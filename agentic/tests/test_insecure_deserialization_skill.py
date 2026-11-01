@@ -32,6 +32,8 @@ from pathlib import Path
 
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_REPO_ROOT / "tooling" / "scripts"))
+from wiki_checkout import SKIP_REASON, wiki_checkout_present  # noqa: E402
 _SKILLS_DIR = _REPO_ROOT / "agentic" / "community-skills"
 _SKILL_ID = "insecure_deserialization"
 _SKILL_FILE = _SKILLS_DIR / f"{_SKILL_ID}.md"
@@ -106,11 +108,11 @@ class TestSkillFileShape(unittest.TestCase):
 
     def test_size_under_import_cap(self):
         """
-        webapp import caps content at MAX_CONTENT_SIZE = 50 * 1024 = 51200
-        bytes (webapp/.../attack-skills/route.ts line 29 + line 65). Validate
-        against the real constant, not an approximation.
+        webapp import caps content at MAX_CONTENT_SIZE = 500 * 1024 = 512000
+        (webapp/src/lib/userSkills.ts). Validate against the real constant,
+        not an approximation.
         """
-        cap = 50 * 1024
+        cap = 500 * 1024
         self.assertLess(len(self.text), cap,
                         f"Skill is {len(self.text)} bytes; webapp import caps at {cap}")
 
@@ -253,8 +255,8 @@ class TestIndexUpdates(unittest.TestCase):
                       "agentic/community-skills/README.md must link to the new file")
 
     def test_wiki_lists_skill(self):
-        if not _WIKI.exists():
-            self.skipTest("redamon.wiki/ not checked out (sub-repo)")
+        if not wiki_checkout_present(_WIKI.parent):
+            self.skipTest(SKIP_REASON)
         text = _WIKI.read_text(encoding="utf-8")
         self.assertIn(f"{_SKILL_ID}.md", text,
                       "wiki Agent-Skills.md Community Skills table must include the new entry")

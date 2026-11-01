@@ -9,6 +9,8 @@ import { Drawer, useToast, useAlertModal, WikiInfoButton } from '@/components/ui
 import { TrafficCaptureStatus } from '@/components/traffic/TrafficCaptureStatus'
 import { TrafficMindSettingsModal } from '@/components/traffic/TrafficMindSettingsModal'
 import { isHttpUrl } from '@/lib/url-utils'
+import { copyText } from '@/lib/copyText'
+import { errorMessage } from '@/lib/apiError'
 import {
   useTrafficList,
   useTrafficFacets,
@@ -76,9 +78,11 @@ export default function TrafficPage() {
   const detail = useTrafficDetail(projectId, selectedId)
   const del = useDeleteTraffic(projectId)
 
-  const copyText = useCallback((text: string, what: string) => {
-    navigator.clipboard.writeText(text || '')
-    toast.success(`Copied ${what}`)
+  const copyWithToast = useCallback((text: string, what: string) => {
+    copyText(text || '').then(
+      () => toast.success(`Copied ${what}`),
+      () => toast.error(`Could not copy ${what}`),
+    )
   }, [toast])
   const { dangerConfirm } = useAlertModal()
 
@@ -101,7 +105,7 @@ export default function TrafficPage() {
       const r = await del.mutateAsync({ ids: [...selected] })
       setSelected(new Set())
       toast.success(`Deleted ${r.deleted} transaction(s)`)
-    } catch { toast.error('Delete failed') }
+    } catch (err) { toast.error(errorMessage(err, 'Delete failed')) }
   }, [selected, dangerConfirm, del, toast])
 
   const handleDeleteAllMatching = useCallback(async () => {
@@ -111,7 +115,7 @@ export default function TrafficPage() {
       const r = await del.mutateAsync({ filter: trafficFilterPayload(filters) })
       setSelected(new Set())
       toast.success(`Deleted ${r.deleted} transaction(s)`)
-    } catch { toast.error('Delete failed') }
+    } catch (err) { toast.error(errorMessage(err, 'Delete failed')) }
   }, [filters, dangerConfirm, del, toast])
 
   // Any filter change resets to the first page.
@@ -292,6 +296,11 @@ export default function TrafficPage() {
             Clear ({activeFilterCount})
           </button>
         )}
+        {facets.isError && (
+          <span className={styles.facetsError} role="status">
+            Filter options unavailable: {errorMessage(facets.error, 'Failed to load facets')}
+          </span>
+        )}
       </div>
 
       {/* Table */}
@@ -394,7 +403,12 @@ export default function TrafficPage() {
         </table>
 
         {list.isLoading && <div className={styles.loading}>Loading…</div>}
-        {!list.isLoading && rows.length === 0 && (
+        {list.isError && (
+          <div className={styles.listError} role="alert">
+            Could not load traffic: {errorMessage(list.error, 'Failed to list traffic')}
+          </div>
+        )}
+        {!list.isLoading && !list.isError && rows.length === 0 && (
           <div className={styles.empty}>
             No captured traffic yet. Enable capture on the project and run a recon scan.
           </div>
@@ -425,12 +439,17 @@ export default function TrafficPage() {
         title="Transaction detail"
       >
         {detail.isLoading && <div className={styles.loading}>Loading…</div>}
+        {detail.isError && (
+          <div className={styles.listError} role="alert">
+            Could not load this transaction: {errorMessage(detail.error, 'Failed to load transaction')}
+          </div>
+        )}
         {detail.data && (
           <div className={styles.detail}>
             <div className={styles.detailSection}>
               <div className={styles.sectionHead}>
                 <span className={styles.detailLabel}>Request</span>
-                <button className={styles.copyBtn} onClick={() => copyText(toCurl(detail.data as TrafficDetail), 'curl command')}>
+                <button className={styles.copyBtn} onClick={() => copyWithToast(toCurl(detail.data as TrafficDetail), 'curl command')}>
                   <Copy size={13} /> Copy as curl
                 </button>
               </div>
@@ -439,7 +458,7 @@ export default function TrafficPage() {
                 <dd className={styles.mono}>
                   <span className={styles.urlText}>{fullUrl(detail.data as TrafficDetail)}</span>
                   <button className={styles.iconCopy} title="Copy URL" aria-label="Copy URL"
-                    onClick={() => copyText(fullUrl(detail.data as TrafficDetail), 'URL')}>
+                    onClick={() => copyWithToast(fullUrl(detail.data as TrafficDetail), 'URL')}>
                     <Copy size={13} />
                   </button>
                 </dd>
@@ -457,7 +476,7 @@ export default function TrafficPage() {
                 <div className={styles.sectionHead}>
                   <span className={styles.detailLabel}>Request headers</span>
                   <button className={styles.iconCopy} title="Copy request headers" aria-label="Copy request headers"
-                    onClick={() => copyText(JSON.stringify(detail.data!.reqHeaders ?? {}, null, 2), 'request headers')}>
+                    onClick={() => copyWithToast(JSON.stringify(detail.data!.reqHeaders ?? {}, null, 2), 'request headers')}>
                     <Copy size={13} />
                   </button>
                 </div>
@@ -470,7 +489,7 @@ export default function TrafficPage() {
                 <div className={styles.sectionHead}>
                   <span className={styles.detailLabel}>Request body</span>
                   <button className={styles.iconCopy} title="Copy request body" aria-label="Copy request body"
-                    onClick={() => copyText(detail.data!.reqBody ?? '', 'request body')}>
+                    onClick={() => copyWithToast(detail.data!.reqBody ?? '', 'request body')}>
                     <Copy size={13} />
                   </button>
                 </div>
@@ -488,7 +507,7 @@ export default function TrafficPage() {
               <div className={styles.sectionHead}>
                 <span className={styles.detailLabel}>Response headers</span>
                 <button className={styles.iconCopy} title="Copy response headers" aria-label="Copy response headers"
-                  onClick={() => copyText(JSON.stringify(detail.data!.respHeaders ?? {}, null, 2), 'response headers')}>
+                  onClick={() => copyWithToast(JSON.stringify(detail.data!.respHeaders ?? {}, null, 2), 'response headers')}>
                   <Copy size={13} />
                 </button>
               </div>
@@ -499,7 +518,7 @@ export default function TrafficPage() {
                 </span>
                 <button className={styles.iconCopy} title="Copy response body" aria-label="Copy response body"
                   disabled={!detail.data.respBody}
-                  onClick={() => copyText(detail.data!.respBody ?? '', 'response body')}>
+                  onClick={() => copyWithToast(detail.data!.respBody ?? '', 'response body')}>
                   <Copy size={13} />
                 </button>
               </div>

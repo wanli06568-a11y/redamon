@@ -30,7 +30,7 @@ Without it the scan reports a clear error instead of a misleading clean result. 
 Discovery -> HTTP probing (technology detection) -> crawling (Katana + Hakrawler + GAU) -> **JS Recon with source maps** (the richest package-name source) -> **Supply Chain Recon** (harvest + offline OSV verdict). The JS Recon dependency-confusion check stays on because it complements the OSV verdict.
 
 ### What it disables
-Port scanning (Naabu / Nmap / Masscan), directory and API fuzzing (FFuf / Kiterunner), parameter discovery (Arjun / ParamSpider), active vulnerability scanning (Nuclei), GraphQL testing, subdomain takeover, VHost/SNI, web cache poisoning, AI surface recon, OSINT enrichment, and brute force. Secret-oriented JS Recon sub-checks (regex patterns, key validation, DOM sinks, dev comments) are also off - this preset is about dependencies, not the network surface or secrets.
+Port scanning (Naabu / Nmap / Masscan), directory and API fuzzing (FFuf / Kiterunner), OpenAPI import, parameter discovery (Arjun / ParamSpider), active vulnerability scanning (Nuclei), GraphQL testing, subdomain takeover, VHost/SNI, web cache poisoning, AI surface recon, OSINT enrichment, and brute force. Secret-oriented JS Recon sub-checks (regex patterns, key validation, DOM sinks, dev comments) are also off - this preset is about dependencies, not the network surface or secrets.
 
 Use \`Full Pipeline - Maximum\` if you want supply-chain findings as one signal among many; use this preset when dependency risk is the objective.
 
@@ -41,7 +41,8 @@ Use \`Full Pipeline - Maximum\` if you want supply-chain findings as one signal 
   targetProfile: 'domain',
   environment: 'external',
   parameters: {
-    scanModules: ['domain_discovery', 'http_probe', 'resource_enum', 'js_recon'],
+    scanModules: ['domain_discovery', 'http_probe', 'resource_enum'],
+    ipAttributionEnabled: true,
 
     // -- The point of this preset --
     supplyChainReconEnabled: true,
@@ -85,6 +86,7 @@ Use \`Full Pipeline - Maximum\` if you want supply-chain findings as one signal 
     masscanEnabled: false,
     ffufEnabled: false,
     kiterunnerEnabled: false,
+    openapiEnabled: false,
     arjunEnabled: false,
     paramspiderEnabled: false,
     graphqlSecurityEnabled: false,

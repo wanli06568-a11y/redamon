@@ -5,6 +5,8 @@ import { createHash } from 'crypto'
 // Reuse the graph API's Neo4j driver
 import { getGraphSession } from '../../../graph/neo4j'
 import { notMuted } from '@/lib/graphMute'
+import { jsReconSecretFromRecord } from '@/lib/secrets/jsReconSecret'
+import { internalError } from '@/lib/routeErrors'
 
 const PROJECT_ID_RE = /^[a-zA-Z0-9_-]+$/
 
@@ -149,6 +151,7 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
              s.detection_method AS detection_method,
              s.validation_status AS validation_status,
              s.validation_info AS validation_info,
+             s.public_client_key AS public_client_key,
              s.updated_at AS updatedAt
       `,
       { pid: projectId }
@@ -324,27 +327,7 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
     }
 
     // Map secrets
-    const secrets = secretsResult.records.map((r: any) => {
-      let validation: Record<string, any> = { status: r.get('validation_status') || 'unvalidated' }
-      const vi = r.get('validation_info')
-      if (vi) {
-        try { validation = JSON.parse(vi) } catch {}
-      }
-      return {
-        nodeId: r.get('nodeId') ?? null,
-        id: r.get('id'),
-        name: r.get('name'),
-        severity: r.get('severity'),
-        redacted_value: r.get('redacted_value'),
-        matched_text: r.get('matched_text'),
-        category: r.get('category'),
-        source_url: r.get('source_url'),
-        confidence: r.get('confidence'),
-        detection_method: r.get('detection_method'),
-        validation,
-        updatedAt: r.get('updatedAt') ?? null,
-      }
-    })
+    const secrets = secretsResult.records.map((r: any) => jsReconSecretFromRecord(k => r.get(k)))
 
     // Map endpoints
     const endpoints = endpointsResult.records.map((r: any) => ({
@@ -415,11 +398,7 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
       headers: { 'ETag': `"${etag}"`, 'Cache-Control': 'private, no-cache' },
     })
   } catch (error) {
-    console.error('JS Recon query error:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Query failed' },
-      { status: 500 }
-    )
+    return internalError(error, 'JS Recon query failed', { log: 'JS Recon query error' })
   } finally {
     await session.close()
   }

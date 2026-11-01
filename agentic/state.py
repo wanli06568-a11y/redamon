@@ -1043,6 +1043,7 @@ class AgentState(TypedDict):
     _redundant_transition_count: int  # Consecutive no-op transition_phase requests to the current phase
     _abort_transition: bool  # True when user aborted a phase transition (routes to generate_response)
     _guardrail_blocked: bool  # True when project target was blocked by the scope guardrail
+    _scope_signature: Optional[str]  # The scope the guardrails last approved; a change re-runs them
 
     # Tool plan execution (parallel wave)
     _current_plan: Optional[dict]  # ToolPlan.model_dump() with results after execution
@@ -1069,6 +1070,11 @@ class AgentState(TypedDict):
     # Deep Think result (persists for chain, replaced on re-trigger)
     deep_think_result: Optional[str]
     _need_deep_think: bool  # LLM self-requested Deep Think for next iteration
+
+    # Actionable lines that read as a confirmation to record, from an analysis
+    # that recorded no chain finding (orchestrator_helpers/finding_guard.py);
+    # the next prompt says they recorded nothing.
+    _unrecorded_confirmation: Optional[List[str]]
 
     # Productivity scoring v2 — dynamic, multi-signal loop detection.
     # `_deep_think_cooldown_until` suppresses redundant Deep Thinks for N
@@ -1300,6 +1306,7 @@ def create_initial_state(
         "_redundant_transition_count": 0,
         "_abort_transition": False,
         "_guardrail_blocked": False,
+        "_scope_signature": None,
         "_current_plan": None,
         # Attack Chain memory
         "chain_findings_memory": [],
@@ -1312,6 +1319,7 @@ def create_initial_state(
         # Deep Think
         "deep_think_result": None,
         "_need_deep_think": False,
+        "_unrecorded_confirmation": None,
         # Productivity scoring v2
         "_deep_think_cooldown_until": 0,
         "_iterations_since_state_grew": 0,

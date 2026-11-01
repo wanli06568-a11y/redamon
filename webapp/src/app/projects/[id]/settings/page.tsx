@@ -4,6 +4,8 @@ import { useParams, useRouter } from 'next/navigation'
 import { ProjectForm } from '@/components/projects'
 import { useProjectById, useUpdateProject } from '@/hooks/useProjects'
 import { useProject } from '@/providers/ProjectProvider'
+import { toProjectSummary } from '@/lib/projectSummary'
+import { errorMessage } from '@/lib/apiError'
 import styles from './page.module.css'
 
 export default function ProjectSettingsPage() {
@@ -22,15 +24,7 @@ export default function ProjectSettingsPage() {
       data
     })
 
-    setCurrentProject({
-      id: updated.id,
-      name: updated.name,
-      targetDomain: updated.targetDomain,
-      subdomainList: updated.subdomainList,
-      description: updated.description || undefined,
-      createdAt: updated.createdAt.toString(),
-      updatedAt: updated.updatedAt.toString()
-    })
+    setCurrentProject(toProjectSummary(updated))
 
     return updated
   }
@@ -67,6 +61,7 @@ export default function ProjectSettingsPage() {
       <div className={styles.container}>
         <div className={styles.error}>
           <p>Failed to load project settings.</p>
+          {error && <p>{errorMessage(error, 'Failed to fetch project')}</p>}
           <button className="primaryButton" onClick={() => router.push('/projects')}>
             Go to Projects
           </button>

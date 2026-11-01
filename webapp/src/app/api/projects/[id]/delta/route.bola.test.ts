@@ -29,7 +29,11 @@ vi.mock('@/lib/access', () => ({
 // scanVersionAccess is only partially mocked, so its real module (and therefore
 // the Prisma client) still gets imported — stub the client so no engine loads.
 vi.mock('@/lib/prisma', () => ({
-  default: { scanVersion: { findUnique: vi.fn() }, $queryRaw: vi.fn() },
+  default: {
+    scanVersion: { findUnique: vi.fn() }, $queryRaw: vi.fn(),
+    // The project's scope, read to drop a removed scan root's coverage gaps.
+    project: { findUnique: vi.fn(async () => ({ targetDomain: 'example.com', subdomainList: [] })) },
+  },
 }))
 vi.mock('@/lib/scanVersionAccess', async orig => ({
   ...(await orig<typeof import('@/lib/scanVersionAccess')>()),
@@ -183,5 +187,27 @@ describe('capturing the live graph waits for whoever is writing it', () => {
     h.load.mockResolvedValue(snap('10.0.0.1'))
     const res = await GET(req('from=v1&to=v1'), params('p1'))
     expect(res.status).toBe(200)
+  })
+})
+
+describe('GET /api/projects/[id]/delta - failures', () => {
+  beforeEach(() => { vi.spyOn(console, 'error').mockImplementation(() => {}) })
+
+  test('a failed comparison answers a fixed sentence and the code, not the Neo4j text', async () => {
+    h.capture.mockRejectedValue(Object.assign(new Error('MATCH (n {project_id: "p1"}) on 10.0.0.7 failed'), {
+      code: 'Neo.TransientError.General.DatabaseUnavailable',
+    }))
+    const res = await GET(req('from=v1&to=current'), params('p1'))
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({
+      error: 'Failed to compute the delta', code: 'Neo.TransientError.General.DatabaseUnavailable',
+    })
+  })
+
+  test('a version lookup that throws before the try is readable, not an empty 500', async () => {
+    h.resolve.mockRejectedValue(Object.assign(new Error('pool timeout'), { code: 'P2024' }))
+    const res = await GET(req('from=v1&to=current'), params('p1'))
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Failed to compute the delta', code: 'P2024' })
   })
 })

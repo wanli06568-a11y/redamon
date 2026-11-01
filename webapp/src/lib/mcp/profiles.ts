@@ -482,7 +482,7 @@ export const PROFILE_ONBOARDING: Record<ProfileId, ProfileOnboarding> = {
       'An asset table, one row per asset, with its type, its parent and what is known about it. No ' +
       'findings. State the scan version and flag any layer that was never scanned.',
     gotchas: [
-      'Absence from the graph is not absence in reality. If a node type is missing from the census entirely, that surface was never scanned, and your inventory has a hole rather than a clean answer.',
+      'Absence from the graph is not absence in reality. A node type missing from the census means the surface that produces it was never scanned or produced nothing, and the census alone cannot say which: your inventory may have a hole rather than a clean answer. Say what you know was covered.',
       'Asset lists are long and every list tool caps what it returns. Page until you have it all, or say plainly that the answer is partial.',
     ],
   },
@@ -582,7 +582,7 @@ export const PROFILE_ONBOARDING: Record<ProfileId, ProfileOnboarding> = {
       'scanned" rather than collapsing the last two into zero.',
     gotchas: [
       'Never present a count from an unsettled graph as final. Re-read once it is settled, or label the figure provisional.',
-      'A zero means one of two very different things. Check the census: a node type that is absent entirely was never scanned.',
+      'A zero means one of three very different things: never scanned, scanned and clean, or everything suppressed. Check the census and its `coverage` block for what was actually scanned, and the suppressed count, before reporting a zero as clean.',
     ],
   },
 
@@ -614,7 +614,7 @@ export const PROFILE_ONBOARDING: Record<ProfileId, ProfileOnboarding> = {
       'most serious findings with evidence, and an explicit section on what you could not see and ' +
       'why.',
     gotchas: [
-      'You cannot change what RedAmon points at, and you must not try. The scope was set by a human who confirmed the authorisation to scan this estate.',
+      'Never change what RedAmon points at on your own initiative. The scope was set by a human who confirmed the authorisation to scan this estate; a target list moves only when that human asks for it.',
       'A freshly-started scan takes a long time. Poll the status rather than assuming it finished, and wait for the graph to settle before reading counts.',
       'Absence of findings in a layer that was never scanned is not a clean bill of health. Say which layers you actually have.',
     ],

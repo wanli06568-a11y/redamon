@@ -3,6 +3,8 @@
 import { useState, useRef } from 'react'
 import { Upload, Loader2, CheckCircle, AlertCircle, FileArchive } from 'lucide-react'
 import { useToast } from '@/components/ui'
+import { readApiError, toApiError } from '@/lib/apiError'
+import { IMPORT_MAX_UPLOAD_LABEL } from '@/app/api/projects/import/limits'
 import styles from './page.module.css'
 
 interface ImportStats {
@@ -20,6 +22,8 @@ interface ImportResult {
   projectId: string
   projectName: string
   stats: ImportStats
+  /** What the import changed or dropped from the bundle (dropped hosts, skill toggles, Jev fallbacks). */
+  warnings?: string[]
 }
 
 interface ImportModalProps {
@@ -63,20 +67,14 @@ export function ImportModal({ isOpen, userId, onClose, onSuccess }: ImportModalP
         body: formData,
       })
 
-      if (res.ok) {
-        const data: ImportResult = await res.json()
-        setResult(data)
-        setStatus('success')
-        toast.success('Project imported')
-        onSuccess()
-      } else {
-        const err = await res.json()
-        setErrorMessage(err.error || 'Import failed')
-        setStatus('error')
-        toast.error('Import failed')
-      }
+      if (!res.ok) throw await readApiError(res, 'Import failed')
+      const data: ImportResult = await res.json()
+      setResult(data)
+      setStatus('success')
+      toast.success('Project imported')
+      onSuccess()
     } catch (err) {
-      setErrorMessage(err instanceof Error ? err.message : 'Import failed')
+      setErrorMessage(toApiError(err, 'Import failed').message)
       setStatus('error')
       toast.error('Import failed')
     }
@@ -130,7 +128,7 @@ export function ImportModal({ isOpen, userId, onClose, onSuccess }: ImportModalP
                 />
               </div>
               <p style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', marginTop: 'var(--space-1)' }}>
-                The project will be created under the currently selected user.
+                The project will be created under the currently selected user. Archives up to {IMPORT_MAX_UPLOAD_LABEL}.
               </p>
             </div>
             <div className={styles.modalActions}>
@@ -192,6 +190,11 @@ export function ImportModal({ isOpen, userId, onClose, onSuccess }: ImportModalP
               <span>Relationships: {result.stats.neo4jRelationships}</span>
               <span>Artifacts: {result.stats.artifacts}</span>
             </div>
+            {result.warnings && result.warnings.length > 0 && (
+              <ul style={{ fontSize: 'var(--text-xs)', color: 'var(--status-warning-text)', margin: 0, paddingLeft: 'var(--space-4)' }}>
+                {result.warnings.map(w => <li key={w}>{w}</li>)}
+              </ul>
+            )}
             <div className={styles.modalActions}>
               <button className="primaryButton" onClick={handleClose}>
                 Done

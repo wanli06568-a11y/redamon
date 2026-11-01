@@ -33,6 +33,8 @@ Properties written on each Vulnerability:
     observed_size            body size returned with vhost lie applied
     size_delta               observed_size - baseline_size
     internal_pattern_match   matched internal-keyword (e.g. "admin"), or None
+    dns_known                public DNS points the hostname at this IP (only a
+                             routing inconsistency is reported for such a name)
     first_seen, last_seen    ISO timestamps
 
 Properties written on the Subdomain for an in-scope hidden vhost:
@@ -48,7 +50,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from graph_db.mixins.recon.scope import attach_roots, root_for_host
+from graph_db.mixins.recon.scope import attach_roots, org_for_scan_root, root_for_host
 
 
 class VhostSniMixin:
@@ -111,6 +113,7 @@ class VhostSniMixin:
                         "is_reverse_proxy": bool(ip_info.get("is_reverse_proxy")),
                         "is_permissive_frontend": bool(ip_info.get("is_permissive_frontend")),
                         "vhost_sni_suppressed_by_control": int(ip_info.get("suppressed_by_control") or 0),
+                        "vhost_sni_suppressed_dns_known": int(ip_info.get("suppressed_dns_known") or 0),
                         # Always written, 0 and [] included: `SET i += $props`
                         # keeps the old value of a key that is left out.
                         "vhost_sni_suppressed_as_noise": int(ip_info.get("suppressed_as_noise") or 0),
@@ -171,6 +174,7 @@ class VhostSniMixin:
                         "observed_size": finding.get("observed_size"),
                         "size_delta": finding.get("size_delta"),
                         "internal_pattern_match": finding.get("internal_pattern_match"),
+                        "dns_known": bool(finding.get("dns_known")),
                         "matched_at": _build_url(hostname, port, finding.get("scheme") or "https"),
                         "is_dast_finding": False,
                         "last_seen": detected_at,
@@ -197,9 +201,11 @@ class VhostSniMixin:
                     # graph, flagged has_dns_records=false until a resolver says
                     # otherwise. An out-of-scope name (a co-hosted third party)
                     # hangs off the IP that served it instead.
+                    # A name public DNS points at this IP is reported only for a
+                    # routing inconsistency, never as hidden.
                     sub_props = {
                         "vhost_tested": True,
-                        "vhost_hidden": True,
+                        "vhost_hidden": not finding.get("dns_known"),
                         "vhost_routing_layer": layer,
                         "vhost_status_code": finding.get("observed_status"),
                         "vhost_size_delta": finding.get("size_delta"),
@@ -277,8 +283,8 @@ class VhostSniMixin:
                             MERGE (d)-[:HAS_SUBDOMAIN]->(s)
                             RETURN count(d) AS matched
                             """,
-                            domain=root_for_host(hostname, roots), hostname=hostname,
-                            uid=user_id, pid=project_id,
+                            domain=org_for_scan_root(root_for_host(hostname, roots), recon_data),
+                            hostname=hostname, uid=user_id, pid=project_id,
                         )
                         if res_d.single()["matched"] > 0:
                             stats["relationships_created"] += 2
@@ -324,15 +330,21 @@ class VhostSniMixin:
                         )
                         stats["relationships_created"] += 1
 
-                    # Attach to Domain too, when the hostname IS one of the apexes.
+                    # A finding on a scan root itself: on the org's Domain when the
+                    # root IS the org, else on the root's Subdomain, which exists
+                    # only when the root is a target.
                     if hostname in {r.lower() for r in roots}:
+                        org = org_for_scan_root(root_for_host(hostname, roots), recon_data)
+                        anchor = ("MATCH (d:Domain {name: $domain, user_id: $uid, project_id: $pid})"
+                                  if org.lower() == hostname else
+                                  "MATCH (d:Subdomain {name: $domain, user_id: $uid, project_id: $pid})")
                         session.run(
-                            """
-                            MATCH (d:Domain {name: $domain, user_id: $uid, project_id: $pid})
+                            anchor + """
                             MATCH (v:Vulnerability {id: $id, user_id: $uid, project_id: $pid})
                             MERGE (d)-[:HAS_VULNERABILITY]->(v)
                             """,
-                            domain=root_for_host(hostname, roots), uid=user_id, pid=project_id, id=vuln_id,
+                            domain=org if org.lower() == hostname else hostname,
+                            uid=user_id, pid=project_id, id=vuln_id,
                         )
                         stats["relationships_created"] += 1
                 except Exception as e:

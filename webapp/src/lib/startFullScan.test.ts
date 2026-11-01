@@ -46,6 +46,7 @@ vi.mock('@/lib/scanTimeline', async orig => ({
 
 import { startFullScan } from './startFullScan'
 import { SnapshotFreezeError } from './scanTimeline'
+import { classifyStartFailure } from './scanStartOutcome'
 
 const orchestratorBody = () => JSON.parse(h.orchestratorFetch.mock.calls[0][1].body)
 
@@ -97,6 +98,17 @@ describe('a third-party engagement cannot start without its ceiling and its auth
     if (res.ok) throw new Error('unreachable')
     expect(res.error).toMatch(/authorization record/i)
     expect(h.orchestratorFetch).not.toHaveBeenCalled()
+  })
+
+  test('the refusal is 422, which the queue and the scheduler treat as permanent', async () => {
+    // A 409 reads as "busy" and is requeued for ever; only a person can add the
+    // ceiling or the record.
+    h.findProject.mockResolvedValue(thirdParty())
+    h.countAuthorizations.mockResolvedValue(0)
+    const res = await startFullScan({ projectId: 'p1', mode: 'new', trigger: 'scheduled', scheduleId: 's1' })
+    expect(res).toMatchObject({ ok: false, status: 422 })
+    if (res.ok) throw new Error('unreachable')
+    expect(classifyStartFailure(res.status, res).kind).toBe('permanent')
   })
 
   test('a ceiling of 0 refuses the start, because 0 means NO ceiling', async () => {
@@ -485,19 +497,16 @@ describe('P0-2: the per-project mutex serialises every start path', () => {
 })
 
 // Strategy row 1: a Domain-batch project must be able to start a scan.
-// Its scope lives in domainBatchGroups, not targetDomain (which is empty), so the
-// single-domain precondition would have refused every batch scan outright.
+// Its scope is derived from domainBatchHosts, not targetDomain (which is empty),
+// so the single-domain precondition would have refused every batch scan outright.
 describe('domain batch preconditions', () => {
-  const batchProject = (groups: unknown) => ({
+  const batchProject = (hosts: unknown, over: Record<string, unknown> = {}) => ({
     id: 'p1', userId: 'owner', targetDomain: '', ipMode: false, targetIps: [],
-    domainBatchMode: true, domainBatchGroups: groups,
+    domainBatchMode: true, domainBatchHosts: hosts, ...over,
   })
 
-  test('a batch with groups starts and reaches the orchestrator', async () => {
-    h.findProject.mockResolvedValue(batchProject([
-      { rootDomain: 'domain1.com', prefixes: ['sub1.'] },
-      { rootDomain: 'domain2.it', prefixes: ['sub2.'] },
-    ]))
+  test('a batch with hosts starts and reaches the orchestrator', async () => {
+    h.findProject.mockResolvedValue(batchProject(['sub1.domain1.com', 'sub2.domain2.it']))
     const r = await startFullScan({ projectId: 'p1', mode: 'new', trigger: 'manual' })
 
     expect(r.ok).toBe(true)
@@ -505,41 +514,86 @@ describe('domain batch preconditions', () => {
     expect(orchestratorBody().project_id).toBe('p1')
   })
 
-  test('an empty group list is refused with 400 and never starts a container', async () => {
-    h.findProject.mockResolvedValue(batchProject([]))
+  test.each([[[]], [null]])('no hosts (%j) is refused as scope_invalid and never starts a container', async hosts => {
+    h.findProject.mockResolvedValue(batchProject(hosts))
     const r = await startFullScan({ projectId: 'p1', mode: 'new', trigger: 'manual' })
 
-    expect(r.ok).toBe(false)
-    expect((r as { status: number }).status).toBe(400)
+    expect(r).toMatchObject({ ok: false, status: 422, code: 'scope_invalid' })
     expect(h.orchestratorFetch).not.toHaveBeenCalled()
-  })
-
-  test('a null group list (never saved) is refused, not treated as no-op', async () => {
-    h.findProject.mockResolvedValue(batchProject(null))
-    const r = await startFullScan({ projectId: 'p1', mode: 'new', trigger: 'manual' })
-
-    expect(r.ok).toBe(false)
-    expect((r as { status: number }).status).toBe(400)
-    expect(h.orchestratorFetch).not.toHaveBeenCalled()
+    expect(h.prepare).not.toHaveBeenCalled()
   })
 
   test('a batch is not held to the single-domain targetDomain requirement', async () => {
-    h.findProject.mockResolvedValue(batchProject([{ rootDomain: 'a.com', prefixes: ['.'] }]))
+    h.findProject.mockResolvedValue(batchProject(['*.a.com', 'a.com']))
     const r = await startFullScan({ projectId: 'p1', mode: 'new', trigger: 'manual' })
 
     expect(r.ok).toBe(true)
-    if (!r.ok) expect(r.error).not.toContain('no target domain')
+  })
+
+  test('the stored group record is never read: hosts decide', async () => {
+    h.findProject.mockResolvedValue(batchProject(['www.example.com'], {
+      domainBatchGroups: [],
+    }))
+    expect((await startFullScan({ projectId: 'p1', mode: 'new', trigger: 'manual' })).ok).toBe(true)
   })
 
   test('a non-batch project with no target still fails as before', async () => {
     h.findProject.mockResolvedValue({
       id: 'p1', userId: 'owner', targetDomain: '', ipMode: false, targetIps: [],
-      domainBatchMode: false, domainBatchGroups: null,
+      domainBatchMode: false, domainBatchHosts: [],
     })
     const r = await startFullScan({ projectId: 'p1', mode: 'new', trigger: 'manual' })
 
     expect(r.ok).toBe(false)
     expect((r as { error: string }).error).toContain('no target domain')
+  })
+})
+
+// WEB-14: a stored scope the current rules refuse (a list saved before a public
+// suffix was added, a legacy wildcard on a suffix) fails closed with a distinct
+// code. 422, never 409: the queue requeues a 409 as "busy" for ever.
+describe('a saved scope the rules now refuse', () => {
+  test('a batch entry on a public suffix is refused, naming the entry', async () => {
+    h.findProject.mockResolvedValue({
+      id: 'p1', userId: 'owner', targetDomain: '', ipMode: false, targetIps: [],
+      domainBatchMode: true, domainBatchHosts: ['*.com.vn', 'www.example.com'],
+    })
+    const r = await startFullScan({ projectId: 'p1', mode: 'new', trigger: 'scheduled', scheduleId: 's1' })
+
+    expect(r).toMatchObject({
+      ok: false, status: 422, code: 'scope_invalid',
+      invalidEntries: [{ entry: '*.com.vn', reason: 'wildcard_on_suffix' }],
+    })
+    if (r.ok) throw new Error('unreachable')
+    expect(r.error).toContain('*.com.vn')
+    expect(h.prepare).not.toHaveBeenCalled()
+    expect(h.orchestratorFetch).not.toHaveBeenCalled()
+  })
+
+  test('a single-domain target that is a public suffix is refused', async () => {
+    h.findProject.mockResolvedValue({
+      id: 'p1', userId: 'owner', targetDomain: 'co.uk', ipMode: false, targetIps: [],
+      domainBatchMode: false, subdomainList: [],
+    })
+    expect(await startFullScan({ projectId: 'p1', mode: 'new', trigger: 'manual' }))
+      .toMatchObject({ ok: false, status: 422, code: 'scope_invalid' })
+  })
+
+  test('a single-domain prefix the rules refuse is refused', async () => {
+    h.findProject.mockResolvedValue({
+      id: 'p1', userId: 'owner', targetDomain: 'example.com', ipMode: false, targetIps: [],
+      domainBatchMode: false, subdomainList: ['www.', '*'],
+    })
+    expect(await startFullScan({ projectId: 'p1', mode: 'new', trigger: 'manual' }))
+      .toMatchObject({ ok: false, status: 422, code: 'scope_invalid', invalidEntries: [{ entry: '*', reason: 'invalid_prefix' }] })
+  })
+
+  test('an IP-mode project is not judged on its leftover domain fields', async () => {
+    h.findProject.mockResolvedValue({
+      id: 'p1', userId: 'owner', targetDomain: 'co.uk', ipMode: true, targetIps: ['192.0.2.10'],
+      domainBatchMode: false, subdomainList: [],
+    })
+    expect((await startFullScan({ projectId: 'p1', mode: 'new', trigger: 'manual' })).ok).toBe(true)
   })
 })
 
@@ -557,5 +611,120 @@ describe('the run records which RoE document it started under', () => {
   test('no document records null', async () => {
     await startFullScan({ projectId: 'p1', mode: 'new', trigger: 'manual', actorUserId: 'owner' })
     expect(h.createJob.mock.calls[0][0].roeTextSha256).toBeNull()
+  })
+})
+
+describe('a failed container spawn is a refusal, not an accepted start (plan 12.9)', () => {
+  test('an older orchestrator answering 2xx with status error rolls back and records a failed run', async () => {
+    h.orchestratorFetch.mockResolvedValue({
+      ok: true, json: async () => ({ project_id: 'p1', status: 'error', error: 'No such image: redamon-recon:latest' }),
+    })
+    const res = await startFullScan({ projectId: 'p1', mode: 'new', trigger: 'manual' })
+    expect(res).toMatchObject({ ok: false, status: 500, code: 'spawn_failed' })
+    if (res.ok) throw new Error('unreachable')
+    expect(res.error).toMatch(/No such image/)
+    expect(h.rollback).toHaveBeenCalledOnce()
+    expect(h.retention).not.toHaveBeenCalled()
+    expect(h.createJob).toHaveBeenCalledWith(expect.objectContaining({ status: 'failed', versionId: 'v2' }))
+    expect(h.createJob).not.toHaveBeenCalledWith(expect.objectContaining({ status: 'running' }))
+  })
+
+  test('the orchestrator\'s 500 spawn_failed carries its code through', async () => {
+    h.orchestratorFetch.mockResolvedValue({
+      ok: false, status: 500,
+      json: async () => ({ detail: { detail: 'Failed to start: image missing', code: 'spawn_failed' } }),
+    })
+    const res = await startFullScan({ projectId: 'p1', mode: 'new', trigger: 'manual' })
+    expect(res).toMatchObject({ ok: false, status: 500, code: 'spawn_failed', error: 'Failed to start: image missing' })
+    if (res.ok) throw new Error('unreachable')
+    expect(classifyStartFailure(res.status, res, { orchestratorAnswered: true }).temporary).toBe(false)
+  })
+})
+
+describe('a headless caller records no failed run for a transient refusal (plan 12.6)', () => {
+  const answered503 = () => h.orchestratorFetch.mockResolvedValue({
+    ok: false, status: 503,
+    json: async () => ({ detail: 'Cannot verify scan scope: the webapp is unreachable (URLError). Refusing to start.' }),
+  })
+
+  test('quietTransient skips the failed ScanJob, still rolls back', async () => {
+    answered503()
+    const res = await startFullScan({ projectId: 'p1', mode: 'new', trigger: 'scheduled', quietTransient: true })
+    expect(res).toMatchObject({ ok: false, status: 503 })
+    expect(h.createJob).not.toHaveBeenCalled()
+    expect(h.rollback).toHaveBeenCalledOnce()
+  })
+
+  test('a manual start still records it', async () => {
+    answered503()
+    await startFullScan({ projectId: 'p1', mode: 'new', trigger: 'manual' })
+    expect(h.createJob).toHaveBeenCalledWith(expect.objectContaining({ status: 'failed' }))
+  })
+
+  test('quietTransient still records a permanent refusal', async () => {
+    h.orchestratorFetch.mockResolvedValue({ ok: false, status: 403, json: async () => ({ detail: 'RoE window' }) })
+    await startFullScan({ projectId: 'p1', mode: 'new', trigger: 'scheduled', quietTransient: true })
+    expect(h.createJob).toHaveBeenCalledWith(expect.objectContaining({ status: 'failed' }))
+  })
+})
+
+describe('an orchestrator that never answered says why, and whether anything started', () => {
+  const refused = () => Object.assign(new TypeError('fetch failed'), {
+    cause: Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:8010'), { code: 'ECONNREFUSED' }),
+  })
+  const timedOut = () => Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' })
+
+  test('a refused connection is 503 orchestrator_unreachable: certainly not started', async () => {
+    h.orchestratorFetch.mockRejectedValue(refused())
+    const res = await startFullScan({ projectId: 'p1', mode: 'new', trigger: 'manual' })
+    expect(res).toMatchObject({
+      ok: false, status: 503, code: 'orchestrator_unreachable', cause: 'ECONNREFUSED',
+      error: 'The orchestrator could not be reached, so the scan was not started.',
+    })
+    if (res.ok) throw new Error('unreachable')
+    expect(res.startOutcome).toBeUndefined()
+  })
+
+  test('nothing reached the orchestrator, so the freeze is undone like any refusal', async () => {
+    h.orchestratorFetch.mockRejectedValue(refused())
+    await startFullScan({ projectId: 'p1', mode: 'new', trigger: 'manual' })
+    expect(h.rollback).toHaveBeenCalledOnce()
+    expect(h.retention).not.toHaveBeenCalled()
+    expect(h.createJob).toHaveBeenCalledWith(expect.objectContaining({
+      status: 'failed', versionId: 'v2', ramReason: 'the orchestrator could not be reached',
+    }))
+  })
+
+  test('the queue and the scheduler retry it as transient, with no failed run per attempt', async () => {
+    h.orchestratorFetch.mockRejectedValue(refused())
+    const res = await startFullScan({ projectId: 'p1', mode: 'new', trigger: 'scheduled', quietTransient: true })
+    if (res.ok) throw new Error('unreachable')
+    expect(classifyStartFailure(res.status, res, { orchestratorAnswered: res.startOutcome !== 'unknown' }).kind)
+      .toBe('transient')
+    expect(h.createJob).not.toHaveBeenCalled()
+  })
+
+  test('a timeout is 504 orchestrator_timeout and keeps the outcome unknown', async () => {
+    h.orchestratorFetch.mockRejectedValue(timedOut())
+    const res = await startFullScan({ projectId: 'p1', mode: 'new', trigger: 'manual' })
+    expect(res).toMatchObject({ ok: false, status: 504, code: 'orchestrator_timeout', startOutcome: 'unknown' })
+    expect(h.rollback).not.toHaveBeenCalled()
+  })
+
+  test('a reset after the request went out keeps the outcome unknown', async () => {
+    h.orchestratorFetch.mockRejectedValue(Object.assign(new TypeError('fetch failed'), {
+      cause: Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' }),
+    }))
+    const res = await startFullScan({ projectId: 'p1', mode: 'new', trigger: 'manual' })
+    expect(res).toMatchObject({ status: 503, code: 'orchestrator_unreachable', cause: 'ECONNRESET', startOutcome: 'unknown' })
+    expect(h.rollback).not.toHaveBeenCalled()
+  })
+
+  test('an answered error carries the orchestrator status, even with a non-JSON body', async () => {
+    h.orchestratorFetch.mockResolvedValue({
+      ok: false, status: 500, json: async () => { throw new SyntaxError('Unexpected token I') },
+    })
+    const res = await startFullScan({ projectId: 'p1', mode: 'new', trigger: 'manual' })
+    expect(res).toMatchObject({ ok: false, status: 500, upstreamStatus: 500, error: 'Failed to start recon' })
   })
 })

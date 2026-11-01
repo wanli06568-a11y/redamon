@@ -2,20 +2,25 @@ import { NextRequest, NextResponse } from 'next/server'
 import { internalKeyHeaders } from '@/lib/agentAuth'
 import { Prisma } from '@prisma/client'
 import prisma from '@/lib/prisma'
-import { getGraphSession } from '@/app/api/graph/neo4j'
 import { isBlankModelField } from '@/components/projects/ProjectForm/projectLlmGate.logic'
 import { requireEffectiveUser, ownerScope } from '@/lib/access'
 import { validateJevEngineChange } from '@/lib/reconSettings/jevEngine'
 import { normalizeUserSkillToggles, UserSkillError } from '@/lib/userSkills'
-import { validateDomainBatch, splitWildcard } from '@/lib/domainBatch'
+import { describeInvalid, normalizeHost, splitWildcard, validateDomainBatch } from '@/lib/domainBatch'
+import { resolveScopeGroups, scopeGuardrailNames, softGuardrailNames } from '@/lib/scopeGroups'
+import { seedDomainNames, seedProjectDomains } from '@/lib/graphSeedDomains'
+import { firstHardBlocked } from '@/lib/hard-guardrail'
 import { crossOriginResponse, sameOrigin } from '@/lib/plugins/sameOrigin'
 import { actingAdminId } from '@/lib/roe/actor'
 import { buildCreateRoeArtefacts, stripRoeArtefacts } from '@/lib/roe/createRoe'
 import { extractRoeText, ExtractError, type ExtractedDocument } from '@/lib/roe/extractText'
 import { ALLOWED_EXTENSIONS_LABEL, MAX_FILE_SIZE, classifyRoeFile, type RoeFileKind } from '@/lib/roe/limits'
 import { contentLengthProblem } from '@/lib/roe/upload'
+import { internalError } from '@/lib/routeErrors'
+import { cleanOpenApiSources, normalizeOpenApiSourceIds, validateOpenApiSettings } from '@/lib/validation/openapiSettings'
 
 const AGENT_API_URL = process.env.AGENT_API_URL || 'http://localhost:8080'
+const SOFT_GUARDRAIL_TIMEOUT_MS = 10_000
 
 // GET /api/projects - List the effective user's projects.
 // The client-supplied ?userId is ignored as an auth input: the list is always
@@ -34,6 +39,13 @@ export async function GET() {
         name: true,
         description: true,
         targetDomain: true,
+        // The scope fields, so a card names a batch by its scope groups (a
+        // batch row's targetDomain is empty).
+        subdomainList: true,
+        ipMode: true,
+        targetIps: true,
+        domainBatchMode: true,
+        domainBatchHosts: true,
         captureProxyEnabled: true,
         createdAt: true,
         updatedAt: true,
@@ -49,11 +61,7 @@ export async function GET() {
 
     return NextResponse.json(projects)
   } catch (error) {
-    console.error('Failed to fetch projects:', error)
-    return NextResponse.json(
-      { error: 'Failed to fetch projects' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to fetch projects')
   }
 }
 
@@ -104,6 +112,15 @@ export async function POST(request: NextRequest) {
       body = await request.json()
     }
 
+    if ('openapiSources' in body) body.openapiSources = cleanOpenApiSources(body.openapiSources)
+    const openapiError = validateOpenApiSettings(body)
+    if (openapiError) {
+      return NextResponse.json({ error: openapiError }, { status: 400 })
+    }
+    if ('openapiSources' in body) {
+      body.openapiSources = normalizeOpenApiSourceIds(body.openapiSources)
+    }
+
     const { userId: _bodyUserId, name, targetDomain, ipMode, domainBatchMode,
       id: clientId, ...optionalParams } = body as {
       userId: string
@@ -130,7 +147,6 @@ export async function POST(request: NextRequest) {
     if (batch && !batch.ok) {
       return NextResponse.json({ error: batch.errors.join(' ') }, { status: 400 })
     }
-    const batchRoots = batch ? batch.groups.map(g => g.rootDomain) : []
 
     // Owner is the effective user, never the client-supplied body value.
     const userId = eff.userId
@@ -179,20 +195,30 @@ export async function POST(request: NextRequest) {
       )
     }
 
+    const rawSubdomains = optionalParams.subdomainList
+    const scopeFields = {
+      ipMode, domainBatchMode, domainBatchHosts: batchHosts, targetDomain,
+      subdomainList: Array.isArray(rawSubdomains)
+        ? rawSubdomains.filter((s): s is string => typeof s === 'string')
+        : typeof rawSubdomains === 'string' ? rawSubdomains.split(',') : [],
+    }
+    // The single-domain target and prefixes get the same rules as a batch entry
+    // (no public suffix, no IP, prefixes of any depth): a direct POST bypasses
+    // the form's own check.
+    const scope = resolveScopeGroups(scopeFields)
+    if (!ipMode && !domainBatchMode && scope.invalid.length > 0) {
+      return NextResponse.json({ error: describeInvalid(scope.invalid) }, { status: 400 })
+    }
+
     // Hard guardrail: deterministic, non-disableable - always blocks government/public domains.
-    // Checks EVERY domain the project would scan, so a batch cannot smuggle one in.
-    const guardedDomains = domainBatchMode ? batchRoots : (!ipMode && targetDomain ? [targetDomain] : [])
-    if (guardedDomains.length > 0) {
-      const { isHardBlockedDomain } = await import('@/lib/hard-guardrail')
-      for (const domain of guardedDomains) {
-        const hardCheck = isHardBlockedDomain(domain)
-        if (hardCheck.blocked) {
-          return NextResponse.json(
-            { error: `Target permanently blocked: ${domain}: ${hardCheck.reason}` },
-            { status: 403 }
-          )
-        }
-      }
+    // Checks every host AND every group root the project would scan, so a batch
+    // cannot smuggle one in, and the refusal names the host that was listed.
+    const blocked = firstHardBlocked(scopeGuardrailNames(scopeFields))
+    if (blocked) {
+      return NextResponse.json(
+        { error: `Target permanently blocked: ${blocked.name}: ${blocked.reason}` },
+        { status: 403 }
+      )
     }
 
     // Soft guardrail (LLM-based): check if domain/IPs are allowed before creating
@@ -201,12 +227,17 @@ export async function POST(request: NextRequest) {
         const guardrailResponse = await fetch(`${AGENT_API_URL}/guardrail/check-target`, {
           method: 'POST',
           headers: internalKeyHeaders({ 'Content-Type': 'application/json' }),
+          // Fail-open by design, so a hung agent must not stall the create either.
+          signal: AbortSignal.timeout(SOFT_GUARDRAIL_TIMEOUT_MS),
           body: JSON.stringify({
-            // Batch mode has no single targetDomain. Send the roots as a LIST:
-            // joining them into target_domain feeds a singular prompt that can
-            // approve the set despite one blocked member.
-            target_domain: (ipMode || domainBatchMode) ? '' : (targetDomain || ''),
-            target_domains: domainBatchMode ? batchRoots : [],
+            // Batch mode has no single targetDomain. Send the orgs and scan roots
+            // as a LIST: joining them into target_domain feeds a singular prompt
+            // that can approve the set despite one blocked member. A single
+            // target adds its org and, for a private-section org, the platform
+            // owner, so the model judges the company rather than a hostname.
+            target_domain: (ipMode || domainBatchMode) ? '' : (scope.groups[0]?.scanRoot ?? ''),
+            target_domains: ipMode ? [] : softGuardrailNames(scope.groups)
+              .filter(n => domainBatchMode || n !== scope.groups[0]?.scanRoot),
             target_ips: ipMode ? (optionalParams.targetIps || []) : [],
             user_id: userId,
           }),
@@ -268,9 +299,11 @@ export async function POST(request: NextRequest) {
     // `roeEnabled` joins these because it is DERIVED from whether any engagement
     // limit is set, and nothing writes it. Creating a project with it set would
     // store a value that disagrees with the derivation from the first moment.
+    // `domainBatchGroups` is always derived from the host list below, so a
+    // client value is never stored, not even on a project that is not a batch.
     const NON_SETTABLE = new Set([
       'id', 'userId', 'name', 'targetDomain', 'ipMode', 'createdAt', 'updatedAt',
-      'roeEnabled',
+      'roeEnabled', 'domainBatchGroups',
     ])
 
     // Build type map from Prisma DMMF for type coercion
@@ -368,38 +401,22 @@ export async function POST(request: NextRequest) {
         // the crt.sh URL, a puredns filename and a Cypher MERGE, and the in-scope
         // test `endswith('.' + domain)` would then match nothing - a green scan
         // that finds zero hosts.
-        targetDomain: (ipMode || domainBatchMode) ? '' : splitWildcard((targetDomain || '').trim()).rest,
+        targetDomain: (ipMode || domainBatchMode) ? '' : splitWildcard(normalizeHost(targetDomain || '')).rest,
         ipMode: ipMode || false,
         ...sanitizedParams,
         // After sanitizedParams so a client-supplied domainBatchGroups cannot win.
         domainBatchMode: domainBatchMode || false,
-        ...(batch ? { domainBatchHosts: batch.groups.flatMap(g => g.hosts),
-                      domainBatchGroups: batch.groups as unknown as Prisma.InputJsonValue } : {}),
+        // A non-batch project keeps no batch scope: recon's auth scope and the
+        // agent's replay read these columns whatever the mode.
+        ...(batch ? { domainBatchHosts: batch.entries,
+                      domainBatchGroups: batch.legacy as unknown as Prisma.InputJsonValue }
+                  : { domainBatchHosts: [] }),
       }
     })
 
-    // Create Domain nodes in Neo4j so the target is visible in the graph immediately.
-    // Batch mode has one per group; the MERGE key carries user_id + project_id so a
-    // shared domain name can never merge one project's node into another's.
-    const seedDomains = domainBatchMode ? batchRoots : (!ipMode && project.targetDomain ? [project.targetDomain] : [])
-    if (seedDomains.length > 0) {
-      try {
-        const session = getGraphSession()
-        try {
-          for (const name of seedDomains) {
-            await session.run(
-              `MERGE (d:Domain {name: $name, user_id: $userId, project_id: $projectId})
-               ON CREATE SET d.source = 'project_creation', d.updated_at = datetime()`,
-              { name, userId: project.userId, projectId: project.id }
-            )
-          }
-        } finally {
-          await session.close()
-        }
-      } catch (e) {
-        console.warn('Failed to create Domain node in Neo4j on project creation:', e)
-      }
-    }
+    // Create the Domain nodes (one per org) so the target is visible in the graph
+    // immediately. Best-effort; the first full recon writes them anyway.
+    await seedProjectDomains(seedDomainNames(resolveScopeGroups(project).groups), project.userId, project.id)
 
     // Sync JS Recon files uploaded during creation (before project existed in DB)
     if (clientId) {
@@ -449,10 +466,6 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json(project, { status: 201 })
   } catch (error) {
-    console.error('Failed to create project:', error)
-    return NextResponse.json(
-      { error: 'Failed to create project' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to create project')
   }
 }

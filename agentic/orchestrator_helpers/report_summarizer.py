@@ -52,7 +52,7 @@ Section guidelines:
 
   Keep it brief. Do not list every CVE or finding here; those details belong in the Risk Summary and Findings sections. The reader should be able to scan this in 60 seconds and understand the overall situation.
 
-- scopeNarrative: Describe the full scope of the engagement in detail. Cover: the target domain and any subdomains enumerated, the number of IP addresses discovered and whether they are CDN-fronted or directly exposed, the total endpoints and parameters crawled, services and open ports identified, and technologies fingerprinted with their versions. If Rules of Engagement context is available (client name, engagement type, dates), incorporate it. Describe the methodology: automated reconnaissance (subdomain enumeration, port scanning, web crawling, technology fingerprinting), vulnerability correlation (CVE matching against detected technologies), exploit validation (confirmed exploitation attempts), and manual analysis. Mention the graph-based approach to mapping relationships between assets, vulnerabilities, and attack paths.
+- scopeNarrative: Describe the full scope of the engagement in detail. Cover: the target (a domain, or for a domain batch its scope groups: the scan roots and the registrable domains they belong to) and any subdomains enumerated, the number of IP addresses discovered and whether they are CDN-fronted or directly exposed, the total endpoints and parameters crawled, services and open ports identified, and technologies fingerprinted with their versions. If Rules of Engagement context is available (client name, engagement type, dates), incorporate it. Describe the methodology: automated reconnaissance (subdomain enumeration, port scanning, web crawling, technology fingerprinting), vulnerability correlation (CVE matching against detected technologies), exploit validation (confirmed exploitation attempts), and manual analysis. Mention the graph-based approach to mapping relationships between assets, vulnerabilities, and attack paths.
 
 - riskNarrative: This is the DETAILED TECHNICAL ANALYSIS section. It expands on everything the Executive Summary only summarizes. It must be EXTENSIVE (8-12 paragraphs minimum). Structure as follows:
 
@@ -159,15 +159,16 @@ async def generate_report_narratives(
 
     except json.JSONDecodeError as e:
         logger.error(f"Report summarizer: invalid JSON from LLM: {type(e).__name__}: {e}")
-        return _empty_narratives()
+        return {**_empty_narratives(), "narratives_failed": "unreadable_answer"}
     except Exception as e:
         # A refused key or unknown model is the person's to fix, so it reaches
         # the endpoint and opens the model picker; empty narratives would hide it.
-        from llm_builder import is_model_unavailable_error
+        from llm_builder import is_model_unavailable_error, provider_error_details
         if is_model_unavailable_error(e):
             raise
         logger.error(f"Report summarizer error: {type(e).__name__}: {e}")
-        return _empty_narratives()
+        # The report is still built, without narratives; the marker says why.
+        return {**_empty_narratives(), "narratives_failed": "model_call_failed", **provider_error_details(e)}
 
 
 def _condense_for_llm(data: dict) -> dict:

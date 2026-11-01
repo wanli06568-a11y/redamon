@@ -106,6 +106,7 @@ import {
 import { MUTEABLE_FINDING_LABELS } from '@/lib/mcp/findingLabels'
 import { listGraphViews, runGraphView } from '@/lib/mcp/viewTools'
 import { FINDING_SECTIONS, listFindings, listMuted } from '@/lib/mcp/findingTools'
+import { DISPOSITIONS } from '@/lib/triage/disposition'
 import { compareScanVersions, listScanVersions } from '@/lib/mcp/versionTools'
 import { startRecon, stopRecon, updateReconSettings } from '@/lib/mcp/writeTools'
 import {
@@ -344,7 +345,10 @@ export function buildMcpServer(ctx: McpContext, instructions?: string): McpServe
       description:
         'List the RedAmon projects this token can reach. The token belongs to one user and ' +
         'only ever sees that user\'s own projects. Start here to discover a projectId; every ' +
-        'other tool needs one. This does not report scan state - use get_recon_status for that.',
+        'other tool needs one. This does not report scan state - use get_recon_status for that.\n\n' +
+        'Each project carries `scopeSummary`, its scope in one line, and `enumerateGroupCount`, ' +
+        'how many of its scope groups are fully enumerated: that is the difference between a ' +
+        'five-host scan and a multi-hour one.',
       annotations: READ_ONLY,
       _meta: scopesMeta({ required: ['recon:read'] }),
       inputSchema: {},
@@ -358,8 +362,10 @@ export function buildMcpServer(ctx: McpContext, instructions?: string): McpServe
       title: 'Get recon status',
       description:
         'Report whether a full recon scan is running for this project, and its current phase. ' +
-        'If the orchestrator cannot be reached this reports "status unknown" and fails - it ' +
-        'never reports "not running", because those are different facts.',
+        'For a domain batch, `currentGroup` is the scan root of the scope group being scanned ' +
+        '(for example "api.example.com" for a "*.api.example.com" entry), not its registrable ' +
+        'domain. If the orchestrator cannot be reached this reports "status unknown" and fails - ' +
+        'it never reports "not running", because those are different facts.',
       annotations: READ_ONLY,
       _meta: scopesMeta({ required: ['recon:read'] }),
       inputSchema: { projectId: projectIdSchema.describe('From list_projects.') },
@@ -394,10 +400,17 @@ export function buildMcpServer(ctx: McpContext, instructions?: string): McpServe
       title: 'Summarise the attack-surface graph',
       description:
         'What this project ACTUALLY contains: a count per node type, the relationships present, ' +
-        'the current scan version, and whether the live graph is settled.\n\n' +
-        'Read this before concluding that something is absent. If a node type is missing ' +
-        'entirely, that surface was never scanned - which is a very different answer from "it ' +
-        'was scanned and is clean". Counts only, never sample values.\n\n' +
+        'the current scan version, whether the live graph is settled, and a `coverage` block: per ' +
+        'module (js_recon, nuclei), how many web hosts (BaseURL) it analyzed `complete`, `partial`, ' +
+        'found `no_input` on or `failed` on, and how many live hosts it never looked at ' +
+        '(`not_scanned`). `recorded: false` means the project predates coverage records.\n\n' +
+        'Read this before concluding that something is absent. A node type missing from the counts ' +
+        'means one of three things: never scanned, scanned and clean, or every such finding ' +
+        'suppressed (suppressed findings are not counted). Check `coverage` and the suppressed ' +
+        'findings before calling anything clean. Counts only, never sample values.\n\n' +
+        'When the settled graph holds far fewer nodes than a saved version, or none after a ' +
+        'completed full scan, `warning` is "graph_data_missing" and `graphDataMissing` says what ' +
+        'was expected: the data was lost, so the graph\'s contents are UNKNOWN, not empty.\n\n' +
         `${GRAPH_TOOL_USAGE}`,
       annotations: READ_ONLY,
       _meta: scopesMeta({ required: ['recon:read'] }),
@@ -489,6 +502,18 @@ export function buildMcpServer(ctx: McpContext, instructions?: string): McpServe
         'that review still describes the evidence. get_finding_triage says why a finding ranks ' +
         'where it does. `decidedBy`, `reviewedVia` and `reviewCurrent` filter in the graph, so ' +
         'their `total` is exact.\n\n' +
+        '`disposition` answers "can this go in a report?", as the RedAmon report counts it. ' +
+        'Report ONLY `reportable` findings (proven by an exploit or a validator, or confirmed by ' +
+        'a person). Treat `candidate` as "verify first": its `blocker` says what is missing: the ' +
+        'first report gate the run found failing (`not reachable now`, `shared edge`, `failed ' +
+        'its control check`, `no impact shown`) or could not tell (`unknown: <gate>`); an AI ' +
+        'review that called it a likely false positive, which is NOT a person\'s verdict; or, ' +
+        'on a finding no current run has rescored, its tier rule or `not triaged yet`. ' +
+        '`shared edge` means a CDN edge may be what answered, never that the target does not ' +
+        'own the finding. `info` has no impact even if ' +
+        'real; `excluded` was judged a false positive by a person, or resolved. The ' +
+        '`disposition`, `severity` and `section` filters apply to the highest-ranked window this ' +
+        'tool reads; `totalIsPartial` says when that window was full.\n\n' +
         'With the separate mute permission, hide noise you have independent evidence for with ' +
         'mute_findings (it takes either id).\n\n' +
         `${UNTRUSTED_DATA_NOTE}`,
@@ -501,6 +526,8 @@ export function buildMcpServer(ctx: McpContext, instructions?: string): McpServe
         severity: z.string().optional().describe('critical | high | medium | low | info.'),
         section: z.enum(FINDING_SECTIONS as [string, ...string[]]).optional()
           .describe('Narrow to one board section.'),
+        disposition: z.enum(DISPOSITIONS).optional()
+          .describe('Narrow to one disposition: reportable | candidate | info | excluded.'),
         decidedBy: z.enum(['person', 'review', 'rules']).optional()
           .describe('Only findings whose final score this layer set.'),
         reviewedVia: z.enum(['builtin', 'mcp', 'none']).optional()
@@ -516,7 +543,7 @@ export function buildMcpServer(ctx: McpContext, instructions?: string): McpServe
       'list_findings',
       a => listFindings(ctx, a.projectId, {
         limit: a.limit, offset: a.offset, severity: a.severity,
-        section: a.section, includeQuotes: a.includeQuotes,
+        section: a.section, disposition: a.disposition, includeQuotes: a.includeQuotes,
         decidedBy: a.decidedBy, reviewedVia: a.reviewedVia, reviewCurrent: a.reviewCurrent,
       }),
       a => a.projectId
@@ -659,6 +686,9 @@ export function buildMcpServer(ctx: McpContext, instructions?: string): McpServe
         'Counts and names only: no property values are returned.\n\n' +
         'Each side hides its own muted findings, so a finding muted after a version was frozen ' +
         'shows as resolved, and one unmuted since shows as added. Neither changed on the target.\n\n' +
+        'A version saved before the graph named its Domain nodes after the registrable domain ' +
+        '(api.example.com became a Subdomain of Domain example.com) differs from a later one in ' +
+        'its Domain nodes once, across that change; the hosts beneath them did not change.\n\n' +
         `${UNTRUSTED_DATA_NOTE}`,
       annotations: READ_ONLY,
       _meta: scopesMeta({ required: ['recon:read'] }),
@@ -875,9 +905,16 @@ export function buildMcpServer(ctx: McpContext, instructions?: string): McpServe
         'Use it to orient before asking anything specific - it costs one query where the same ' +
         'picture assembled from natural-language questions costs many and is easy to get subtly ' +
         'wrong.\n\n' +
-        'Counts exclude suppressed findings and findings a later scan stopped reporting, so they ' +
-        'agree with graph_summary. A category at zero can mean that surface was never scanned; ' +
+        'Counts exclude suppressed findings and findings a later scan stopped reporting, as ' +
+        'graph_summary does. A category at zero can mean that surface was never scanned; ' +
         'graph_summary and get_project_activity are how you tell those apart.\n\n' +
+        'Finding counts also leave out what a person judged a false positive on the Priority ' +
+        'Board and what the board resolved (fixed, gone, inactive), as the client report does; ' +
+        'for vulnerabilities those are counted separately, as judgedFalsePositiveVulnerabilities ' +
+        'and resolvedVulnerabilities. A finding only an AI review flagged as a false positive is ' +
+        'still counted; aiFlaggedVulnerabilities says how many.\n\n' +
+        'Endpoints and parameters known only from an API specification are counted apart, as ' +
+        'declaredEndpoints and declaredParameters: documented, not observed.\n\n' +
         `${UNTRUSTED_DATA_NOTE}`,
       annotations: READ_ONLY,
       _meta: scopesMeta({ required: ['recon:read'] }),
@@ -898,7 +935,8 @@ export function buildMcpServer(ctx: McpContext, instructions?: string): McpServe
         'guessed from a severity label.\n\n' +
         '`cisaKev` means an exploit record for that CVE exists in THIS project\'s graph, not that ' +
         'the CVE appears on a public exploited list. `reachedBy` counts how many web origins, ' +
-        'services and ports run the technology: it is exposure, not severity.\n\n' +
+        'services and ports run the technology: it is exposure, not severity. An exploit record ' +
+        'a person judged a false positive, or the Priority Board resolved, does not count.\n\n' +
         `${UNTRUSTED_DATA_NOTE}`,
       annotations: READ_ONLY,
       _meta: scopesMeta({ required: ['recon:read'] }),
@@ -916,7 +954,8 @@ export function buildMcpServer(ctx: McpContext, instructions?: string): McpServe
         'technology and version, how many CVEs affect it, the worst CVSS among them, how many ' +
         'known exploits exist, and how many web origins, services and ports run it.\n\n' +
         'The top row is usually the highest-leverage single fix, which is a different question ' +
-        'from "what is the worst finding" and often has a different answer.\n\n' +
+        'from "what is the worst finding" and often has a different answer. An exploit record a ' +
+        'person judged a false positive, or the Priority Board resolved, is not counted.\n\n' +
         `${UNTRUSTED_DATA_NOTE}`,
       annotations: READ_ONLY,
       _meta: scopesMeta({ required: ['recon:read'] }),
@@ -937,7 +976,10 @@ export function buildMcpServer(ctx: McpContext, instructions?: string): McpServe
         'budget, and returns the same thing every time. Run one with run_graph_view.\n\n' +
         'The query text itself is deliberately not shown. Note a view saved in the app can still ' +
         'be refused here: this surface proves a query is tenant-scoped and read-only by stricter ' +
-        'rules than the app applies.',
+        'rules than the app applies.\n\n' +
+        '`mayNeedUpdate` is true when a view names a Domain the graph no longer has: Domain nodes ' +
+        'carry the registrable domain, so a view written for `api.example.com` as a Domain now ' +
+        'returns nothing. Its rows would read as a clean target; tell the person instead.',
       annotations: READ_ONLY,
       _meta: scopesMeta({ required: ['recon:read'] }),
       inputSchema: { projectId: projectIdSchema },
@@ -982,8 +1024,10 @@ export function buildMcpServer(ctx: McpContext, instructions?: string): McpServe
         'mode.\n\n' +
         'Three things to know. A queued job can wait minutes or hours - poll it with ' +
         'get_project_activity, never by queueing again. A job that becomes "needs_review" is ' +
-        'PARKED because the project settings changed after it was queued, and only a person can ' +
-        'release it; no tool here can. And a queued job OUTLIVES this token: revoking the token ' +
+        'PARKED, because the project settings changed after it was queued or because its start ' +
+        'got no answer (the scan may have started), and only a person can release it; no tool ' +
+        'here can. A start that fails on a passing orchestrator error is retried with backoff. ' +
+        'And a queued job OUTLIVES this token: revoking the token ' +
         'does not cancel it, only cancel_queued_scan does.\n\n' +
         'One full recon can be queued per project at a time.',
       annotations: {
@@ -1558,8 +1602,12 @@ export function buildMcpServer(ctx: McpContext, instructions?: string): McpServe
     {
       title: 'Stop a running recon scan',
       description:
-        'Stop the full recon scan running for this project. If the orchestrator cannot be ' +
-        'reached this reports that the outcome is unknown rather than claiming it stopped.',
+        'Stop the full recon scan running for this project. The stop is asynchronous: it answers ' +
+        'with status "stopping" at once, the scan\'s tool containers end at once, and the scan ' +
+        'then lands its queued graph writes and applies the project\'s mute rules within a grace ' +
+        '(45 s by default) before get_recon_status reads idle. A new start is refused until then. ' +
+        'If the orchestrator cannot be reached this reports that the outcome is unknown rather ' +
+        'than claiming it stopped.',
       // Aborting a scan is not an additive update, which is what the spec means
       // by destructiveHint: false.
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
@@ -1733,6 +1781,10 @@ export function buildMcpServer(ctx: McpContext, instructions?: string): McpServe
         'Note that roeGlobalMaxRps 0 means NO ceiling rather than a slow one.\n\n' +
         'Only a DIGEST of the scope document is stored, never the document. Pass documentSha256, ' +
         'or pass documentText and it is digested here.\n\n' +
+        'The permanent guardrail checks every host and root and cannot be switched off. The ' +
+        'target guardrail (a model judging whether the target looks like one nobody may test) ' +
+        'runs as well, unless settings.targetGuardrailEnabled is false; it is refused as ' +
+        '`target_blocked`.\n\n' +
         'Pass idempotencyKey, derived from the authorization digest and the program handle. A ' +
         'second call with the same key returns the FIRST project instead of creating another, ' +
         'which is what makes a retried run safe.\n\n' +
@@ -1752,23 +1804,30 @@ export function buildMcpServer(ctx: McpContext, instructions?: string): McpServe
         engagementKind: z.enum(['internal', 'third_party'])
           .describe('Whose estate the target is. third_party requires a ceiling and an authorization.'),
         targetDomain: z.string().max(253).optional()
-          .describe('Single-domain mode. Mutually exclusive with the other two.'),
+          .describe('Single-domain mode. Mutually exclusive with the other two. A domain or a '
+            + 'subdomain at any depth ("api.example.com"), stored lower-cased and with a leading '
+            + '"*." dropped; a public suffix ("co.uk") or an IP address is refused.'),
         targetIps: z.array(z.string().max(64)).max(1000).optional()
           .describe('IP / CIDR mode. Mutually exclusive with the other two.'),
         domainBatchHosts: z.array(z.string().max(253)).max(500).optional()
-          .describe('Domain-batch mode: the raw host list. The server derives the grouping. '
-            + 'An entry may be a wildcard - "*.example.com" or "*example.com" - which makes '
-            + 'that one domain be fully enumerated (subdomain discovery, as single-domain '
-            + 'mode runs it) instead of scanned as listed; every other entry stays literal. '
-            + 'A wildcard must name a registrable domain, not a deeper name and not a public '
-            + 'suffix. Listing the BARE domain alongside a wildcard ("example.com" next to '
-            + '"*.example.com") also puts the apex itself in scope; a wildcard on its own '
-            + 'scans only what enumeration discovers beneath it. That is the same control '
-            + 'the project form calls "Root" - there is no separate flag, the list is the '
-            + 'whole interface. The project form can edit the list later, and so can '
-            + 'update_project_scope, which needs its own permission.'),
+          .describe('Domain-batch mode: the raw host list. The server derives the scope groups, '
+            + 'one per scan root, grouped by registrable domain (Public Suffix List: '
+            + '"www.acme.co.uk" belongs to acme.co.uk). An entry is a host, scanned exactly as '
+            + 'listed, or a wildcard at any depth - "*.example.com", "*.api.example.com" or '
+            + '"*example.com" - which makes that name a scan root that is fully enumerated '
+            + '(subdomain discovery, as single-domain mode runs it). A host under a wildcard is '
+            + 'seeded into its group; a wildcard under another one is covered by it. A wildcard '
+            + 'on a public suffix ("*.co.uk", "*.github.io") is refused. Listing the BARE name '
+            + 'alongside its wildcard ("api.example.com" next to "*.api.example.com") also puts '
+            + 'that name itself in scope; a wildcard on its own scans only what enumeration '
+            + 'discovers beneath it. That is the same control the project form calls "Root" - '
+            + 'there is no separate flag, the list is the whole interface. The project form '
+            + 'can edit the list later, and so can update_project_scope, which needs its own '
+            + 'permission.'),
         subdomainList: z.array(z.string().max(253)).max(5000).optional()
-          .describe('Hosts seeded in addition to whatever discovery finds.'),
+          .describe('Single-domain mode only. Empty: the domain is fully enumerated. Otherwise '
+            + 'prefixes ("www.", "eu.api.") naming the ONLY hosts scanned, with no discovery; '
+            + '"." puts the domain itself in scope as well.'),
         engagementIdentityHeader: z.string().max(400).optional()
           .describe('"Name: value", sent with every request so the target can attribute it to you.'),
         settings: z.record(z.string(), z.unknown()).optional()
@@ -1854,15 +1913,20 @@ export function buildMcpServer(ctx: McpContext, instructions?: string): McpServe
         'target guardrail stay fixed whatever the token holds; a different target is a different ' +
         'project (create_project).\n\n' +
         'domainBatchHosts replaces a domain-batch project\'s host list (only on a project created ' +
-        'in batch mode); the grouping is re-derived here, and every root goes through the ' +
-        'permanent guardrail. gvmScanTargets is both, ips_only or hostnames_only. GitHub names and ' +
+        'in batch mode); the scope groups are re-derived here, every host, scan root and ' +
+        'registrable domain goes through the permanent guardrail, and the new list through the ' +
+        'target guardrail unless the project switched it off. An active login recording is re-pointed at the new list. ' +
+        'gvmScanTargets is both, ips_only or hostnames_only. GitHub names and ' +
         'the supply-chain repository are validated as the form validates them.\n\n' +
-        'On a THIRD-PARTY engagement a widening - a new batch host or root, a new GitHub ' +
+        'A widening is a list that admits a host the old one did not; a regroup, or a narrower ' +
+        'wildcard under an enumerated one ("*.api.example.com" inside "*.example.com"), is not. ' +
+        'On a THIRD-PARTY engagement a widening - a new batch host or scan root, a new GitHub ' +
         'organisation, more repositories, a new supply-chain organisation or repository - is ' +
         'refused unless `authorization` records what authorized the wider scope, in the same ' +
         'transaction. Passing `authorization` needs the engagement:authorize permission too. ' +
         'Removals and narrowing need neither.\n\n' +
-        'A batch that gains hosts also PAUSES the project\'s scan schedules in the same ' +
+        'A batch that admits a host it did not before also PAUSES the project\'s scan ' +
+        'schedules in the same ' +
         'transaction, so no unattended run reaches the new hosts first; the result lists them in ' +
         '`pausedSchedules`, and only a person re-enables them, in the Scans tab.\n\n' +
         'Refused while anything reads or writes this project\'s graph. A compare-and-swap on the ' +
@@ -1931,14 +1995,21 @@ export function buildMcpServer(ctx: McpContext, instructions?: string): McpServe
         'back to the default, a wordlist path outside this project\'s directory is dropped. An ' +
         'agent that only read the first would believe a rejected value was accepted.\n\n' +
         'It also names every enabled tool whose PHASE is not in scanModules. Those are the ' +
-        'silent no-ops: the scan succeeds, that tool never runs, and no result field says why.\n\n' +
+        'silent no-ops: the scan succeeds, that tool never runs, and no result field says why. ' +
+        'JS recon is no phase: it is named when jsReconEnabled is on with neither resource_enum ' +
+        'nor http_probe to feed it, and its options when jsReconEnabled is off.\n\n' +
         '`aiHooks` gives, for each recon hook that can run on Jev, its kind, the engine the row ' +
         'asks for and the one that will run. An `engine` hook asks for llm or jev; an `enable` ' +
         'hook (Jev-only) asks for off or jev. Every hook is off when ' +
         'aiInPipeline is off, and a hook on Jev reads as its static fallback when the project ' +
         'owner has no Jev token.\n\n' +
+        '`scope.scopeGroups` is the scope the scan runs, derived from the saved targets: one ' +
+        'group per scan root, `enumerate` (subdomain discovery) or `exact` (only the listed ' +
+        'hosts), and whether the root itself is a target. `scope.invalidEntries` lists saved ' +
+        'entries the current rules refuse.\n\n' +
         '`startable` is false when a third-party engagement is missing its ceiling or its ' +
-        'authorization record, which is exactly what start_recon will refuse on.',
+        'authorization record, or the saved scope holds a refused entry, which is exactly what ' +
+        'start_recon will refuse on.',
       annotations: READ_ONLY,
       _meta: scopesMeta({ required: ['recon:read'] }),
       inputSchema: { projectId: projectIdSchema },

@@ -11,10 +11,10 @@
  * Run: npx vitest run src/hooks/useAgentWebSocket.test.tsx
  */
 import { describe, test, expect, beforeEach, afterEach, vi } from 'vitest'
-import { renderHook, act, waitFor } from '@testing-library/react'
+import { renderHook, act, waitFor, cleanup } from '@testing-library/react'
 import { ConnectionStatus } from '@/lib/websocket-types'
 
-vi.mock('./agentWsUrl', () => ({ buildAgentWsUrl: () => 'ws://agent.test/ws/agent' }))
+vi.mock('./agentWsUrl', () => ({ buildAgentWsUrl: () => 'ws://agent.test/ws/agent?probe=1' }))
 
 import { useAgentWebSocket } from './useAgentWebSocket'
 
@@ -34,8 +34,9 @@ class FakeSocket {
     FakeSocket.instances.push(this)
   }
   send(data: string) { this.sent.push(data) }
-  close() { /* the hook detaches handlers before calling this */ }
-  fireClose(code: number) { this.onclose?.({ code, reason: '', wasClean: false } as CloseEvent) }
+  closed = false
+  close() { this.closed = true /* the hook detaches handlers before calling this */ }
+  fireClose(code: number, reason = '') { this.onclose?.({ code, reason, wasClean: false } as CloseEvent) }
 }
 
 const config = {
@@ -100,5 +101,272 @@ describe('useAgentWebSocket auth rejection (#173)', () => {
 
     expect(result.current.status).toBe(ConnectionStatus.RECONNECTING)
     await waitFor(() => expect(FakeSocket.instances.length).toBeGreaterThan(1))
+  })
+})
+
+// ---------------------------------------------------------------------------
+// "Agent stuck" incident: Stop clicks that vanished while the socket was down,
+// a half-open socket nobody noticed, and reconnects that dropped a live run.
+// ---------------------------------------------------------------------------
+
+function deliver(sock: FakeSocket, type: string, payload: Record<string, unknown> = {}) {
+  sock.onmessage?.({ data: JSON.stringify({ type, payload, timestamp: 't' }) } as MessageEvent)
+}
+const sentTypes = (sock: FakeSocket) => sock.sent.map(s => JSON.parse(s).type)
+
+async function openAndConnect(sock: FakeSocket, payload: Record<string, unknown> = {}) {
+  await act(async () => { sock.onopen?.() })
+  act(() => deliver(sock, 'connected', payload))
+}
+
+describe('useAgentWebSocket outbox', () => {
+  test('Stop and guidance sent while not connected go out right after CONNECTED', async () => {
+    const { result } = renderHook(() => useAgentWebSocket(config))
+    await waitFor(() => expect(FakeSocket.instances).toHaveLength(1))
+    const sock = FakeSocket.instances[0]
+    await act(async () => { sock.onopen?.() })
+    await waitFor(() => expect(sentTypes(sock)).toEqual(['init']))
+
+    act(() => { result.current.sendGuidance('is it running?'); result.current.sendStop() })
+    expect(sentTypes(sock)).toEqual(['init'])   // not authenticated yet: held, not dropped
+
+    act(() => deliver(sock, 'connected', { agent_running: true }))
+    expect(sentTypes(sock)).toEqual(['init', 'guidance', 'stop'])
+  })
+
+  test('a Stop clicked during a drop is delivered on the new connection', async () => {
+    const { result } = renderHook(() => useAgentWebSocket(config))
+    await waitFor(() => expect(FakeSocket.instances).toHaveLength(1))
+    await openAndConnect(FakeSocket.instances[0])
+    act(() => { FakeSocket.instances[0].fireClose(1006) })
+
+    act(() => { result.current.sendStop() })
+    await waitFor(() => expect(FakeSocket.instances).toHaveLength(2))
+    const next = FakeSocket.instances[1]
+    await openAndConnect(next)
+    expect(sentTypes(next)).toContain('stop')
+  })
+
+  test('queries are never queued: a stale question must not replay later', async () => {
+    const { result } = renderHook(() => useAgentWebSocket(config))
+    await waitFor(() => expect(FakeSocket.instances).toHaveLength(1))
+    act(() => { result.current.sendQuery('old question') })
+    await openAndConnect(FakeSocket.instances[0])
+    expect(sentTypes(FakeSocket.instances[0])).not.toContain('query')
+  })
+})
+
+describe('useAgentWebSocket connection truth', () => {
+  test('onConnect receives the server payload with agent_running', async () => {
+    const onConnect = vi.fn()
+    renderHook(() => useAgentWebSocket({ ...config, onConnect }))
+    await waitFor(() => expect(FakeSocket.instances).toHaveLength(1))
+    await openAndConnect(FakeSocket.instances[0], { agent_running: false, session_id: 's1' })
+    expect(onConnect).toHaveBeenCalledWith(expect.objectContaining({ agent_running: false }))
+  })
+
+  test('a half-open socket (pings, no pongs) is replaced instead of freezing the page', async () => {
+    vi.useFakeTimers()
+    try {
+      renderHook(() => useAgentWebSocket(config))
+      expect(FakeSocket.instances).toHaveLength(1)
+      const sock = FakeSocket.instances[0]
+      await openAndConnect(sock)
+
+      act(() => { vi.advanceTimersByTime(30_000) })
+      expect(sentTypes(sock).at(-1)).toBe('ping')
+      act(() => deliver(sock, 'pong'))
+      act(() => { vi.advanceTimersByTime(60_000) })   // 60s since the last pong: still fine
+      expect(FakeSocket.instances).toHaveLength(1)
+
+      act(() => { vi.advanceTimersByTime(30_000) })   // 90s without a pong
+      expect(FakeSocket.instances).toHaveLength(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  test('a socket that keeps answering is never replaced', async () => {
+    vi.useFakeTimers()
+    try {
+      renderHook(() => useAgentWebSocket(config))
+      const sock = FakeSocket.instances[0]
+      await openAndConnect(sock)
+      for (let i = 0; i < 10; i++) {
+        act(() => { vi.advanceTimersByTime(30_000) })
+        act(() => deliver(sock, 'pong'))
+      }
+      expect(FakeSocket.instances).toHaveLength(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+describe('useAgentWebSocket graph-view changes', () => {
+  test('a view change during a run waits for the run to end, then reconnects with it', async () => {
+    const { rerender } = renderHook(
+      (p: { graphViewCypher: string; runActive: boolean }) => useAgentWebSocket({ ...config, ...p }),
+      { initialProps: { graphViewCypher: 'MATCH (a) RETURN a', runActive: true } },
+    )
+    await waitFor(() => expect(FakeSocket.instances).toHaveLength(1))
+    await openAndConnect(FakeSocket.instances[0])
+
+    rerender({ graphViewCypher: 'MATCH (b) RETURN b', runActive: true })
+    await new Promise(r => setTimeout(r, 30))
+    expect(FakeSocket.instances).toHaveLength(1)   // the live run keeps its stream
+
+    rerender({ graphViewCypher: 'MATCH (b) RETURN b', runActive: false })
+    await waitFor(() => expect(FakeSocket.instances).toHaveLength(2))
+    const next = FakeSocket.instances[1]
+    await act(async () => { next.onopen?.() })
+    await waitFor(() => expect(next.sent).toHaveLength(1))
+    expect(JSON.parse(next.sent[0]).payload.graph_view_cypher).toBe('MATCH (b) RETURN b')
+  })
+
+  test('with no run going, a view change reconnects at once', async () => {
+    const { rerender } = renderHook(
+      (p: { graphViewCypher: string }) => useAgentWebSocket({ ...config, ...p }),
+      { initialProps: { graphViewCypher: 'A' } },
+    )
+    await waitFor(() => expect(FakeSocket.instances).toHaveLength(1))
+    await openAndConnect(FakeSocket.instances[0])
+    rerender({ graphViewCypher: 'B' })
+    await waitFor(() => expect(FakeSocket.instances).toHaveLength(2))
+  })
+})
+
+describe('useAgentWebSocket outbox is per session', () => {
+  test('a Stop queued for one session never reaches the session the page switched to', async () => {
+    const { result, rerender } = renderHook(
+      (p: { sessionId: string }) => useAgentWebSocket({ ...config, ...p }),
+      { initialProps: { sessionId: 's1' } },
+    )
+    await waitFor(() => expect(FakeSocket.instances).toHaveLength(1))
+    act(() => { result.current.sendStop() })          // s1 not connected yet: queued
+    rerender({ sessionId: 's2' })                      // operator opens another session
+    await waitFor(() => expect(FakeSocket.instances).toHaveLength(2))
+    const s2 = FakeSocket.instances[1]
+    await openAndConnect(s2)
+    expect(sentTypes(s2)).not.toContain('stop')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// G-1 / G-2 / G-43: the drawer is told why the socket is not connected.
+// ---------------------------------------------------------------------------
+
+function stubMint(status: number, body: unknown) {
+  vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify(body), {
+    status, headers: { 'Content-Type': 'application/json' },
+  })))
+}
+
+describe('useAgentWebSocket says why it is not connected', () => {
+  // A hook left mounted keeps reconnecting into the next test's sockets.
+  afterEach(() => { cleanup() })
+
+  test('a refused ticket mint stops with its own reason, not the auth hint, and sends no init', async () => {
+    stubMint(409, { error: 'A version activation is in progress for this project - the graph is being swapped. Try again once it finishes.' })
+    const { result } = renderHook(() => useAgentWebSocket(config))
+    await waitFor(() => expect(FakeSocket.instances).toHaveLength(1))
+    const sock = FakeSocket.instances[0]
+    await act(async () => { sock.onopen?.() })
+
+    await waitFor(() => expect(result.current.status).toBe(ConnectionStatus.FAILED))
+    expect(result.current.error?.message).toBe(
+      'Could not get a ticket for the agent connection: A version activation is in progress for this project - the graph is being swapped. Try again once it finishes. (HTTP 409)',
+    )
+    expect(result.current.error?.message).not.toContain('redamon.sh update')
+    expect(sock.sent).toHaveLength(0)
+    expect(sock.closed).toBe(true)
+    await new Promise(r => setTimeout(r, 40))
+    expect(FakeSocket.instances).toHaveLength(1)
+  })
+
+  test('an expired session at mint time says 401', async () => {
+    stubMint(401, { error: 'Unauthorized' })
+    const { result } = renderHook(() => useAgentWebSocket(config))
+    await waitFor(() => expect(FakeSocket.instances).toHaveLength(1))
+    await act(async () => { FakeSocket.instances[0].onopen?.() })
+    await waitFor(() => expect(result.current.error?.message).toBe(
+      'Could not get a ticket for the agent connection: Unauthorized (HTTP 401)',
+    ))
+  })
+
+  test('the update hint appears only when a ticket secret is really missing', async () => {
+    const { result } = renderHook(() => useAgentWebSocket(config))
+    await waitFor(() => expect(FakeSocket.instances).toHaveLength(1))
+    const sock = FakeSocket.instances[0]
+    await act(async () => { sock.onopen?.() })
+    await waitFor(() => expect(sock.sent).toHaveLength(1))   // a ticket was minted and sent
+    act(() => { sock.fireClose(1008, 'Invalid or missing ticket') })
+    expect(result.current.error?.message).toContain('the agent rejected the session ticket (close 1008: Invalid or missing ticket)')
+    expect(result.current.error?.message).not.toContain('redamon.sh update')
+  })
+
+  test('an agent without the secret says so, with the update hint', async () => {
+    const { result } = renderHook(() => useAgentWebSocket(config))
+    await waitFor(() => expect(FakeSocket.instances).toHaveLength(1))
+    const sock = FakeSocket.instances[0]
+    await act(async () => { sock.onopen?.() })
+    await waitFor(() => expect(sock.sent).toHaveLength(1))
+    act(() => { sock.fireClose(1008, 'ticket auth not configured') })
+    expect(result.current.error?.message).toBe(
+      'Agent WebSocket authentication failed: the agent has no AGENT_WS_TICKET_SECRET. Run ./redamon.sh update, then restart the agent.',
+    )
+  })
+
+  test('the close code and reason are kept while reconnecting, and the URL has no query', async () => {
+    const { result } = renderHook(() => useAgentWebSocket(config))
+    await waitFor(() => expect(FakeSocket.instances).toHaveLength(1))
+    expect(result.current.url).toBe('ws://agent.test/ws/agent')
+    act(() => { FakeSocket.instances[0].fireClose(1011, 'Orchestrator not initialized') })
+    expect(result.current.status).toBe(ConnectionStatus.RECONNECTING)
+    expect(result.current.lastClose).toEqual({ code: 1011, reason: 'Orchestrator not initialized' })
+    await waitFor(() => expect(FakeSocket.instances).toHaveLength(2))
+    expect(result.current.lastClose).toEqual({ code: 1011, reason: 'Orchestrator not initialized' })
+  })
+
+  test('giving up names the last close and the URL', async () => {
+    const { result } = renderHook(() => useAgentWebSocket({ ...config, maxReconnectAttempts: 1 }))
+    await waitFor(() => expect(FakeSocket.instances).toHaveLength(1))
+    act(() => { FakeSocket.instances[0].fireClose(1013, 'Server busy (low memory) - retry shortly') })
+    await waitFor(() => expect(FakeSocket.instances).toHaveLength(2))
+    act(() => { FakeSocket.instances[1].fireClose(1013, 'Server busy (low memory) - retry shortly') })
+    expect(result.current.status).toBe(ConnectionStatus.FAILED)
+    expect(result.current.error?.message).toBe(
+      'Max reconnection attempts reached (last close 1013: Server busy (low memory) - retry shortly) · ws://agent.test/ws/agent',
+    )
+  })
+
+  test('a connect clears the kept close', async () => {
+    const { result } = renderHook(() => useAgentWebSocket(config))
+    await waitFor(() => expect(FakeSocket.instances).toHaveLength(1))
+    act(() => { FakeSocket.instances[0].fireClose(1006) })
+    await waitFor(() => expect(FakeSocket.instances).toHaveLength(2))
+    await openAndConnect(FakeSocket.instances[1])
+    expect(result.current.lastClose).toBeNull()
+  })
+
+  test('decisions report whether they were sent instead of vanishing', async () => {
+    const { result } = renderHook(() => useAgentWebSocket(config))
+    await waitFor(() => expect(FakeSocket.instances).toHaveLength(1))
+    let sent: boolean[] = []
+    act(() => {
+      sent = [
+        result.current.sendApproval('approve'),
+        result.current.sendAnswer('yes'),
+        result.current.sendToolConfirmation('approve'),
+        result.current.sendFireteamMemberConfirmation('w', 'm', 'approve'),
+      ]
+    })
+    expect(sent).toEqual([false, false, false, false])
+    await openAndConnect(FakeSocket.instances[0])
+    // Not queued: nothing replays after the connect.
+    expect(sentTypes(FakeSocket.instances[0])).toEqual(['init'])
+    act(() => { sent = [result.current.sendApproval('approve')] })
+    expect(sent).toEqual([true])
+    expect(sentTypes(FakeSocket.instances[0])).toEqual(['init', 'approval'])
   })
 })

@@ -47,6 +47,7 @@ export const TOOL_WIKI: Record<string, { page: string; anchor?: string }> = {
 
   // HTTP Probing
   Httpx:              { page: 'Project-Settings-Reference', anchor: 'http-prober-httpx' },
+  IpAttribution:      { page: 'Project-Settings-Reference', anchor: 'ip-attribution' },
 
   // Resource Enumeration
   Katana:             { page: 'Project-Settings-Reference', anchor: 'web-crawler-katana' },
@@ -57,6 +58,7 @@ export const TOOL_WIKI: Record<string, { page: string; anchor?: string }> = {
   Gau:                { page: 'Project-Settings-Reference', anchor: 'passive-url-discovery-gau' },
   ParamSpider:        { page: 'Project-Settings-Reference', anchor: 'paramspider-passive-parameter-discovery' },
   Kiterunner:         { page: 'Project-Settings-Reference', anchor: 'api-discovery-kiterunner' },
+  OpenAPI:            { page: 'Project-Settings-Reference', anchor: 'openapi-import' },
   Arjun:              { page: 'Project-Settings-Reference', anchor: 'parameter-discovery-arjun' },
 
   // JS Recon
@@ -75,6 +77,7 @@ export const TOOL_WIKI: Record<string, { page: string; anchor?: string }> = {
   VhostSni:           { page: 'VHost-and-SNI-Enumeration' },
   Tlsx:               { page: 'TLS-Certificate-Grab' },
   WebCachePoison:     { page: 'Web-Cache-Poisoning' },
+  RouteExposure:      { page: 'Route-Exposure-Scan' },
 
   // CVE & MITRE
   CveLookup:          { page: 'Project-Settings-Reference', anchor: 'cve-enrichment' },

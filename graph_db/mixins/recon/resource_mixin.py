@@ -8,7 +8,70 @@ from datetime import datetime
 from urllib.parse import urlparse, parse_qs
 
 from graph_db.cpe_resolver import _is_ip_address
-from graph_db.mixins.recon.scope import build_host_scope, host_in_scope
+from graph_db.mixins.recon.scope import build_host_scope, host_in_scope, org_for_scan_root
+
+def _openapi_params(endpoint_info: dict, method: str) -> dict:
+    """Cypher parameters for an endpoint's OpenAPI fields; None keeps what is stored.
+
+    Every source other than OpenAPI passes oa_declared_only = False: an
+    endpoint a tool found is observed. Only short sanitized identifiers reach
+    the graph; the merge dropped every free-text field of the specification.
+    """
+    declared_only = endpoint_info.get("declared_only")
+    meta = (endpoint_info.get("openapi") or {}).get(method) or {}
+    spec = endpoint_info.get("openapi_spec") if method == "GET" else None
+    spec = spec if isinstance(spec, dict) else {}
+    return {
+        "oa_declared_only": declared_only if isinstance(declared_only, bool) else False,
+        "oa_declared": True if meta else None,
+        "oa_templates": (endpoint_info.get("openapi_path_templates") or None) if meta else None,
+        "oa_operation_id": meta.get("operation_id"),
+        "oa_deprecated": meta.get("deprecated") if meta else None,
+        "oa_security": meta.get("security") if meta else None,
+        "oa_tags": meta.get("tags") or None,
+        "oa_spec_urls": meta.get("spec_urls") or None,
+        "oa_spec": True if spec else None,
+        "oa_spec_version": spec.get("version"),
+        "oa_op_count": spec.get("operation_count"),
+    }
+
+
+def openapi_status_entry(scan_root: str, entry: str) -> str:
+    """`<scanRoot>|<id>|<hash>|<code>|<time>` (§4.11.5): the writer files every
+    entry under the scan root it came from, whatever form recon produced."""
+    if entry.startswith(scan_root + "|") and entry.count("|") == 4:
+        return entry
+    return f"{scan_root}|{entry}"
+
+
+def write_openapi_source_status(tx, user_id: str, project_id: str, org: str,
+                                scan_root: str, statuses: list) -> None:
+    """Replace ONE scan root's entries on its org Domain, keeping every other
+    root's (§4.11.5).
+
+    Several scan roots share the org Domain, and parallel partial OpenAPI runs
+    can write it at once, so the node is locked in the statement's first
+    clause and the read-modify-write is that one statement (GDB-11). A
+    pre-scan-root (4-segment) entry belonged to the Domain's own name, so it
+    is dropped only when this scan root IS the org.
+    """
+    from graph_db.mixins.recon.domain_mixin import ORG_DOMAIN_LOCK
+    tx.run(
+        f"""
+        MATCH (d:Domain {{user_id: $user_id, project_id: $project_id}})
+        WHERE toLower(d.name) = $org
+        {ORG_DOMAIN_LOCK}
+        WITH d
+        SET d.openapi_source_status =
+            [s IN coalesce(d.openapi_source_status, [])
+             WHERE NOT s STARTS WITH $root + '|'
+               AND NOT (size(split(s, '|')) = 4 AND toLower(d.name) = $root)] + $new
+        """,
+        user_id=user_id, project_id=project_id, org=str(org or "").lower(),
+        root=str(scan_root or "").lower(),
+        new=[openapi_status_entry(str(scan_root or "").lower(), e) for e in statuses],
+    )
+
 
 class ResourceMixin:
     def update_graph_from_resource_enum(self, recon_data: dict, user_id: str, project_id: str) -> dict:
@@ -110,9 +173,29 @@ class ResourceMixin:
                                 s for s in (endpoint_info.get("sources") or [])
                                 if s and isinstance(s, str)
                             ))
+                            oa = _openapi_params(endpoint_info, method)
+                            # openapi_declared_only: an endpoint that already
+                            # existed was observed by some tool, so a
+                            # declaration reaching it does not make it
+                            # declared-only; an observing source clears it. A
+                            # node an earlier release declared (openapi_declared
+                            # without the flag) counts as declared-only, so a
+                            # declared node this run creates on an observed path
+                            # stores false rather than leaving the flag unset.
                             session.run(
                                 """
                                 MERGE (e:Endpoint {path: $path, method: $method, baseurl: $baseurl, user_id: $user_id, project_id: $project_id})
+                                ON CREATE SET e.openapi_declared_only = CASE WHEN $oa_declared_only THEN true
+                                                                              WHEN $oa_declared THEN false ELSE null END
+                                ON MATCH SET e.openapi_declared_only = CASE
+                                    WHEN $oa_declared_only IS NULL THEN e.openapi_declared_only
+                                    WHEN NOT $oa_declared_only THEN
+                                        CASE WHEN coalesce(e.openapi_declared_only, e.openapi_declared, false)
+                                             THEN false ELSE e.openapi_declared_only END
+                                    WHEN e.openapi_declared_only IS NOT NULL THEN e.openapi_declared_only
+                                    WHEN coalesce(e.openapi_declared, false) THEN true
+                                    ELSE false
+                                END
                                 SET e.user_id = $user_id,
                                     e.project_id = $project_id,
                                     e.category = $category,
@@ -128,6 +211,18 @@ class ResourceMixin:
                                     END,
                                     e.ai_interface_type = COALESCE($ai_interface_type, e.ai_interface_type),
                                     e.is_ai_rag_ingest = COALESCE($is_ai_rag_ingest, e.is_ai_rag_ingest),
+                                    e.openapi_declared = coalesce($oa_declared, e.openapi_declared),
+                                    e.openapi_path_templates = coalesce($oa_templates, e.openapi_path_templates),
+                                    e.openapi_operation_id = coalesce($oa_operation_id, e.openapi_operation_id),
+                                    e.openapi_deprecated = coalesce($oa_deprecated, e.openapi_deprecated),
+                                    e.openapi_security = coalesce($oa_security, e.openapi_security),
+                                    e.openapi_tags = coalesce($oa_tags, e.openapi_tags),
+                                    e.openapi_spec_urls = CASE WHEN $oa_spec_urls IS NULL THEN e.openapi_spec_urls
+                                        ELSE coalesce(e.openapi_spec_urls, [])
+                                             + [u IN $oa_spec_urls WHERE NOT u IN coalesce(e.openapi_spec_urls, [])] END,
+                                    e.openapi_spec = coalesce($oa_spec, e.openapi_spec),
+                                    e.openapi_spec_version = coalesce($oa_spec_version, e.openapi_spec_version),
+                                    e.openapi_operation_count = coalesce($oa_op_count, e.openapi_operation_count),
                                     e.updated_at = datetime()
                                 """,
                                 path=path, method=method, baseurl=base_url,
@@ -141,6 +236,7 @@ class ResourceMixin:
                                 sources=ep_sources,
                                 ai_interface_type=ai_interface_type,
                                 is_ai_rag_ingest=is_ai_rag_ingest,
+                                **oa,
                             )
                             stats["endpoints_created"] += 1
                             created_endpoints.add(endpoint_key)
@@ -215,6 +311,56 @@ class ResourceMixin:
                                     """,
                                     path=path, method=method, baseurl=base_url,
                                     param_name=param_name, position="query",
+                                    user_id=user_id, project_id=project_id
+                                )
+                                stats["relationships_created"] += 1
+
+                        # Process path parameters (an API specification declares them)
+                        for param in parameters.get("path", []):
+                            param_name = param.get("name")
+                            if not param_name:
+                                continue
+
+                            param_key = (base_url, path, param_name, "path")
+                            if param_key in created_parameters:
+                                continue
+
+                            session.run(
+                                """
+                                MERGE (p:Parameter {name: $name, position: $position, endpoint_path: $endpoint_path, baseurl: $baseurl, user_id: $user_id, project_id: $project_id})
+                                SET p.user_id = $user_id,
+                                    p.project_id = $project_id,
+                                    p.type = $param_type,
+                                    p.category = $category,
+                                    p.sample_values = $sample_values,
+                                    p.required = $required,
+                                    p.is_injectable = coalesce(p.is_injectable, false),
+                                    p.source = 'resource_enum',
+                                    p.is_ai_prompt_injectable = COALESCE($is_ai_prompt_injectable, p.is_ai_prompt_injectable),
+                                    p.ai_tool_arg_path = COALESCE($ai_tool_arg_path, p.ai_tool_arg_path),
+                                    p.updated_at = datetime()
+                                """,
+                                name=param_name, position="path", endpoint_path=path, baseurl=base_url,
+                                user_id=user_id, project_id=project_id,
+                                param_type=param.get("type", "string"),
+                                category=param.get("category", "other"),
+                                sample_values=(param.get("sample_values") or [])[:5],
+                                required=param.get("required", True),
+                                is_ai_prompt_injectable=param.get("is_ai_prompt_injectable"),
+                                ai_tool_arg_path=param.get("ai_tool_arg_path"),
+                            )
+                            stats["parameters_created"] += 1
+                            created_parameters.add(param_key)
+
+                            for method in methods:
+                                session.run(
+                                    """
+                                    MATCH (e:Endpoint {path: $path, method: $method, baseurl: $baseurl, user_id: $user_id, project_id: $project_id})
+                                    MATCH (p:Parameter {name: $param_name, position: $position, endpoint_path: $path, baseurl: $baseurl, user_id: $user_id, project_id: $project_id})
+                                    MERGE (e)-[:HAS_PARAMETER]->(p)
+                                    """,
+                                    path=path, method=method, baseurl=base_url,
+                                    param_name=param_name, position="path",
                                     user_id=user_id, project_id=project_id
                                 )
                                 stats["relationships_created"] += 1
@@ -417,6 +563,10 @@ class ResourceMixin:
             # Update Domain node with resource_enum metadata
             metadata = recon_data.get("metadata", {})
             root_domain = metadata.get("root_domain", "")
+            # The flat per-tool stamp goes on the org Domain (§4.11.3): a scan
+            # root below its org has no Domain node of its own.
+            if root_domain:
+                root_domain = metadata.get("org_domain") or org_for_scan_root(root_domain, recon_data)
             summary = resource_enum_data.get("summary", {})
 
             if root_domain:
@@ -438,6 +588,19 @@ class ResourceMixin:
                     )
                 except Exception as e:
                     stats["errors"].append(f"Domain update failed: {e}")
+
+            # Per-source OpenAPI status, on the org Domain of the scan root this
+            # run covers (ip-targets.<project> in IP mode). Present whenever
+            # OpenAPI ran, so a removed source's status is cleared.
+            openapi_inventory = resource_enum_data.get("openapi")
+            run_root = recon_data.get("domain")
+            if isinstance(openapi_inventory, dict) and "source_status" in openapi_inventory and run_root:
+                try:
+                    statuses = [s for s in openapi_inventory.get("source_status") or [] if isinstance(s, str)]
+                    session.execute_write(lambda tx: write_openapi_source_status(
+                        tx, user_id, project_id, org_for_scan_root(run_root, recon_data), run_root, statuses))
+                except Exception as e:
+                    stats["errors"].append(f"OpenAPI source status update failed: {e}")
 
             # Connect orphaned BaseURLs to their Subdomain node.
             # BaseURLs created by resource_enum may not have a Service -[:SERVES_URL]-> link
@@ -508,4 +671,100 @@ class ResourceMixin:
             if stats["errors"]:
                 print(f"[!][graph-db] {len(stats['errors'])} errors occurred")
 
+        return stats
+
+    def prune_withdrawn_openapi_declarations(self, user_id: str, project_id: str, reread_spec_urls,
+                                             run_started_at: str, redeclared=None) -> dict:
+        """Withdraw what a re-read specification no longer declares (D17).
+
+        Partial OpenAPI runs only: a full run clears every recon asset first,
+        and a partial run is the project's only writer while it runs.
+        ``reread_spec_urls`` are the documents this run fetched AND parsed, so a
+        failed fetch withdraws nothing. ``redeclared`` maps
+        ``"<METHOD> <baseurl><path>"`` to the spec URLs that declared that
+        endpoint this run.
+
+        An endpoint carrying a re-read URL that did not declare it again loses
+        that URL. When no URL is left, an endpoint known only from a
+        specification, with no finding on it or its parameters and not written
+        by this run, is deleted; any other one stops being declared. The write
+        lock is taken before anything attached is read (the prune_unseen_findings
+        idiom), so a finding committed meanwhile is never deleted with its node.
+        """
+        stats = {"deleted": 0, "withdrawn": 0}
+        urls = sorted({u for u in reread_spec_urls or [] if isinstance(u, str) and u})
+        if not urls:
+            return stats
+        params = dict(user_id=user_id, project_id=project_id)
+
+        def work(tx):
+            rows = tx.run(
+                """
+                MATCH (e:Endpoint {user_id: $user_id, project_id: $project_id})
+                WHERE any(u IN coalesce(e.openapi_spec_urls, []) WHERE u IN $urls)
+                WITH e, coalesce($redeclared[e.method + ' ' + e.baseurl + e.path], []) AS again
+                WITH e, [u IN e.openapi_spec_urls WHERE u IN $urls AND NOT u IN again] AS dropped
+                WHERE size(dropped) > 0
+                SET e._prune_lock = true
+                REMOVE e._prune_lock
+                WITH e, [u IN e.openapi_spec_urls WHERE NOT u IN dropped] AS remaining
+                RETURN elementId(e) AS eid, remaining,
+                       size(remaining) = 0
+                       AND coalesce(e.openapi_declared_only, e.openapi_declared, false)
+                       AND (e.updated_at IS NULL OR e.updated_at < datetime($run_started_at))
+                       AND NOT EXISTS { (e)-[:HAS_VULNERABILITY]->() }
+                       AND NOT EXISTS { ()-[:FOUND_AT]->(e) }
+                       AND NOT EXISTS {
+                           MATCH (e)-[:HAS_PARAMETER]->(p:Parameter)
+                           WHERE EXISTS { ()-[:AFFECTS_PARAMETER]->(p) }
+                              OR EXISTS { (p)-[:HAS_VULNERABILITY]->() }
+                       } AS delete_it
+                """,
+                urls=urls, redeclared=redeclared or {}, run_started_at=run_started_at, **params,
+            ).data()
+            gone = [r["eid"] for r in rows if r["delete_it"]]
+            kept = [{"eid": r["eid"], "remaining": r["remaining"]} for r in rows if not r["delete_it"]]
+            tx.run(
+                """
+                UNWIND $rows AS row
+                MATCH (e:Endpoint {user_id: $user_id, project_id: $project_id})
+                WHERE elementId(e) = row.eid
+                SET e.openapi_spec_urls = CASE WHEN size(row.remaining) = 0 THEN null ELSE row.remaining END
+                WITH e, row WHERE size(row.remaining) = 0
+                SET e.openapi_declared = false
+                REMOVE e.openapi_declared_only, e.openapi_operation_id, e.openapi_deprecated,
+                       e.openapi_security, e.openapi_tags, e.openapi_path_templates
+                """,
+                rows=kept, **params,
+            ).consume()
+            orphans = tx.run(
+                """
+                UNWIND $ids AS eid
+                MATCH (e:Endpoint {user_id: $user_id, project_id: $project_id})
+                WHERE elementId(e) = eid
+                OPTIONAL MATCH (e)-[:HAS_PARAMETER]->(p:Parameter)
+                WITH e, collect(elementId(p)) AS pids
+                DETACH DELETE e
+                RETURN pids
+                """,
+                ids=gone, **params,
+            ).data()
+            pids = sorted({pid for r in orphans for pid in r["pids"] if pid})
+            # Parameters are keyed per path; one another method still uses stays.
+            tx.run(
+                """
+                UNWIND $pids AS pid
+                MATCH (p:Parameter {user_id: $user_id, project_id: $project_id})
+                WHERE elementId(p) = pid
+                  AND NOT EXISTS { ()-[:HAS_PARAMETER]->(p) }
+                  AND NOT EXISTS { ()-[:AFFECTS_PARAMETER]->(p) }
+                  AND NOT EXISTS { (p)-[:HAS_VULNERABILITY]->() }
+                DETACH DELETE p
+                """,
+                pids=pids, **params,
+            ).consume()
+            return len(gone), len(kept)
+
+        with self.driver.session() as session:
+            stats["deleted"], stats["withdrawn"] = session.execute_write(work)
         return stats

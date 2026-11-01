@@ -1296,6 +1296,29 @@
   gap: var(--space-2);
 }
 
+/* The User Agent Skills header only: in the chat drawer (as narrow as 336 px, and not the
+   viewport's width) its buttons drop under the title instead of overflowing. */
+.userSkillsHeader {
+  flex-wrap: wrap;
+  row-gap: var(--space-2);
+}
+
+.userSkillsHeaderTitle {
+  flex: 1 1 12rem;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.userSkillsHeaderActions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  margin-left: auto;
+}
+
 /* Node info tooltip */
 .nodeInfoIcon {
   color: #22c55e;
@@ -2939,6 +2962,55 @@
   font-size: var(--text-xs);
   font-weight: var(--font-semibold);
   color: var(--form-ink);
+}
+
+/* ---- Skin: OpenAPI ---- */
+
+/* A discovery path: the field fills the row and its remove control keeps the
+   end. A .fieldRow would give the icon a 200px grid column of its own. */
+.listInputRow {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.listInputRow > :global(.textInput) {
+  flex: 1;
+  min-width: 0;
+}
+
+/* Controls side by side at their own width: a .subSection's column stretches
+   a direct child across the whole panel. */
+.controlRow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* A configured document's panel header. Unlike .sourceCardHead it does not
+   fold, so it carries no pointer. */
+.docCardHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+/* A document's last fetch: green once imported, grey before any fetch, amber
+   for every reason it was not imported. */
+.statusBadge {
+  composes: sevBadge;
+  --chip-accent: var(--form-warning);
+  text-transform: none;
+}
+
+.statusBadge[data-tone="success"] {
+  --chip-accent: var(--form-success);
+}
+
+.statusBadge[data-tone="muted"] {
+  --chip-accent: var(--form-ink-muted);
 }
 
 /* ---- Skin: Agent Skills ---- */

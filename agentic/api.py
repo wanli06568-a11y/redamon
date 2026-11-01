@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import shlex
+import time
 from contextlib import asynccontextmanager
 from typing import Any, List, Literal, Optional
 
@@ -29,10 +30,11 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, JSONResponse
 from langchain_core.messages import SystemMessage, HumanMessage
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from llm_guard import (master_key_is_weak, require_internal_auth,
-                       require_internal_auth_only, require_master_internal_auth)
+from llm_guard import (master_key_is_weak, require_configured_master_auth,
+                       require_internal_auth, require_internal_auth_only,
+                       require_master_internal_auth)
 from logging_config import setup_logging
 from orchestrator import AgentOrchestrator
 from orchestrator_helpers import normalize_content
@@ -306,8 +308,11 @@ async def check_target_guardrail(body: GuardrailRequest):
         )
         return result
     except Exception as e:
+        # A malformed or missing verdict lands here too. This check is the
+        # soft, user-disableable one and stays fail-open; the session-start
+        # check refuses on the same error.
         logger.error(f"Guardrail error: {e}")
-        return {"allowed": True, "reason": f"Guardrail error: {str(e)}"}
+        return {"allowed": True, "verdict": "unknown", "reason": f"Guardrail verdict unknown: {str(e)}"}
 
 
 # =============================================================================
@@ -486,12 +491,17 @@ from llm_builder import (  # noqa: E402
     fetch_user_providers,
     is_model_unavailable_error,
     log_provider_error,
+    provider_error_details,
 )
 
 
-def _feature_error(code: str, model: str, status: int, error: str) -> JSONResponse:
+def _feature_error(code: str, model: str, status: int, error: str,
+                   exc: Optional[BaseException] = None) -> JSONResponse:
+    # The provider's class and HTTP status tell a bad key from a rate limit or
+    # an overflowing context; its message stays in the log (it can quote the key).
+    details = provider_error_details(exc) if exc is not None else {}
     return JSONResponse(
-        content={"error": error, "code": code, "model_used": model},
+        content={"error": error, "code": code, "model_used": model, **details},
         status_code=status,
     )
 
@@ -520,7 +530,7 @@ async def _build_feature_llm(feature: str, model: str, user_id: str):
     except Exception as exc:                                      # noqa: BLE001
         log_provider_error(feature, model, exc)
         return None, _feature_error("model_unavailable", model, 503,
-                                    MODEL_UNAVAILABLE_MESSAGE.format(model=model))
+                                    MODEL_UNAVAILABLE_MESSAGE.format(model=model), exc)
     return llm, None
 
 
@@ -536,10 +546,10 @@ async def _invoke_feature_llm(feature: str, model: str, llm, messages):
         log_provider_error(feature, model, exc)
         if is_model_unavailable_error(exc):
             return None, _feature_error("model_unavailable", model, 503,
-                                        MODEL_UNAVAILABLE_MESSAGE.format(model=model))
+                                        MODEL_UNAVAILABLE_MESSAGE.format(model=model), exc)
         return None, JSONResponse(
             content={"error": "The model call failed. Try again in a moment.",
-                     "model_used": model},
+                     "model_used": model, **provider_error_details(exc)},
             status_code=502,
         )
 
@@ -575,10 +585,10 @@ async def summarize_report(body: ReportSummarizeRequest):
         log_provider_error("Report summarizer", requested_model, exc)
         if is_model_unavailable_error(exc):
             return _feature_error("model_unavailable", requested_model, 503,
-                                  MODEL_UNAVAILABLE_MESSAGE.format(model=requested_model))
+                                  MODEL_UNAVAILABLE_MESSAGE.format(model=requested_model), exc)
         return JSONResponse(
             content={"error": "Failed to generate report narratives. The details are in the agent log.",
-                     "model_used": requested_model},
+                     "model_used": requested_model, **provider_error_details(exc)},
             status_code=500,
         )
     if isinstance(narratives, dict):
@@ -1437,6 +1447,61 @@ class SerializedClassifyRequest(BaseModel):
     project_id: Optional[str] = None
 
 
+class RoutePrivacyItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1, max_length=200)
+    method: Literal["GET", "HEAD"] = "GET"
+    category: Literal["admin", "admin_debug", "api", "api_documentation", "authentication", "dynamic",
+                      "endpoint", "file_access", "file_upload", "search", "upload", "other"] = "other"
+    openapi_secured: bool = False
+    declared_only: bool = False
+    js_only: bool = False
+    host_internal: bool = False
+
+
+class RoutePrivacyRankRequest(BaseModel):
+    routes: List[RoutePrivacyItem] = Field(min_length=1, max_length=400)
+    user_id: Optional[str] = None
+    project_id: Optional[str] = None
+
+
+class RouteCandidateItem(BaseModel):
+    # Evidence only: no route_class and no signature, so Jev's kind is a second
+    # opinion rather than the classifier read back. Key names, never values.
+    model_config = ConfigDict(extra="forbid")
+
+    path: str = Field(min_length=1, max_length=200)
+    method: Literal["GET", "HEAD"] = "GET"
+    anon_status: int = Field(default=0, ge=0, le=999)
+    authed_status: Optional[int] = Field(default=None, ge=0, le=999)
+    content_class: Literal["json", "html", "text", "xml", "binary", "other"] = "other"
+    size_bucket: Literal["<1k", "1-10k", "10-100k", ">100k"] = "<1k"
+    bodies_match: Optional[bool] = None
+    key_paths: List[str] = Field(default_factory=list, max_length=60)
+    max_array_len: int = Field(default=0, ge=0)
+    det_signals: List[Literal["pii", "pii_others", "sensitive_fields", "secret"]] = Field(
+        default_factory=list, max_length=4)
+    auth_expected_by: List[Literal["openapi", "openapi_tag", "declared_only", "seen_denied", "path_word",
+                                   "host_word", "siblings_locked", "version_locked", "vary_auth"]] = Field(
+        default_factory=list, max_length=9)
+    generated_by: Literal["found", "seed", "vcs", "backup", "version", "sibling", "framework", "catalog",
+                          "cross_host"] = "found"
+
+    @field_validator("key_paths")
+    @classmethod
+    def _short_keys(cls, value):
+        if any(len(k) > 80 for k in value):
+            raise ValueError("key paths are at most 80 characters")
+        return value
+
+
+class RouteExposureAssessRequest(BaseModel):
+    candidates: List[RouteCandidateItem] = Field(min_length=1, max_length=50)
+    user_id: Optional[str] = None
+    project_id: Optional[str] = None
+
+
 @app.post("/jev/ffuf-base-paths", tags=["LLM"], dependencies=[Depends(require_internal_auth)])
 async def jev_ffuf_base_paths(body: FfufBasePathsRequest):
     import jev_hooks
@@ -1485,6 +1550,25 @@ async def jev_serialized_classify(body: SerializedClassifyRequest):
     )
 
 
+@app.post("/jev/route-privacy-rank", tags=["LLM"], dependencies=[Depends(require_internal_auth)])
+async def jev_route_privacy_rank(body: RoutePrivacyRankRequest):
+    import jev_hooks
+    return await _run_jev(
+        "route-privacy-rank", body.user_id or "", body.project_id or "", len(body.routes),
+        lambda key: jev_hooks.route_privacy_rank(key, [r.model_dump() for r in body.routes]),
+    )
+
+
+@app.post("/jev/route-exposure-assess", tags=["LLM"], dependencies=[Depends(require_internal_auth)])
+async def jev_route_exposure_assess(body: RouteExposureAssessRequest):
+    import jev_hooks
+    return await _run_jev(
+        "route-exposure-assess", body.user_id or "", body.project_id or "",
+        len(body.candidates) * 2,
+        lambda key: jev_hooks.route_exposure_assess(key, [c.model_dump() for c in body.candidates]),
+    )
+
+
 @app.post("/emergency-stop-all", tags=["System"], dependencies=[Depends(require_internal_auth_only)])
 async def emergency_stop_all():
     """Emergency stop: cancel every running agent task immediately."""
@@ -1501,7 +1585,8 @@ class SessionStopRequest(BaseModel):
     session_id: str
 
 
-@app.post("/agent-session/stop", tags=["Sessions"])
+@app.post("/agent-session/stop", tags=["Sessions"],
+          dependencies=[Depends(require_configured_master_auth)])
 async def stop_agent_session(body: SessionStopRequest):
     """Cancel the running agent task for ONE session (by user/project/session).
 
@@ -2071,37 +2156,19 @@ async def get_defaults():
     """
     Get default agent settings for frontend project creation.
 
-    Returns DEFAULT_AGENT_SETTINGS with camelCase keys prefixed with 'agent'
-    for frontend compatibility (e.g., OPENAI_MODEL -> agentOpenaiModel).
+    Returns DEFAULT_AGENT_SETTINGS keyed by Project column name, from
+    AGENT_SETTING_COLUMNS (e.g. OPENAI_MODEL -> agentOpenaiModel, SSRF_GOPHER_ENABLED
+    -> ssrfGopherEnabled). Settings with no column are not served.
     """
-    from project_settings import DEFAULT_AGENT_SETTINGS
-
-    def to_camel_case(snake_str: str, prefix: str = "agent") -> str:
-        """Convert SCREAMING_SNAKE_CASE to prefixCamelCase."""
-        prefixed = f"{prefix}_{snake_str}" if prefix else snake_str
-        components = prefixed.lower().split('_')
-        return components[0] + ''.join(x.title() for x in components[1:])
+    from project_settings import AGENT_SETTING_COLUMNS, DEFAULT_AGENT_SETTINGS
 
     # STEALTH_MODE is a project-level setting (not agent-specific), served by
-    # recon defaults as "stealthMode".  Exclude it here to avoid creating a
-    # duplicate "agentStealthMode" key that Prisma doesn't recognise.
-    SKIP_KEYS = {'STEALTH_MODE', 'USER_ATTACK_SKILLS'}
-
-    # HYDRA_* keys map to Prisma fields without the 'agent' prefix
-    # (e.g. HYDRA_ENABLED -> hydraEnabled, not agentHydraEnabled)
-    NO_PREFIX_KEYS = {k for k in DEFAULT_AGENT_SETTINGS if k.startswith(('HYDRA_', 'PHISHING_', 'ROE_', 'ATTACK_SKILL_', 'SHODAN_', 'DOS_', 'FIRETEAM_'))}
-    # Exclude internal-only fireteam keys that the frontend should not see.
-    # SKILL_TEXT_OVERRIDES is runtime data from the plugin platform, not a project field.
-    SKIP_KEYS = SKIP_KEYS | {'PERSISTENT_CHECKPOINTER', 'SKILL_TEXT_OVERRIDES'}
-
-    camel_case_defaults = {}
-    for k, v in DEFAULT_AGENT_SETTINGS.items():
-        if k in SKIP_KEYS:
-            continue
-        if k in NO_PREFIX_KEYS:
-            camel_case_defaults[to_camel_case(k, prefix="")] = v
-        else:
-            camel_case_defaults[to_camel_case(k)] = v
+    # recon defaults as "stealthMode".
+    camel_case_defaults = {
+        column: DEFAULT_AGENT_SETTINGS[key]
+        for key, column in AGENT_SETTING_COLUMNS.items()
+        if key != 'STEALTH_MODE'
+    }
 
     # An engagement LIMIT has no global default: it belongs to one engagement,
     # not to the installation. It matters more than tidiness, because the
@@ -2518,10 +2585,13 @@ async def download_file(
 # All routes are project-scoped (projectId is required) and use the same
 # _resolve_safe validator as the fs_* tools, so path traversal and symlink
 # escape attempts are rejected at the boundary. The webapp drawer + AI panel
-# both consume these.
+# both consume these. The projectId is NOT an authorization: the webapp proxy
+# checks the caller owns the project, then calls with the master key, which is
+# all that stands between the 0.0.0.0-published agent port and every tenant's files.
 
 
-@app.get("/workspace/list", tags=["Workspace"])
+@app.get("/workspace/list", tags=["Workspace"],
+         dependencies=[Depends(require_configured_master_auth)])
 async def workspace_list(
     projectId: str = Query(..., description="Project UUID"),
     path: str = Query(".", description="Subdir relative to /workspace/<projectId>/"),
@@ -2539,7 +2609,8 @@ async def workspace_list(
         return JSONResponse(content={"error": str(e)}, status_code=500)
 
 
-@app.get("/workspace/tree", tags=["Workspace"])
+@app.get("/workspace/tree", tags=["Workspace"],
+         dependencies=[Depends(require_configured_master_auth)])
 async def workspace_tree(
     projectId: str = Query(...),
     path: str = Query("."),
@@ -2559,7 +2630,8 @@ async def workspace_tree(
         return JSONResponse(content={"error": str(e)}, status_code=500)
 
 
-@app.get("/workspace/download", tags=["Workspace"])
+@app.get("/workspace/download", tags=["Workspace"],
+         dependencies=[Depends(require_configured_master_auth)])
 async def workspace_download(
     projectId: str = Query(...),
     path: str = Query(...),
@@ -2591,7 +2663,8 @@ class WorkspaceRenameRequest(BaseModel):
     newName: str
 
 
-@app.post("/workspace/rename", tags=["Workspace"])
+@app.post("/workspace/rename", tags=["Workspace"],
+          dependencies=[Depends(require_configured_master_auth)])
 async def workspace_rename(req: WorkspaceRenameRequest):
     """Rename a single entry within its parent (no cross-dir moves)."""
     if not req.projectId:
@@ -2606,7 +2679,8 @@ async def workspace_rename(req: WorkspaceRenameRequest):
         return JSONResponse(content={"error": str(e)}, status_code=500)
 
 
-@app.delete("/workspace", tags=["Workspace"])
+@app.delete("/workspace", tags=["Workspace"],
+            dependencies=[Depends(require_configured_master_auth)])
 async def workspace_delete(
     projectId: str = Query(...),
     path: str = Query(...),
@@ -2629,7 +2703,8 @@ class WorkspaceResetRequest(BaseModel):
     projectId: str
 
 
-@app.post("/workspace/reset", tags=["Workspace"])
+@app.post("/workspace/reset", tags=["Workspace"],
+          dependencies=[Depends(require_configured_master_auth)])
 async def workspace_reset(req: WorkspaceResetRequest):
     """Wipe the workspace back to its initial state (4 empty default folders)."""
     if not req.projectId:
@@ -2644,7 +2719,8 @@ async def workspace_reset(req: WorkspaceResetRequest):
         return JSONResponse(content={"error": str(e)}, status_code=500)
 
 
-@app.get("/workspace/jobs", tags=["Workspace"])
+@app.get("/workspace/jobs", tags=["Workspace"],
+         dependencies=[Depends(require_configured_master_auth)])
 async def workspace_jobs_list(
     projectId: str = Query(...),
     active: Optional[bool] = Query(None, description="True=running only, False=terminal only, omit for all"),
@@ -2656,7 +2732,8 @@ async def workspace_jobs_list(
     return {"projectId": projectId, "jobs": reg.list(projectId, active=active)}
 
 
-@app.post("/workspace/jobs/{job_id}/cancel", tags=["Workspace"])
+@app.post("/workspace/jobs/{job_id}/cancel", tags=["Workspace"],
+          dependencies=[Depends(require_configured_master_auth)])
 async def workspace_job_cancel(
     job_id: str,
     projectId: str = Query(...),
@@ -2669,7 +2746,8 @@ async def workspace_job_cancel(
     return result
 
 
-@app.post("/workspace/upload", tags=["Workspace"])
+@app.post("/workspace/upload", tags=["Workspace"],
+          dependencies=[Depends(require_configured_master_auth)])
 async def workspace_upload(
     projectId: str = Form(...),
     path: str = Form("."),
@@ -2705,7 +2783,8 @@ class WorkspaceMkdirRequest(BaseModel):
     path: str
 
 
-@app.post("/workspace/mkdir", tags=["Workspace"])
+@app.post("/workspace/mkdir", tags=["Workspace"],
+          dependencies=[Depends(require_configured_master_auth)])
 async def workspace_mkdir(req: WorkspaceMkdirRequest):
     """Create a new directory (parents created automatically)."""
     if not req.projectId:
@@ -2727,7 +2806,8 @@ class WorkspaceBulkArchiveRequest(BaseModel):
     archiveName: str = "bundle"
 
 
-@app.post("/workspace/bulk-archive", tags=["Workspace"])
+@app.post("/workspace/bulk-archive", tags=["Workspace"],
+          dependencies=[Depends(require_configured_master_auth)])
 async def workspace_bulk_archive(req: WorkspaceBulkArchiveRequest):
     """Bundle N workspace entries into one tar.gz/zip; stream back to client.
 
@@ -2756,7 +2836,8 @@ async def workspace_bulk_archive(req: WorkspaceBulkArchiveRequest):
     )
 
 
-@app.get("/workspace/archive-download", tags=["Workspace"])
+@app.get("/workspace/archive-download", tags=["Workspace"],
+         dependencies=[Depends(require_configured_master_auth)])
 async def workspace_archive_download(
     projectId: str = Query(...),
     path: str = Query(...),
@@ -2785,7 +2866,8 @@ async def workspace_archive_download(
     )
 
 
-@app.get("/workspace/preview", tags=["Workspace"])
+@app.get("/workspace/preview", tags=["Workspace"],
+         dependencies=[Depends(require_configured_master_auth)])
 async def workspace_preview(
     projectId: str = Query(...),
     path: str = Query(...),
@@ -2803,7 +2885,8 @@ async def workspace_preview(
         return JSONResponse(content={"error": str(e)}, status_code=500)
 
 
-@app.get("/workspace/properties", tags=["Workspace"])
+@app.get("/workspace/properties", tags=["Workspace"],
+         dependencies=[Depends(require_configured_master_auth)])
 async def workspace_properties(
     projectId: str = Query(...),
     path: str = Query(...),
@@ -2882,6 +2965,115 @@ async def command_whisperer(body: CommandWhispererRequest):
 
 
 # =============================================================================
+# SKILL METADATA - the upload dialog's "Generate with AI" for user attack skills
+# =============================================================================
+
+import skill_metadata  # noqa: E402
+
+
+class SkillMetadataItem(BaseModel):
+    key: str
+    content: str
+    file_name: str = ""
+    # The current name, as context when only the description is asked.
+    name: str = ""
+    want_name: bool = False
+    want_description: bool = False
+
+
+class SkillMetadataRequest(BaseModel):
+    items: list[SkillMetadataItem]
+    other_names: list[str] = []
+    # Set by the webapp from the caller's saved "Skill names & descriptions"
+    # model and effective user, like every feature endpoint.
+    model: Optional[str] = None
+    user_id: Optional[str] = None
+
+
+def _skill_metadata_size_error(body: SkillMetadataRequest, model: str) -> Optional[JSONResponse]:
+    def refuse(error: str) -> JSONResponse:
+        return JSONResponse(content={"error": error, "model_used": model}, status_code=400)
+
+    if not 1 <= len(body.items) <= skill_metadata.MAX_ITEMS:
+        return refuse(f"Send 1 to {skill_metadata.MAX_ITEMS} skills")
+    for item in body.items:
+        if not item.content.strip() or len(item.content) > skill_metadata.CONTENT_MAX_CHARS:
+            return refuse(f"Each skill needs a text of at most {skill_metadata.CONTENT_MAX_CHARS // 1024} KB")
+        if not (item.want_name or item.want_description):
+            return refuse("Each skill must ask for a name or a description")
+        if len(item.key) > 64:
+            return refuse("A skill key is at most 64 characters")
+    if len(body.other_names) > skill_metadata.OTHER_NAMES_MAX:
+        return refuse(f"At most {skill_metadata.OTHER_NAMES_MAX} other names")
+    return None
+
+
+@app.post("/skill-metadata/generate", tags=["Skills"],
+          dependencies=[Depends(require_master_internal_auth), Depends(require_internal_auth)])
+async def generate_skill_metadata(body: SkillMetadataRequest):
+    """Propose the missing name and/or description of up to 5 uploaded skills, on the caller's model.
+
+    Nothing is saved: the webapp re-validates the answer and the person reviews it.
+    """
+    started = time.monotonic()
+    model = (body.model or "").strip()
+    missing = _feature_request_error(model, body.user_id)
+    if missing:
+        return missing
+    too_big = _skill_metadata_size_error(body, model)
+    if too_big:
+        return too_big
+    llm, failure = await _build_feature_llm("Skill metadata", model, body.user_id)
+    if failure:
+        return failure
+
+    other_names = [n[:skill_metadata.NAME_MAX] for n in body.other_names]
+    gate = asyncio.Semaphore(skill_metadata.CONCURRENCY)
+    unavailable: list[JSONResponse] = []
+    call_failures: list[JSONResponse] = []
+
+    async def one(item: SkillMetadataItem) -> dict:
+        async with gate:
+            messages = skill_metadata.build_messages(item, other_names)
+            try:
+                response, failed = await asyncio.wait_for(
+                    _invoke_feature_llm("Skill metadata", model, llm, messages),
+                    skill_metadata.ITEM_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                return {"key": item.key, "error": "timeout"}
+        if failed:
+            if failed.status_code == 503:
+                unavailable.append(failed)
+            else:
+                call_failures.append(failed)
+            return {"key": item.key, "error": "model_call_failed"}
+        answer = skill_metadata.parse_answer(
+            normalize_content(response.content), item.want_name, item.want_description)
+        return {"key": item.key, **answer} if answer else {"key": item.key, "error": "unreadable_answer"}
+
+    try:
+        items = await asyncio.wait_for(asyncio.gather(*(one(i) for i in body.items)),
+                                       skill_metadata.REQUEST_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        # Still one line per request: it is the operator's only record of a Generate call.
+        logger.info("skill_metadata user=%s model=%s items=%d ok=0 failed=%d ms=%d timeout",
+                    body.user_id, model, len(body.items), len(body.items),
+                    int((time.monotonic() - started) * 1000))
+        return _feature_error("agent_timeout", model, 504, "The model took too long, try again")
+
+    failed = sum(1 for i in items if "error" in i)
+    # Counts only: a skill file, its name or the generated text can hold anything.
+    logger.info("skill_metadata user=%s model=%s items=%d ok=%d failed=%d ms=%d",
+                body.user_id, model, len(items), len(items) - failed, failed,
+                int((time.monotonic() - started) * 1000))
+    if unavailable:
+        return unavailable[0]
+    if call_failures and len(call_failures) == len(items):
+        return call_failures[0]
+    return {"items": items, "model_used": model}
+
+
+# =============================================================================
 # SESSION MANAGEMENT PROXY — proxies to kali-sandbox:8013 session endpoints
 # =============================================================================
 
@@ -2906,7 +3098,8 @@ async def get_tunnel_status():
     }
 
 
-@app.get("/sessions", tags=["Sessions"])
+@app.get("/sessions", tags=["Sessions"],
+         dependencies=[Depends(require_configured_master_auth)])
 async def get_sessions():
     """List all active Metasploit sessions, background jobs, and non-MSF sessions."""
     try:
@@ -2920,7 +3113,8 @@ async def get_sessions():
         return JSONResponse(content={"error": str(e)}, status_code=502)
 
 
-@app.post("/sessions/{session_id}/interact", tags=["Sessions"])
+@app.post("/sessions/{session_id}/interact", tags=["Sessions"],
+          dependencies=[Depends(require_configured_master_auth)])
 async def interact_session(session_id: int, body: dict):
     """Send a command to a specific Metasploit session."""
     try:
@@ -2936,7 +3130,8 @@ async def interact_session(session_id: int, body: dict):
         return JSONResponse(content={"error": str(e)}, status_code=502)
 
 
-@app.post("/sessions/{session_id}/kill", tags=["Sessions"])
+@app.post("/sessions/{session_id}/kill", tags=["Sessions"],
+          dependencies=[Depends(require_configured_master_auth)])
 async def kill_session(session_id: int):
     """Kill a specific Metasploit session."""
     try:
@@ -2948,7 +3143,8 @@ async def kill_session(session_id: int):
         return JSONResponse(content={"error": str(e)}, status_code=502)
 
 
-@app.post("/jobs/{job_id}/kill", tags=["Sessions"])
+@app.post("/jobs/{job_id}/kill", tags=["Sessions"],
+          dependencies=[Depends(require_configured_master_auth)])
 async def kill_job(job_id: int):
     """Kill a background Metasploit job."""
     try:
@@ -2960,7 +3156,8 @@ async def kill_job(job_id: int):
         return JSONResponse(content={"error": str(e)}, status_code=502)
 
 
-@app.post("/session-chat-map", tags=["Sessions"])
+@app.post("/session-chat-map", tags=["Sessions"],
+          dependencies=[Depends(require_configured_master_auth)])
 async def session_chat_map(body: dict):
     """Register a mapping between a Metasploit session ID and agent chat session ID."""
     try:
@@ -2972,7 +3169,8 @@ async def session_chat_map(body: dict):
         return JSONResponse(content={"error": str(e)}, status_code=502)
 
 
-@app.post("/non-msf-sessions", tags=["Sessions"])
+@app.post("/non-msf-sessions", tags=["Sessions"],
+          dependencies=[Depends(require_configured_master_auth)])
 async def register_non_msf_session(body: dict):
     """Register a non-Metasploit session (netcat, socat, etc.)."""
     try:
@@ -3009,12 +3207,35 @@ class TextToCypherRequest(BaseModel):
 
 
 class _CypherSetupError(Exception):
-    """Carries the (status, safe message) to answer with."""
+    """Carries the (status, safe message) to answer with, plus safe extra fields
+    (a code, the provider's class and HTTP status) for the body."""
 
-    def __init__(self, status: int, message: str):
+    def __init__(self, status: int, message: str, fields: Optional[dict] = None):
         super().__init__(message)
         self.status = status
         self.message = message
+        self.fields = dict(fields or {})
+
+
+def _cypher_model_error(exc: BaseException) -> _CypherSetupError:
+    """A failed model call while generating Cypher.
+
+    Not a bad query: retrying it with the "previous error" fed back would bill
+    the same refused key or exhausted quota three more times and then tell the
+    person to rephrase their question.
+    """
+    log_provider_error("text-to-cypher", "", exc)
+    details = provider_error_details(exc)
+    if is_model_unavailable_error(exc):
+        return _CypherSetupError(
+            503,
+            "The AI model could not be used. Check the project's AI model and its API key.",
+            {"code": "model_unavailable", **details},
+        )
+    return _CypherSetupError(
+        502, "The AI model call failed. Try again in a moment.",
+        {"code": "model_call_failed", **details},
+    )
 
 
 async def _build_cypher_manager(user_id: str, project_id: str):
@@ -3137,15 +3358,20 @@ async def _generate_validated_cypher(
 
     for attempt in range(max_retries):
         try:
-            if attempt == 0:
-                cypher = await manager._generate_cypher(question, for_graph_view=for_graph_view)
-            else:
-                cypher = await manager._generate_cypher(
-                    question,
-                    previous_error=last_error,
-                    previous_cypher=last_cypher,
-                    for_graph_view=for_graph_view,
-                )
+            try:
+                if attempt == 0:
+                    cypher = await manager._generate_cypher(question, for_graph_view=for_graph_view)
+                else:
+                    cypher = await manager._generate_cypher(
+                        question,
+                        previous_error=last_error,
+                        previous_cypher=last_cypher,
+                        for_graph_view=for_graph_view,
+                    )
+            except CypherGenerationTimeout:
+                raise
+            except Exception as gen_exc:                          # noqa: BLE001
+                raise _cypher_model_error(gen_exc) from gen_exc
 
             if manager._find_disallowed_write_operation(cypher):
                 raise _CypherSetupError(400, "Write operations are not allowed in data filters")
@@ -3208,7 +3434,7 @@ async def text_to_cypher(body: TextToCypherRequest):
             manager, body.question, body.user_id, body.project_id, body.for_graph_view
         )
     except _CypherSetupError as e:
-        return JSONResponse(content={"error": e.message}, status_code=e.status)
+        return JSONResponse(content={"error": e.message, **e.fields}, status_code=e.status)
     return JSONResponse(content={"cypher": cypher})
 
 
@@ -3252,7 +3478,7 @@ async def graph_nl_query(body: GraphNlQueryRequest):
         )
     except _CypherSetupError as e:
         return JSONResponse(
-            status_code=e.status, content={"error": e.message, "stage": "generate"}
+            status_code=e.status, content={"error": e.message, "stage": "generate", **e.fields}
         )
 
     from graph_db.tenant_filter import scope_query, TenantScopeError
@@ -4045,7 +4271,15 @@ async def graph_triage(body: GraphTriageRequest):
             return JSONResponse(status_code=503, content={
                 "error": "The graph was busy; nothing was changed. Try again.",
                 "code": "retry"})
-        return JSONResponse(status_code=500, content={"error": str(e)})
+        # A Neo4j message quotes the Cypher and its values; its status code
+        # (Neo.ClientError.Schema...) or the class says enough to tell causes apart.
+        neo4j_code = getattr(e, "code", None)
+        error_class = (neo4j_code if isinstance(neo4j_code, str)
+                       and re.fullmatch(r"Neo\.[A-Za-z]+\.[A-Za-z]+\.[A-Za-z]+", neo4j_code)
+                       else type(e).__name__)
+        return JSONResponse(status_code=500, content={
+            "error": "The triage operation failed. The details are in the agent log.",
+            "code": "internal_error", "error_class": error_class})
 
     # An acknowledgement the CALLER can check. The agent's Python is baked into
     # its image while the webapp is a separate one, so a deploy that rebuilds
@@ -4471,13 +4705,23 @@ def _graph_exec_summary(params: dict) -> JSONResponse:
     (hostnames, secrets, endpoints) and would leak recon output into an external
     agent's context ahead of any deliberate query.
     """
+    from graph_db.coverage_stamps import COVERAGE_SUMMARY_CYPHER, coverage_summary
+
     try:
         nodes, _ = _graph_exec_run(_GRAPH_SUMMARY_NODES_CYPHER, params)
         rels, _ = _graph_exec_run(_GRAPH_SUMMARY_RELS_CYPHER, params)
     except Exception as e:
         logger.error(f"graph/exec summary failed: {e}")
         return JSONResponse(status_code=500, content={"error": "graph query failed"})
-    return JSONResponse(content={"nodes": nodes, "relationships": rels})
+    body = {"nodes": nodes, "relationships": rels}
+    # The per-host coverage counts explain the census, they are not part of it:
+    # an unreadable count drops the block, never the answer, and never reads as 0.
+    try:
+        coverage, _ = _graph_exec_run(COVERAGE_SUMMARY_CYPHER, params)
+        body["coverage"] = coverage_summary(coverage[0] if coverage else None)
+    except Exception as e:
+        logger.warning(f"graph/exec summary: coverage counts unreadable: {e}")
+    return JSONResponse(content=body)
 
 
 def _graph_exec_respond(final: str, params: dict) -> JSONResponse:
@@ -4515,11 +4759,53 @@ def _graph_exec_respond(final: str, params: dict) -> JSONResponse:
 _TRAFFIC_REPLAY_SENDS: dict[str, int] = {}
 
 
-# Short-TTL cache for the per-project auth profile. One proxy_brain run fans out
-# to many replays, and each was doing a full project GET with a 10s timeout on
-# the send path.
+# Cache for the project row behind replay auth. One proxy_brain run fans out to
+# many replays, and each was doing a full project GET with a 10s timeout on the
+# send path. An entry is reused for at most the TTL, and never once a settings
+# load has seen the project's updatedAt move: a rescope must not keep sending a
+# session to a host it no longer covers.
 _AUTH_PROFILE_CACHE: dict[str, tuple[float, dict]] = {}
 _AUTH_PROFILE_TTL_SEC = 60.0
+
+
+async def _cached_project(project_id: str) -> dict:
+    """The project row behind replay auth, cached (see _AUTH_PROFILE_CACHE). Raises."""
+    webapp_url = os.environ.get("WEBAPP_API_URL", "http://webapp:3000")
+    def _fetch():
+        import requests as _rq
+        r = _rq.get(f"{webapp_url.rstrip('/')}/api/projects/{project_id}",
+                    headers={"X-Internal-Key": os.environ.get("INTERNAL_API_KEY", "")}, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    import time as _time  # `time` is not imported at module scope in this file
+    from project_settings import seen_project_updated_at
+    _now = _time.time()
+    _hit = _AUTH_PROFILE_CACHE.get(project_id)
+    _seen = seen_project_updated_at(project_id)
+    if (_hit and (_now - _hit[0]) < _AUTH_PROFILE_TTL_SEC
+            and (_seen is None or _hit[1].get("updatedAt") == _seen)):
+        return _hit[1]
+    project = await asyncio.to_thread(_fetch)
+    _AUTH_PROFILE_CACHE[project_id] = (_now, project)
+    return project
+
+
+#: Always credentials, whatever the profile says.
+_CREDENTIAL_HEADERS = frozenset({"cookie", "authorization", "proxy-authorization"})
+
+
+async def _anonymous_strip_names(project_id: str) -> frozenset:
+    """Header names an anonymous send must not carry: the standard credential
+    headers plus every name the project's profile sets (its header, apikey and
+    extraHeaders names), whatever host it is scoped to."""
+    names = set(_CREDENTIAL_HEADERS)
+    try:
+        from auth_profile import build_auth_headers
+        profile = (await _cached_project(project_id)).get("authProfile")
+        names |= {str(k).lower() for k in build_auth_headers(profile or {})}
+    except Exception:  # noqa: BLE001 - the standard names are still stripped
+        pass
+    return frozenset(names)
 
 
 async def _profile_auth_base(project_id: str, txn: dict) -> dict:
@@ -4533,54 +4819,21 @@ async def _profile_auth_base(project_id: str, txn: dict) -> dict:
         host = txn.get("host")
         if not host:
             return {}
-        webapp_url = os.environ.get("WEBAPP_API_URL", "http://webapp:3000")
-        def _fetch():
-            import requests as _rq
-            r = _rq.get(f"{webapp_url.rstrip('/')}/api/projects/{project_id}",
-                        headers={"X-Internal-Key": os.environ.get("INTERNAL_API_KEY", "")}, timeout=10)
-            r.raise_for_status()
-            return r.json()
-        import time as _time  # `time` is not imported at module scope in this file
-        _now = _time.time()
-        _hit = _AUTH_PROFILE_CACHE.get(project_id)
-        if _hit and (_now - _hit[0]) < _AUTH_PROFILE_TTL_SEC:
-            project = _hit[1]
-        else:
-            project = await asyncio.to_thread(_fetch)
-            _AUTH_PROFILE_CACHE[project_id] = (_now, project)
+        project = await _cached_project(project_id)
         profile = project.get("authProfile")
         if not profile:
             return {}
-        # Scope: the profile's explicit hosts, else the project's target domains.
-        scope = list(profile.get("scopeHosts") or [])
-        if not scope:
-            if not project.get("ipMode"):
-                roots = []
-                root = (project.get("targetDomain") or "").strip()
-                if root:
-                    roots.append(root)
-                # A domain-batch project leaves targetDomain empty and keeps its
-                # scope in the derived groups.
-                for g in (project.get("domainBatchGroups") or []):
-                    if isinstance(g, dict):
-                        gr = str(g.get("rootDomain") or "").strip()
-                        if gr and gr not in roots:
-                            roots.append(gr)
-                for r in roots:
-                    # Subdomains are the project's own surface and are exactly what
-                    # the captured transactions hit. An apex-only scope left every
-                    # replay against a discovered host silently unauthenticated
-                    # (mirrors default_scope_hosts in recon/helpers/auth_profile.py).
-                    scope.append(r)
-                    scope.append(f"*.{r}")
-                if root:
-                    for pre in (project.get("subdomainList") or []):
-                        pre = str(pre).strip().rstrip(".")
-                        if pre:
-                            scope.append(f"{pre}.{root}")
-            scope += [str(ip) for ip in (project.get("targetIps") or [])]
+        # The same scope as the agent's curl session (§4.6), from the webapp's
+        # scope groups; the profile's explicit hosts only narrow it, and the
+        # request's host is RoE-checked.
         from auth_profile import auth_headers_for_host
-        return auth_headers_for_host(profile, host, scope)
+        from recon_settings.engagement import derive_roe_enabled
+        from scope_groups import auth_scope_patterns, scope_groups_from_project
+        groups = scope_groups_from_project(project)[0]
+        patterns = auth_scope_patterns(groups, ip_mode=bool(project.get("ipMode")),
+                                       target_ips=project.get("targetIps") or [])
+        roe = (project.get("roeExcludedHosts") or []) if derive_roe_enabled(project) else []
+        return auth_headers_for_host(profile, host, patterns, roe)
     except Exception:  # noqa: BLE001
         return {}
 
@@ -4612,6 +4865,9 @@ class TrafficReplayRequest(BaseModel):
     mutate: dict = {}
     insertion_point: Optional[str] = None  # fuzz only
     payloads: Optional[list] = None        # fuzz only
+    # The same request with no credentials at all: no profile seeded, and the
+    # origin's Cookie/Authorization/profile headers stripped (an authz check).
+    anonymous: bool = False
 
 
 def _verify_traffic_ctx(ctx: str) -> Optional[dict]:
@@ -4734,8 +4990,12 @@ async def traffic_replay(body: TrafficReplayRequest):
     except Exception:  # noqa: BLE001
         replay_tag = ""
 
-    # Authenticated identity for in-scope hosts (best-effort; {} otherwise).
-    auth_base = await _profile_auth_base(claims["project_id"], txn)
+    # Authenticated identity for in-scope hosts (best-effort; {} otherwise), or
+    # none at all for an anonymous send.
+    if body.anonymous:
+        auth_base, strip = {}, await _anonymous_strip_names(claims["project_id"])
+    else:
+        auth_base, strip = await _profile_auth_base(claims["project_id"], txn), None
 
     try:
         if body.op == "fuzz":
@@ -4745,10 +5005,12 @@ async def traffic_replay(body: TrafficReplayRequest):
             payloads = [str(x) for x in (body.payloads or [])[:200]]
             if not ip or not payloads:
                 return JSONResponse(status_code=400, content={"error": "fuzz requires insertion_point + payloads"})
-            sends = [{"payload": pl, "curl_args": args} for pl, args in build_fuzz_curls(txn, ip, payloads, auth_base=auth_base)]
+            sends = [{"payload": pl, "curl_args": args}
+                     for pl, args in build_fuzz_curls(txn, ip, payloads, auth_base=auth_base, strip_headers=strip)]
         else:
             mutate = body.mutate if isinstance(body.mutate, dict) else {}
-            sends = [{"payload": None, "curl_args": build_replay_curl(txn, mutate, auth_base=auth_base)}]
+            sends = [{"payload": None,
+                      "curl_args": build_replay_curl(txn, mutate, auth_base=auth_base, strip_headers=strip)}]
     except ValueError as e:
         # Host-pin / scope violation (F1) or a malformed mutate — refuse, fail closed.
         return JSONResponse(status_code=400, content={"error": f"replay refused: {str(e)[:200]}"})
@@ -4765,7 +5027,8 @@ async def traffic_replay(body: TrafficReplayRequest):
             "error": f"replay send budget exhausted for this session ({used}/{budget}); refusing {len(sends)} more"})
     _TRAFFIC_REPLAY_SENDS[bkey] = used + len(sends)
 
-    return JSONResponse(content={"sends": sends, "ctx": replay_tag})
+    return JSONResponse(content={"sends": sends, "ctx": replay_tag,
+                                 "identity": "anonymous" if body.anonymous else "session"})
 
 
 # Per-session browser-action budget for /traffic/browser. proxy_brain's
@@ -4793,6 +5056,7 @@ class TrafficBrowserRequest(BaseModel):
     action: str  # open | navigate | interact | eval
     origin_id: str
     url: Optional[str] = None  # navigate only (for the host-pin check)
+    anonymous: bool = False    # open only: no session in the browser context
 
 
 @app.post("/traffic/browser", tags=["Traffic"], dependencies=[Depends(require_internal_auth_only)])
@@ -4877,13 +5141,14 @@ async def traffic_browser(body: TrafficBrowserRequest):
         # to the origin transaction's host, which _profile_auth_base scope-checks,
         # so the session rides every request the page makes (best-effort, {} when
         # no profile / out of scope). Same write-only channel as the ctx tag.
-        auth_headers = await _profile_auth_base(claims["project_id"], txn)
+        auth_headers = {} if body.anonymous else await _profile_auth_base(claims["project_id"], txn)
         return JSONResponse(content={
             "origin_host": origin_host,
             "scheme": origin_scheme,
             "port": origin_port,
             "ctx": cap_tag,
             "auth_headers": auth_headers,
+            "identity": "anonymous" if body.anonymous else "session",
         })
 
     return JSONResponse(content={"ok": True})
@@ -5221,6 +5486,7 @@ async def kali_terminal_proxy(websocket: WebSocket):
 
     await websocket.accept()
 
+    close_code, close_reason = 1000, ""
     try:
         async with websockets.connect(
             upstream_url,
@@ -5263,9 +5529,13 @@ async def kali_terminal_proxy(websocket: WebSocket):
 
     except Exception as e:
         logger.error("Kali terminal proxy error: %s", e)
+        # The class only: the terminal shows the reason, and the text can carry
+        # the upstream URL with the tenant ids in its query.
+        close_code = 1011
+        close_reason = f"Kali sandbox terminal unavailable ({type(e).__name__})"
     finally:
         try:
-            await websocket.close()
+            await websocket.close(code=close_code, reason=close_reason)
         except Exception:
             pass
 
@@ -5285,11 +5555,15 @@ async def agent_websocket(websocket: WebSocket):
 
     The client must send an 'init' message first to authenticate the session.
     """
+    # Closing before accept() refuses the handshake, which the browser sees as a
+    # bare 1006; accepting first lets the code and reason reach the drawer.
     if not orchestrator:
+        await websocket.accept()
         await websocket.close(code=1011, reason="Orchestrator not initialized")
         return
 
     if not ws_manager:
+        await websocket.accept()
         await websocket.close(code=1011, reason="WebSocket manager not initialized")
         return
 

@@ -27,6 +27,7 @@ Bug bounty hunters who have already triaged a target (perhaps with the Quick Win
 - Nuclei with all severity levels + DAST mode + Interactsh OOB detection
 - Security checks for comprehensive header/TLS/infrastructure validation
 - CVE lookup and MITRE enrichment
+- OpenAPI import with Auto-discover: API specification documents found on live hosts become declared endpoints and parameters (never called; later scanners request them with GET or HEAD only)
 
 ### What it disables
 - Port scanning (Naabu, Masscan, Nmap) -- not needed for web-focused bounty hunting, httpx handles web ports
@@ -50,8 +51,8 @@ Bug bounty hunters who have already triaged a target (perhaps with the Quick Win
   targetProfile: 'domain',
   environment: 'external',
   parameters: {
-    // Modules: all except port_scan (web-focused) and js_recon handled via tool toggle
-    scanModules: ['domain_discovery', 'http_probe', 'resource_enum', 'vuln_scan', 'js_recon'],
+    // Modules: all except port_scan (web-focused); JS recon runs by jsReconEnabled
+    scanModules: ['domain_discovery', 'http_probe', 'resource_enum', 'vuln_scan'],
 
     // No stealth
     stealthMode: false,
@@ -85,6 +86,7 @@ Bug bounty hunters who have already triaged a target (perhaps with the Quick Win
 
     // --- httpx: all probes enabled for full fingerprinting ---
     httpxEnabled: true,
+    ipAttributionEnabled: true,
     httpxThreads: 50,
     httpxTimeout: 15,
     httpxRetries: 2,
@@ -201,6 +203,7 @@ Bug bounty hunters who have already triaged a target (perhaps with the Quick Win
 
     // --- DISABLE Kiterunner (too noisy) ---
     kiterunnerEnabled: false,
+    openapiAutoDiscover: true,
 
     // --- Arjun: GET + POST parameter discovery ---
     arjunEnabled: true,
@@ -273,6 +276,8 @@ Bug bounty hunters who have already triaged a target (perhaps with the Quick Win
 
     // --- Security checks: all enabled ---
     serializedScanEnabled: true,
+    // Route exposure: unauthenticated internal/admin/debug routes, exposed .git/.env/backups, PII in responses.
+    routeExposureEnabled: true,
     securityCheckEnabled: true,
     securityCheckDirectIpHttp: true,
     securityCheckDirectIpHttps: true,

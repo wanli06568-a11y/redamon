@@ -2,13 +2,15 @@
 
 import { useState, useEffect, useRef } from 'react'
 import { useRouter } from 'next/navigation'
-import { Plus, FolderOpen, Users, RefreshCw, Trash2, Upload } from 'lucide-react'
+import { Plus, FolderOpen, Users, RefreshCw, Trash2, Upload, AlertTriangle } from 'lucide-react'
 import Link from 'next/link'
-import { useProjects, useDeleteProject } from '@/hooks/useProjects'
+import { useProjects, useDeleteProject, type ProjectListItem } from '@/hooks/useProjects'
 import { useUsers, useCreateUser, useDeleteUser } from '@/hooks/useUsers'
 import { useProject } from '@/providers/ProjectProvider'
 import { ProjectCard } from '@/components/projects/ProjectCard'
+import { projectTargetLabel, toProjectSummary } from '@/lib/projectSummary'
 import { useAlertModal, useToast, WikiInfoButton } from '@/components/ui'
+import { errorMessage } from '@/lib/apiError'
 import { ImportModal } from './ImportModal'
 import styles from './page.module.css'
 
@@ -23,7 +25,7 @@ export default function ProjectsPage() {
   const [newUserEmail, setNewUserEmail] = useState('')
 
   const { data: users, isLoading: usersLoading } = useUsers()
-  const { data: projects, isLoading: projectsLoading, refetch } = useProjects(userId || undefined)
+  const { data: projects, isLoading: projectsLoading, error: projectsError, refetch } = useProjects(userId || undefined)
   const deleteProjectMutation = useDeleteProject()
   const createUserMutation = useCreateUser()
   const deleteUserMutation = useDeleteUser()
@@ -41,21 +43,21 @@ export default function ProjectsPage() {
     }
   }, [userId, users, setUserId, setCurrentProject])
 
-  const handleSelectProject = (project: { id: string; name: string; targetDomain: string }) => {
-    setCurrentProject({
-      id: project.id,
-      name: project.name,
-      targetDomain: project.targetDomain,
-      createdAt: '',
-      updatedAt: ''
-    })
+  const handleSelectProject = (project: ProjectListItem) => {
+    setCurrentProject(toProjectSummary(project))
     router.push(`/graph?project=${project.id}`)
   }
 
   const handleDeleteProject = async (projectId: string) => {
     if (await dangerConfirm('Are you sure you want to delete this project? This action cannot be undone.')) {
-      await deleteProjectMutation.mutateAsync(projectId)
-      toast.success('Project deleted')
+      try {
+        await deleteProjectMutation.mutateAsync(projectId)
+        toast.success('Project deleted')
+      } catch (error) {
+        alertError(errorMessage(error, 'Failed to delete project'))
+        // A proxy timeout can answer after the row is already gone.
+        void refetch()
+      }
     }
   }
 
@@ -175,6 +177,16 @@ export default function ProjectsPage() {
 
       {isLoading ? (
         <div className={styles.loading}>Loading...</div>
+      ) : projectsError && !projects ? (
+        <div className={styles.empty} role="alert">
+          <AlertTriangle size={48} />
+          <h2>Could not load the projects</h2>
+          <p>{errorMessage(projectsError, 'Failed to fetch projects')}</p>
+          <button className="secondaryButton" onClick={() => refetch()}>
+            <RefreshCw size={14} />
+            Retry
+          </button>
+        </div>
       ) : projects && projects.length > 0 ? (
         <div className={styles.grid}>
           {projects.map((project) => (
@@ -182,7 +194,7 @@ export default function ProjectsPage() {
               key={project.id}
               id={project.id}
               name={project.name}
-              targetDomain={project.targetDomain}
+              target={projectTargetLabel(project)}
               description={project.description}
               createdAt={project.createdAt}
               onSelect={() => handleSelectProject(project)}

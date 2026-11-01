@@ -15,6 +15,8 @@ import {
   ScheduleValidationError,
 } from '@/lib/scanSchedule'
 import { fetchScanEnvelope } from '@/lib/scanEnvelope'
+import { scopeStartProblem } from '@/lib/scopeGroups'
+import { internalError, withRouteErrors } from '@/lib/routeErrors'
 
 interface RouteParams {
   params: Promise<{ id: string; scheduleId: string }>
@@ -30,7 +32,7 @@ async function loadOwnedSchedule(projectId: string, scheduleId: string) {
 
 const NOT_FOUND = () => NextResponse.json({ error: 'Not found' }, { status: 404 })
 
-export async function PATCH(request: NextRequest, { params }: RouteParams) {
+export const PATCH = withRouteErrors('Failed to update the schedule', async (request: NextRequest, { params }: RouteParams) => {
   const { id, scheduleId } = await params
   const eff = await requireEffectiveUser()
   if (eff instanceof NextResponse) return eff
@@ -41,6 +43,26 @@ export async function PATCH(request: NextRequest, { params }: RouteParams) {
   if (!existing) return NOT_FOUND()
 
   const body = (await request.json().catch(() => ({}))) as Record<string, unknown>
+
+  // A schedule paused because its saved scope is no longer valid would fail
+  // again on its next tick: the scope is fixed first, then the schedule.
+  if (body.enabled === true) {
+    const project = await prisma.project.findUnique({
+      where: { id },
+      select: { ipMode: true, domainBatchMode: true, domainBatchHosts: true, targetDomain: true, subdomainList: true },
+    })
+    const problem = project ? scopeStartProblem(project) : null
+    if (problem) {
+      return NextResponse.json(
+        {
+          error: `${problem.message} Edit the target list, then enable this schedule.`,
+          code: 'scope_invalid',
+          invalidEntries: problem.invalid,
+        },
+        { status: 422 },
+      )
+    }
+  }
 
   // Only a change that touches the TIMING re-validates it. A spent one-off has a
   // runAt in the past, so re-validating on every edit would make renaming or
@@ -156,15 +178,11 @@ export async function PATCH(request: NextRequest, { params }: RouteParams) {
 
     return NextResponse.json({ schedule: serialize(updated) })
   } catch (error) {
-    console.error('[scanTimeline] schedule update failed:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Failed to update the schedule' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to update the schedule', { log: '[scanTimeline] schedule update failed' })
   }
-}
+})
 
-export async function DELETE(_request: NextRequest, { params }: RouteParams) {
+export const DELETE = withRouteErrors('Failed to delete the schedule', async (_request: NextRequest, { params }: RouteParams) => {
   const { id, scheduleId } = await params
   const eff = await requireEffectiveUser()
   if (eff instanceof NextResponse) return eff
@@ -188,13 +206,9 @@ export async function DELETE(_request: NextRequest, { params }: RouteParams) {
     })
     return NextResponse.json({ ok: true, deletedScheduleId: scheduleId })
   } catch (error) {
-    console.error('[scanTimeline] schedule delete failed:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Failed to delete the schedule' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to delete the schedule', { log: '[scanTimeline] schedule delete failed' })
   }
-}
+})
 
 function serialize(s: { estimatedEnvelopeBytes: bigint | null }) {
   return {

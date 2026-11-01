@@ -9,6 +9,15 @@ export interface WorkflowToolDef {
   enabledField: string
   group: number
   badge?: 'active' | 'passive' | 'both'
+  /** Recently shipped module: shows a "New!" badge on its node. */
+  isNew?: boolean
+  /** Enabled but given nothing to work on: shown as Idle, and not a source of its outputs. */
+  idleWhen?: (formData: Record<string, unknown>) => boolean
+}
+
+function openApiIdle(d: Record<string, unknown>): boolean {
+  const sources = Array.isArray(d.openapiSources) ? d.openapiSources as Array<Record<string, unknown> | null> : []
+  return !d.openapiAutoDiscover && !sources.some(s => s?.enabled !== false && Boolean(s?.url))
 }
 
 export const WORKFLOW_TOOLS: WorkflowToolDef[] = [
@@ -29,6 +38,7 @@ export const WORKFLOW_TOOLS: WorkflowToolDef[] = [
 
   // Group 4 - HTTP Probing
   { id: 'Httpx', label: 'Httpx', enabledField: 'httpxEnabled', group: 4, badge: 'active' },
+  { id: 'IpAttribution', label: 'IP Attribution', enabledField: 'ipAttributionEnabled', group: 4, badge: 'both' },
 
   // Group 5 - Resource Enumeration
   { id: 'Katana',      label: 'Katana',      enabledField: 'katanaEnabled',      group: 5, badge: 'active' },
@@ -40,6 +50,8 @@ export const WORKFLOW_TOOLS: WorkflowToolDef[] = [
   { id: 'ParamSpider', label: 'ParamSpider', enabledField: 'paramspiderEnabled', group: 5, badge: 'passive' },
   { id: 'Kiterunner',  label: 'Kiterunner',  enabledField: 'kiterunnerEnabled',  group: 5, badge: 'active' },
   { id: 'Arjun',       label: 'Arjun',       enabledField: 'arjunEnabled',       group: 5, badge: 'active' },
+  { id: 'OpenAPI',     label: 'OpenAPI',     enabledField: 'openapiEnabled',     group: 5, badge: 'active',
+    idleWhen: openApiIdle },
   { id: 'EndpointAiClassifier', label: 'Endpoint AI Classifier',
     enabledField: 'resourceEnumAiClassifierEnabled', group: 5, badge: 'passive' },
 
@@ -57,6 +69,7 @@ export const WORKFLOW_TOOLS: WorkflowToolDef[] = [
   { id: 'SubdomainTakeover',  label: 'Subdomain Takeover', enabledField: 'subdomainTakeoverEnabled',   group: 6, badge: 'active' },
   { id: 'VhostSni',           label: 'VHost & SNI',        enabledField: 'vhostSniEnabled',             group: 6, badge: 'active' },
   { id: 'WebCachePoison',     label: 'Cache Poisoning',    enabledField: 'webCachePoisonEnabled',       group: 6, badge: 'active' },
+  { id: 'RouteExposure',      label: 'Route Exposure',     enabledField: 'routeExposureEnabled',        group: 6, badge: 'active', isNew: true },
 
   // Group 7 - CVE & MITRE
   { id: 'CveLookup', label: 'CVE Lookup', enabledField: 'cveLookupEnabled', group: 7 },

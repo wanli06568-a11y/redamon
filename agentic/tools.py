@@ -32,6 +32,7 @@ from graph_db.tenant_filter import (
 import workspace_fs
 import job_runner
 import output_offload
+from neo4j_read_pool import run_neo4j_read
 
 if TYPE_CHECKING:
     from langchain_core.language_models import BaseChatModel
@@ -134,46 +135,123 @@ def _first_http_status(text: str) -> str:
     return m.group(1) if m else "?"
 
 
-def _curl_target_host(args_str: str):
-    """The host of the first full URL in a curl arg string, or None. A bare host
-    (no scheme) returns None on purpose: the auth scope check needs a host it can
-    resolve unambiguously, and 'attach nothing' is the fail-closed default."""
+# curl options that send the request, or its headers, somewhere the one URL token
+# does not name: a second request (--next), a redirect, a proxy, a rewritten
+# name resolution or socket, or arguments read from a file. The auth headers of
+# `-H` apply to every request the command makes, so any of these could carry
+# the session to a host nobody checked. Prefix matches cover the families.
+_CURL_SESSION_REFUSED = frozenset({
+    "--resolve", "--connect-to", "-x", "--proxy", "-K", "--config", "--next", "-:",
+    "-L", "--location", "--location-trusted", "--url", "--preproxy", "--doh-url",
+    "--dns-servers", "--unix-socket", "--abstract-unix-socket", "--alt-svc",
+})
+_CURL_SESSION_REFUSED_PREFIXES = ("--proxy", "--socks", "--expand-")
+_CURL_SHORT_REFUSED = frozenset("xKL:")
+# Short options that take an argument: in a cluster (`-sXPOST`) the rest of the
+# token, or else the next token, is that argument, never a URL.
+_CURL_SHORT_WITH_ARG = frozenset("AbcCdDeEFHKmoPQrtTuUwxXyYz")
+# Long options that take an argument. One missing here only makes its argument
+# count as a second URL, which withholds the session: the safe direction.
+_CURL_LONG_WITH_ARG = frozenset({
+    "--cacert", "--capath", "--cert", "--cert-type", "--ciphers", "--connect-timeout",
+    "--continue-at", "--cookie", "--cookie-jar", "--create-file-mode", "--curves",
+    "--data", "--data-ascii", "--data-binary", "--data-raw", "--data-urlencode",
+    "--dump-header", "--etag-compare", "--etag-save", "--expect100-timeout", "--form",
+    "--form-string", "--header", "--hsts", "--interface", "--ip-tos", "--json",
+    "--keepalive-time", "--key", "--key-type", "--limit-rate", "--local-port",
+    "--max-filesize", "--max-redirs", "--max-time", "--netrc-file", "--noproxy",
+    "--oauth2-bearer", "--output", "--output-dir", "--pass", "--pinnedpubkey",
+    "--proto", "--proto-default", "--proto-redir", "--range", "--rate", "--referer",
+    "--request", "--request-target", "--retry", "--retry-delay", "--retry-max-time",
+    "--speed-limit", "--speed-time", "--stderr", "--tls-max", "--tls13-ciphers",
+    "--trace", "--trace-ascii", "--upload-file", "--url-query", "--user",
+    "--user-agent", "--write-out", "--aws-sigv4", "--variable", "--happy-eyeballs-timeout-ms",
+})
+
+
+def _curl_session_target(args_str: str):
+    """(host, None) when the curl args make exactly one request, to one http(s)
+    URL, with no option that could send it elsewhere; else (None, why)."""
+    import shlex
+    from urllib.parse import urlsplit
     try:
-        import shlex
-        from urllib.parse import urlparse
-        for tok in shlex.split(args_str or ""):
-            if tok.startswith(("http://", "https://")):
-                return urlparse(tok).hostname
-    except Exception:  # noqa: BLE001
-        pass
-    return None
+        tokens = shlex.split(args_str or "")
+    except ValueError:
+        return None, "the arguments could not be parsed"
+    urls: list[str] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        i += 1
+        if tok.startswith("--"):
+            name = tok.split("=", 1)[0]
+            if name in _CURL_SESSION_REFUSED or name.startswith(_CURL_SESSION_REFUSED_PREFIXES):
+                return None, f"it uses {name}"
+            if name in _CURL_LONG_WITH_ARG and "=" not in tok:
+                i += 1
+        elif tok.startswith("-") and len(tok) > 1:
+            for j, ch in enumerate(tok[1:], start=1):
+                if ch in _CURL_SHORT_REFUSED:
+                    return None, f"it uses -{ch}"
+                if ch in _CURL_SHORT_WITH_ARG:
+                    if j == len(tok) - 1:
+                        i += 1
+                    break
+        else:
+            urls.append(tok)
+    if len(urls) != 1:
+        return None, "it names more than one URL" if urls else "it names no URL"
+    url = urls[0]
+    if not url.lower().startswith(("http://", "https://")):
+        return None, "its URL is not a full http(s) URL"
+    # URL globbing ({a,b}, [1-3]) or a backslash can make one token several
+    # hosts. Only an IPv6 literal may carry brackets.
+    probe = re.sub(r"^(https?://(?:[^/@\[]*@)?)\[[0-9a-f:.%]+\]", r"\1h", url, flags=re.I)
+    if re.search(r"[{}\[\]\\\s]", probe):
+        return None, "its URL uses globbing or a backslash"
+    try:
+        host = urlsplit(url).hostname
+    except ValueError:
+        host = None
+    return (host, None) if host else (None, "its URL has no host")
+
+
+def _curl_target_host(args_str: str):
+    """The host of a curl command that sends one request to one full http(s) URL,
+    or None. A bare host (no scheme) returns None on purpose: the auth scope
+    check needs a host it can resolve unambiguously."""
+    return _curl_session_target(args_str)[0]
 
 
 def _maybe_attach_curl_session(tool_args: dict) -> dict:
     """When the agent set use_session=true, append the project's auth headers to
-    the curl args — but ONLY for an in-scope host. The raw value is resolved from
-    project settings here (agent side), never handled by the LLM. Fails closed:
-    no profile, no host, or out of scope -> args unchanged, request stays anon."""
+    the curl args, but ONLY for a command that makes one request to an in-scope,
+    non-RoE-excluded host. The raw value is resolved from project settings here
+    (agent side), never handled by the LLM. Fails closed: otherwise the command
+    runs anonymously and `_session_note` says why, for the tool output."""
+    if not tool_args.get("use_session"):
+        return tool_args
+    withheld = "[session] Auth headers NOT attached: {}. The request ran without them."
     try:
-        if not tool_args.get("use_session"):
-            return tool_args
         from auth_profile import auth_headers_for_host
-        from project_settings import target_scope_domains
+        from project_settings import auth_scope_patterns
         profile = get_setting("AUTH_PROFILE")
-        host = _curl_target_host(tool_args.get("args", ""))
-        if not profile or not host:
-            return tool_args
-        scope_domains = []
-        for d in target_scope_domains():
-            scope_domains += [d, f"*.{d}"]   # subdomains are in scope, mirroring recon
-        headers = auth_headers_for_host(profile, host, scope_domains)
+        if not profile:
+            return {**tool_args, "_session_note": withheld.format("this project has no auth profile")}
+        host, why = _curl_session_target(tool_args.get("args", ""))
+        if not host:
+            return {**tool_args, "_session_note": withheld.format(
+                f"{why}; a session rides only a single request to a single http(s) URL")}
+        roe = (get_setting("ROE_EXCLUDED_HOSTS") or []) if get_setting("ROE_ENABLED") else []
+        headers = auth_headers_for_host(profile, host, auth_scope_patterns(), roe)
         if not headers:
-            return tool_args
+            return {**tool_args, "_session_note": withheld.format(
+                f"{host} is outside the authenticated-session scope or RoE-excluded")}
         import shlex as _shlex
         extra = "".join(f" -H {_shlex.quote(f'{k}: {v}')}" for k, v in headers.items())
         return {**tool_args, "args": (tool_args.get("args", "") + extra)}
     except Exception:  # noqa: BLE001
-        return tool_args
+        return {**tool_args, "_session_note": withheld.format("the session could not be resolved")}
 
 
 # =============================================================================
@@ -432,6 +510,12 @@ class MCPToolsManager:
 # into a multi-minute hang, because CYPHER_MAX_RETRIES generations run back to
 # back with no clock on any of them. 0 or a negative value disables the bound.
 CYPHER_GENERATION_TIMEOUT_DEFAULT = 120.0
+
+# Server-side transaction timeout for the agent's own graph reads (query_graph,
+# graph_summary). An LLM-written Cartesian product otherwise runs until Neo4j is
+# restarted, pinning the database the graph screen and every scan share. Same
+# bound as /graph/exec (api.py _GRAPH_EXEC_DEFAULT_TIMEOUT_MS).
+GRAPH_QUERY_TX_TIMEOUT_S = 120.0
 
 
 def _cypher_generation_timeout() -> float:
@@ -702,7 +786,8 @@ Cypher Query:"""
             self.graph = Neo4jGraph(
                 url=self.uri,
                 username=self.user,
-                password=self.password
+                password=self.password,
+                timeout=GRAPH_QUERY_TX_TIMEOUT_S,
             )
 
             # Store reference to self for use in the tool closure
@@ -773,7 +858,11 @@ Cypher Query:"""
                         logger.info(f"[{user_id}/{project_id}] Filtered Cypher: {filtered_cypher}")
 
                         # Step 3: Execute the filtered query
-                        result = manager.graph.query(
+                        # Off the event loop (a slow query must not freeze every
+                        # other session served by this process) and off the
+                        # default executor the LLM calls and DNS lookups share.
+                        result = await run_neo4j_read(
+                            manager.graph.query,
                             filtered_cypher,
                             params={
                                 "tenant_user_id": user_id,
@@ -853,12 +942,14 @@ Cypher Query:"""
         return graph_schema
 
     def get_summary_tool(self) -> Optional[callable]:
-        """What this project ACTUALLY contains: a count per label.
+        """What this project ACTUALLY contains: a count per label, and which web
+        hosts each stamping module actually analyzed.
 
-        Exists because "no results" has two very different causes - the scan ran
-        and the project is clean, or that surface was never scanned - and an
-        agent that cannot tell them apart reports the second as the first, which
-        is a false negative in a security tool.
+        Exists because "no results" has three very different causes - the scan
+        ran and the project is clean, that surface was never scanned, or every
+        such finding is muted - and an agent that cannot tell them apart reports
+        the second or third as the first, which is a false negative in a
+        security tool.
 
         COUNTS ONLY, never sample values: sample values are live target data
         (hostnames, secrets, endpoints) and belong in a deliberate query, not in
@@ -870,11 +961,15 @@ Cypher Query:"""
         async def graph_summary() -> str:
             """
             Summarise what this project's attack-surface graph actually contains:
-            a count per node type and the relationships present.
+            a count per node type, the relationships present, and per module
+            (JS Recon, Nuclei) how many web hosts it analyzed completely,
+            partly, found nothing to analyze on, failed on, or never looked at.
 
-            Read this before concluding that something is ABSENT. If a node type
-            is missing entirely, that surface was never scanned - which is a very
-            different answer from "it was scanned and is clean".
+            Read this before concluding that something is ABSENT. A node type
+            missing from the counts means one of three things: never scanned,
+            scanned and clean, or every such finding muted by the operator
+            (muted findings are hidden from these counts). Check the coverage
+            lines before calling a host clean.
 
             Takes no arguments. Returns counts only, never sample values.
 
@@ -917,21 +1012,39 @@ Cypher Query:"""
             try:
                 if manager.graph is None:
                     manager.graph = Neo4jGraph(
-                        url=manager.uri, username=manager.user, password=manager.password
+                        url=manager.uri, username=manager.user, password=manager.password,
+                        timeout=GRAPH_QUERY_TX_TIMEOUT_S,
                     )
-                nodes = manager.graph.query(nodes_cypher, params=params)
-                rels = manager.graph.query(rels_cypher, params=params)
+                nodes = await run_neo4j_read(manager.graph.query, nodes_cypher, params=params)
+                rels = await run_neo4j_read(manager.graph.query, rels_cypher, params=params)
             except Exception as e:
                 logger.error(f"[{user_id}/{project_id}] graph_summary failed: {e}")
                 # A plain failure, NEVER an empty summary: an empty summary reads
                 # as "nothing has ever been scanned".
                 return "Error: could not read the graph summary."
+            # The coverage lines explain the counts; an unreadable one is said
+            # so, never shown as zero or as "not recorded". Imported here: many
+            # tests import this module with graph_db stubbed as a bare module.
+            try:
+                from graph_db.coverage_stamps import (
+                    COVERAGE_SUMMARY_CYPHER, coverage_summary, coverage_summary_lines,
+                )
+                coverage = coverage_summary_lines(coverage_summary(next(iter(
+                    await run_neo4j_read(manager.graph.query, COVERAGE_SUMMARY_CYPHER, params=params)
+                ), None)))
+            except Exception as e:
+                logger.warning(f"[{user_id}/{project_id}] graph_summary coverage unreadable: {e}")
+                coverage = ["  Coverage could not be read this time; the counts above are still exact."]
 
+            # The scan history lives behind the webapp's user-session routes,
+            # out of this tool's reach, so both causes are named.
             if not nodes:
                 return (
-                    "This project's graph is EMPTY: no nodes of any type. "
-                    "Nothing has been scanned yet, so an absent finding here "
-                    "means 'not looked for', not 'not present'."
+                    "This project's graph is EMPTY: no nodes of any type. Either nothing "
+                    "has been scanned yet, or the graph data was lost (a reset database "
+                    "or a failed restore); the project's scan history in the app tells "
+                    "which. Either way an absent finding here means 'not looked for' or "
+                    "'unknown', never 'not present'."
                 )
 
             lines = ["Node types in this project (count):"]
@@ -941,6 +1054,12 @@ Cypher Query:"""
                 lines += [f"  {r['type']}: {r['count']}" for r in rels]
             else:
                 lines.append("No relationships between nodes yet.")
+            lines.append("Web hosts (BaseURL) per module, from its last run:")
+            lines += coverage
+            lines.append(
+                "A node type or finding missing here means never scanned, scanned and clean, "
+                "or all of it muted by the operator (muted findings are not counted). Only a "
+                "host a module completed is clean for that module.")
             return "\n".join(lines)
 
         return graph_summary
@@ -1989,6 +2108,115 @@ def _is_mcp_transport_error(exc: BaseException) -> bool:
     return False
 
 
+# =============================================================================
+# TOOL DEADLINES
+# =============================================================================
+
+# Wall-clock seconds the agent waits for ONE tool call before abandoning it.
+# Nothing else bounds a call: the kali MCP SSE stream carries a keep-alive
+# comment every 15s (sse-starlette's default ping), which resets httpx's read
+# timeout, so the per-server sse_read_timeout never fires while kali-sandbox is
+# up. A lost answer therefore hung the session forever (observed: an
+# execute_code card at 1837s for a script kali kills at 120s). Each value is the
+# tool's own server-side limit in mcp/servers/*.py plus a margin for MCP session
+# setup and queueing on the server, so no tool is cut short of the limit it
+# already enforces on itself.
+_TOOL_DEADLINE_MARGIN_S = 60
+TOOL_DEADLINES_S: Dict[str, float] = {
+    name: float(limit + _TOOL_DEADLINE_MARGIN_S)
+    for name, limit in {
+        "execute_curl": 60,
+        "execute_naabu": 300,
+        "execute_httpx": 300,
+        "execute_subfinder": 120,
+        "execute_gau": 300,
+        "kali_shell": 300,
+        "execute_code": 180,          # C/C++: 60s compile + 120s run
+        "proxy_brain": 180,
+        "execute_hydra": 1800,
+        "execute_jsluice": 120,
+        "execute_masscan": 600,
+        "execute_wpscan": 600,
+        "execute_amass": 1800,
+        "execute_katana": 1800,
+        "execute_arjun": 1200,
+        "execute_ffuf": 1200,
+        "cve_intel": 60,
+        "execute_osv_scanner": 60,
+        "execute_nmap": 600,
+        "execute_nuclei": 1800,
+        "execute_playwright": 60,
+        # MSF_RUN_TIMEOUT, plus up to 10 min queued behind the single console lock.
+        "metasploit_console": 2400,
+        # In-process tools: bounded by their own HTTP/LLM timeouts, which can
+        # chain (query_graph retries Cypher generation; tradecraft may run an
+        # LLM section picker before its fetch).
+        "query_graph": 540,
+        "graph_schema": 60,
+        "graph_summary": 120,
+        "tradecraft_lookup": 240,
+        "web_search": 120,
+        "shodan": 60,
+        "google_dork": 60,
+    }.items()
+}
+# Unknown tools (user MCP servers, agent-native tools) get the longest kali
+# limit plus the margin, so a working long-running tool is never cut short.
+TOOL_DEADLINE_DEFAULT_S = 1860.0
+
+
+def tool_deadline_seconds(tool_name: str) -> float:
+    """Seconds allowed for one call of `tool_name`; 0.0 means unbounded.
+
+    TOOL_DEADLINE_DEFAULT overrides the bound for tools without a table entry.
+    """
+    if tool_name in TOOL_DEADLINES_S:
+        return TOOL_DEADLINES_S[tool_name]
+    raw = os.environ.get("TOOL_DEADLINE_DEFAULT")
+    if raw is None or raw.strip() == "":
+        return TOOL_DEADLINE_DEFAULT_S
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        logger.warning(
+            f"Invalid TOOL_DEADLINE_DEFAULT={raw!r}, using {TOOL_DEADLINE_DEFAULT_S}s"
+        )
+        return TOOL_DEADLINE_DEFAULT_S
+
+
+class ToolDeadlineExceeded(Exception):
+    """A tool call produced no answer within its wall-clock deadline."""
+
+    def __init__(self, tool_name: str, seconds: float):
+        self.tool_name = tool_name
+        self.seconds = seconds
+        super().__init__(
+            f"Tool '{tool_name}' gave no answer within {int(seconds)}s and was "
+            f"abandoned: the result was lost in transit, or the tool or its host "
+            f"is stuck or overloaded. Do not assume the call ran or failed on the "
+            f"target: re-run it once if the result matters, otherwise continue "
+            f"with another step."
+        )
+
+
+async def _await_within_deadline(tool_name: str, awaitable) -> str:
+    """Await one tool call, raising ToolDeadlineExceeded when its clock runs out.
+
+    Uses asyncio.timeout's own expiry flag so a TimeoutError raised BY the tool
+    is passed through untouched rather than reported as a missed deadline.
+    """
+    deadline = tool_deadline_seconds(tool_name)
+    if not deadline:
+        return await awaitable
+    try:
+        async with asyncio.timeout(deadline) as clock:
+            return await awaitable
+    except TimeoutError:
+        if clock.expired():
+            raise ToolDeadlineExceeded(tool_name, deadline) from None
+        raise
+
+
 class PhaseAwareToolExecutor:
     """
     Executes tools with phase-awareness.
@@ -2397,8 +2625,12 @@ class PhaseAwareToolExecutor:
         # Opt-in authenticated identity for execute_curl. Injected here so the raw
         # session value never reaches the LLM (mirrors the ctx tag), and only for
         # an in-scope host so a curl the model points off-target cannot leak it.
+        session_note = None
         if tool_name == "execute_curl":
             tool_args = _maybe_attach_curl_session(tool_args)
+            if "_session_note" in tool_args:
+                tool_args = dict(tool_args)
+                session_note = tool_args.pop("_session_note")
 
         # proxy_brain: the signed tenant/session tag is how its kali `redamon` SDK
         # reaches the corpus (/traffic/exec) and the replay path (/traffic/replay),
@@ -2474,7 +2706,8 @@ class PhaseAwareToolExecutor:
             else:
                 output = await active_tool.ainvoke(tool_args)
             # Extract clean text from MCP response (list of content blocks, etc.)
-            return self._extract_text_from_output(output)
+            text = self._extract_text_from_output(output)
+            return f"{session_note}\n\n{text}" if session_note else text
 
         is_mcp = tool_name in self._mcp_tool_names
         # Snapshot the generation BEFORE the call so concurrent failures
@@ -2483,7 +2716,7 @@ class PhaseAwareToolExecutor:
         seen_gen = self.mcp_manager.generation if is_mcp else 0
 
         try:
-            clean_output = await _invoke(tool)
+            clean_output = await _await_within_deadline(tool_name, _invoke(tool))
             clean_output = output_offload.maybe_offload(
                 current_project_id.get(),
                 tool_name,
@@ -2491,6 +2724,12 @@ class PhaseAwareToolExecutor:
                 override=output_override,
             )
             return {"success": True, "output": clean_output, "error": None}
+
+        except ToolDeadlineExceeded as exc:
+            # Not a dead transport: a reconnect + retry would only spend the
+            # same deadline a second time on a call that already got lost.
+            logger.error(f"Tool deadline exceeded: {tool_name} after {int(exc.seconds)}s")
+            return {"success": False, "output": None, "error": str(exc)}
 
         except Exception as exc:
             # Non-MCP tools or unrelated failures: original behaviour.
@@ -2533,7 +2772,7 @@ class PhaseAwareToolExecutor:
                 return {"success": False, "output": None, "error": str(exc)}
 
             try:
-                clean_output = await _invoke(retry_tool)
+                clean_output = await _await_within_deadline(tool_name, _invoke(retry_tool))
                 clean_output = output_offload.maybe_offload(
                     current_project_id.get(),
                     tool_name,

@@ -19,13 +19,23 @@ const hookState = {
   phase: { name: null, num: null },
   launching: false,
   loadingTargets: false,
-  error: null,
+  error: null as string | null,
+  targetsError: null as string | null,
+  findingsError: null as string | null,
+  statusError: null as string | null,
+  streamError: null as string | null,
   loadTargets: vi.fn(),
   loadFindings: vi.fn(),
   launch: vi.fn(),
   stop: vi.fn(),
 }
 vi.mock('@/hooks/useAiAttackSurface', () => ({ useAiAttackSurface: () => hookState }))
+
+// The backend's judge model (drift-map #16). The name is test data: the page must
+// show whatever the orchestrator reports, never a model of its own.
+const BACKEND_JUDGE = 'judge-under-test:7b'
+const judgeState = vi.hoisted(() => ({ current: { status: 'ready', model: 'judge-under-test:7b' } as Record<string, unknown> }))
+vi.mock('@/hooks/useLocalJudgeModel', () => ({ useLocalJudgeModel: () => judgeState.current }))
 
 // Mock useAlertModal. The real hook throws unless <AlertProvider> is in the
 // tree (it is mounted in app/layout.tsx in production, which these render tests
@@ -56,6 +66,12 @@ beforeEach(() => {
   hookState.findings = []
   hookState.run = null
   hookState.logs = []
+  hookState.error = null
+  hookState.targetsError = null
+  hookState.findingsError = null
+  hookState.statusError = null
+  hookState.streamError = null
+  judgeState.current = { status: 'ready', model: BACKEND_JUDGE }
 })
 
 describe('AI Attack Surface page', () => {
@@ -247,5 +263,141 @@ describe('AI Attack Surface — garak probe selection grid', () => {
     fireEvent.click(screen.getByText('Clear'))
     const launchBtn = (screen.getByText('Launch garak').closest('button')) as HTMLButtonElement
     expect(launchBtn.disabled).toBe(true)
+  })
+})
+
+describe('AI Attack Surface — the judge model is the backend\'s (drift-map #16)', () => {
+  beforeEach(() => {
+    (hookState.launch as ReturnType<typeof vi.fn>).mockClear()
+    hookState.targets = [{ baseUrl: 'http://h:8000', path: '/v1/chat/completions', method: 'POST', interfaceType: 'llm-chat' }]
+  })
+
+  const judgeInput = () =>
+    screen.getByText('Judge').querySelector('input') as HTMLInputElement
+
+  const openGarakReady = () => {
+    render(<AiAttackSurfacePage />)
+    fireEvent.click(screen.getAllByText('Configure & launch')[0])
+    fireEvent.click(screen.getByText('http://h:8000/v1/chat/completions'))
+    fireEvent.click(screen.getByText(/I confirm this is an authorized/))
+  }
+
+  test('the field starts at the orchestrator\'s model and the launch sends it', () => {
+    openGarakReady()
+    expect(judgeInput().value).toBe(BACKEND_JUDGE)
+    fireEvent.click(screen.getByText('Launch garak'))
+    const arg = (hookState.launch as ReturnType<typeof vi.fn>).mock.calls[0][0]
+    expect(arg.bounds.judge_model).toBe(BACKEND_JUDGE)
+  })
+
+  test('an operator\'s own model wins over the backend\'s', () => {
+    openGarakReady()
+    fireEvent.change(judgeInput(), { target: { value: 'my-judge:14b' } })
+    fireEvent.click(screen.getByText('Launch garak'))
+    const arg = (hookState.launch as ReturnType<typeof vi.fn>).mock.calls[0][0]
+    expect(arg.bounds.judge_model).toBe('my-judge:14b')
+  })
+
+  test('while it loads the field is empty and disabled, and nothing can launch', () => {
+    judgeState.current = { status: 'loading' }
+    openGarakReady()
+    const input = judgeInput()
+    expect(input.value).toBe('')
+    expect(input.disabled).toBe(true)
+    expect(input.placeholder).toBe('Loading…')
+    const launchBtn = screen.getByText('Launch garak').closest('button') as HTMLButtonElement
+    expect(launchBtn.disabled).toBe(true)
+  })
+
+  test('with the orchestrator down the field is empty, says so, and stays editable', () => {
+    judgeState.current = { status: 'unavailable', reason: 'orchestrator_unreachable', error: 'The local judge model is unavailable (orchestrator_unreachable · HTTP 503)' }
+    openGarakReady()
+    const input = judgeInput()
+    expect(input.value).toBe('')
+    expect(input.disabled).toBe(false)
+    expect(input.placeholder).toBe('Local LLM unavailable')
+    fireEvent.click(screen.getByText('Launch garak'))
+    const arg = (hookState.launch as ReturnType<typeof vi.fn>).mock.calls[0][0]
+    expect(arg.bounds.judge_model).toBe('')
+  })
+
+  test('its tooltip names which failure it was', () => {
+    judgeState.current = { status: 'unavailable', reason: 'orchestrator_unreachable', error: 'The local judge model is unavailable (orchestrator_unreachable · HTTP 503)' }
+    openGarakReady()
+    expect(judgeInput().title).toBe(
+      'The judge model could not be read: The local judge model is unavailable (orchestrator_unreachable · HTTP 503). '
+      + 'Type one, or leave it empty to run without a judge.',
+    )
+  })
+
+  test('an orchestrator without a model says so, not that it failed', () => {
+    judgeState.current = { status: 'unavailable', reason: 'no_model' }
+    openGarakReady()
+    expect(judgeInput().title).toMatch(/^The orchestrator did not report its judge model\./)
+  })
+})
+
+describe('AI Attack Surface — a failure shows its cause', () => {
+  const openGarak = () => {
+    render(<AiAttackSurfacePage />)
+    fireEvent.click(screen.getAllByText('Configure & launch')[0])
+  }
+
+  test('a failed target load reads as a failure, not as "no endpoints"', () => {
+    hookState.targetsError = 'Failed to load the LLM endpoints (Neo4jError · HTTP 500)'
+    openGarak()
+    expect(screen.getByText('Failed to load the LLM endpoints (Neo4jError · HTTP 500)')).toBeTruthy()
+    expect(screen.queryByText(/No llm-chat\/completion endpoints/)).toBeNull()
+    expect(screen.getByText(/LLM endpoints could not be loaded/)).toBeTruthy()
+    expect(screen.queryByText(/0 LLM endpoint\(s\) discovered/)).toBeNull()
+  })
+
+  test('a failed findings load reads as a failure, not as "no findings yet"', () => {
+    hookState.findingsError = 'Failed to load AI Gauntlet findings (Neo4jError · HTTP 500)'
+    render(<AiAttackSurfacePage />)
+    expect(screen.getByText('Failed to load AI Gauntlet findings (Neo4jError · HTTP 500)')).toBeTruthy()
+    expect(screen.queryByText('No AI Gauntlet findings yet.')).toBeNull()
+  })
+
+  test('a run that ended in error shows the scanner\'s reason', () => {
+    hookState.run = { run_id: 'r1', tool: 'garak', status: 'error', error: 'Container exited with code 137: killed (out of memory)' }
+    openGarak()
+    expect(screen.getByText('Container exited with code 137: killed (out of memory)')).toBeTruthy()
+  })
+
+  test('an unavailable status is said next to the last known state', () => {
+    hookState.run = { run_id: 'r1', tool: 'garak', status: 'running' }
+    hookState.statusError = 'AI Gauntlet status unavailable (orchestrator_unreachable · HTTP 503)'
+    render(<AiAttackSurfacePage />)
+    fireEvent.click(screen.getByText('Running…'))
+    expect(screen.getByText('running')).toBeTruthy()
+    expect(screen.getByText('AI Gauntlet status unavailable (orchestrator_unreachable · HTTP 503)')).toBeTruthy()
+  })
+
+  test('with no run to attach it to, an unavailable status shows at the top', () => {
+    hookState.statusError = 'AI Gauntlet runs unavailable (orchestrator_unreachable · HTTP 503)'
+    render(<AiAttackSurfacePage />)
+    expect(screen.getByRole('alert').textContent).toBe('AI Gauntlet runs unavailable (orchestrator_unreachable · HTTP 503)')
+  })
+
+  test('a lost log stream is said while the run is live, and not after it ended', () => {
+    hookState.run = { run_id: 'r1', tool: 'garak', status: 'running' }
+    hookState.streamError = 'Log stream lost'
+    render(<AiAttackSurfacePage />)
+    fireEvent.click(screen.getByText('Running…'))
+    expect(screen.getByText('Log stream lost')).toBeTruthy()
+    cleanup()
+    hookState.run = { run_id: 'r1', tool: 'garak', status: 'completed' }
+    openGarak()
+    expect(screen.queryByText('Log stream lost')).toBeNull()
+  })
+
+  test('a failed stop is shown beside the Stop button', () => {
+    hookState.run = { run_id: 'r1', tool: 'garak', status: 'running' }
+    hookState.error = 'Failed to stop AI Gauntlet scan (orchestrator_unreachable · HTTP 503)'
+    render(<AiAttackSurfacePage />)
+    fireEvent.click(screen.getByText('Running…'))
+    expect(screen.getByText('Stop')).toBeTruthy()
+    expect(screen.getByText('Failed to stop AI Gauntlet scan (orchestrator_unreachable · HTTP 503)')).toBeTruthy()
   })
 })

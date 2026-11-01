@@ -27,6 +27,32 @@ describe('ZapAjaxSpider node mapping', () => {
   })
 })
 
+describe('OpenAPI workflow wiring', () => {
+  test('consumes BaseURL and produces declared endpoints with their parameters', () => {
+    expect(SECTION_INPUT_MAP.OpenAPI).toEqual(['BaseURL'])
+    expect(SECTION_NODE_MAP.OpenAPI).toEqual(['Endpoint', 'BaseURL', 'Parameter'])
+  })
+
+  test('is a resource-enumeration tool with the exact partial tool id', () => {
+    const tool = WORKFLOW_TOOLS.find(t => t.id === 'OpenAPI')
+    expect(tool).toMatchObject({
+      label: 'OpenAPI',
+      enabledField: 'openapiEnabled',
+      group: 5,
+      badge: 'active',
+    })
+  })
+
+  test('is idle with no document configured and auto-discover off', () => {
+    const idle = WORKFLOW_TOOLS.find(t => t.id === 'OpenAPI')!.idleWhen!
+    expect(idle({ openapiAutoDiscover: false, openapiSources: [] })).toBe(true)
+    expect(idle({ openapiAutoDiscover: false, openapiSources: [{ url: 'https://a.example.com/o.json', enabled: false }] })).toBe(true)
+    expect(idle({ openapiAutoDiscover: false, openapiSources: [{ url: '' }] })).toBe(true)
+    expect(idle({ openapiAutoDiscover: false, openapiSources: [{ url: 'https://a.example.com/o.json' }] })).toBe(false)
+    expect(idle({ openapiAutoDiscover: true, openapiSources: [] })).toBe(false)
+  })
+})
+
 describe('GraphqlScan workflow definition', () => {
   const tool = WORKFLOW_TOOLS.find(t => t.id === 'GraphqlScan')
 
@@ -69,7 +95,7 @@ describe('Workflow graph edges stay consistent', () => {
     // A few tools are pure enrichment (annotate existing nodes without creating
     // new ones) and intentionally map to an empty output array — accept
     // undefined OR empty for those, otherwise require a non-empty entry.
-    const PURE_ENRICHMENT = new Set(['EndpointAiClassifier'])
+    const PURE_ENRICHMENT = new Set(['EndpointAiClassifier', 'IpAttribution'])
     for (const tool of WORKFLOW_TOOLS) {
       const outputs = SECTION_NODE_MAP[tool.id]
       if (outputs !== undefined && !PURE_ENRICHMENT.has(tool.id)) {

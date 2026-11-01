@@ -75,10 +75,11 @@ describe('phase B: shared contract', () => {
     ['paramMatrix',   paramMatrixRoute.GET],
     ['sharedInfra',   sharedInfraRoute.GET],
     ['dnsEmail',      dnsEmailRoute.GET],
-  ])('%s returns 500 on Neo4j failure', async (_, handler) => {
-    shouldThrow = new Error('connection refused')
+  ])('%s returns 500 on Neo4j failure, with the Neo4j code and no raw text', async (_, handler) => {
+    shouldThrow = Object.assign(new Error('connection refused'), { code: 'Neo.ClientError.Statement.SyntaxError' })
     const res = await handler(makeRequest('p1'))
     expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Query failed', code: 'Neo.ClientError.Statement.SyntaxError' })
   })
 
   test.each([
@@ -96,6 +97,17 @@ describe('phase B: shared contract', () => {
 // webInitAccess
 // ---------------------------------------------------------------------------
 describe('/api/analytics/redzone/webInitAccess', () => {
+  test('a declared-only auth endpoint is counted apart unless a finding sits on it', async () => {
+    runReturn = []
+    await webInitRoute.GET(makeRequest('p1'))
+    const c = runCalls[0].cypher
+    expect(c).toContain("AND (NOT coalesce(ep.openapi_declared_only, ep.openapi_declared, false) OR (ep)-[:HAS_VULNERABILITY]->())")
+    expect(c).toContain("AND coalesce(dep.openapi_declared_only, dep.openapi_declared, false) AND NOT (dep)-[:HAS_VULNERABILITY]->()")
+    expect(c).toMatch(/WITH bu, authEps, count\(DISTINCT dep\) AS declaredAuthCount/)
+    // A declaration alone never makes a row.
+    expect(c).toMatch(/WHERE size\(authEps\) > 0 OR size\(\[x IN vulnTags WHERE x IS NOT NULL\]\) > 0/)
+  })
+
   test('Cypher filters auth endpoints by category AND login-path regex', async () => {
     runReturn = []
     await webInitRoute.GET(makeRequest('p1'))
@@ -156,6 +168,16 @@ describe('/api/analytics/redzone/webInitAccess', () => {
     expect(r.headerGrid['Strict-Transport-Security']).toBe(false)
     // 4 headers missing + 1 vuln = 5 → D
     expect(r.grade).toBe('D')
+  })
+
+  test('maps the declared auth endpoint count, 0 when the graph has none', async () => {
+    runReturn = [
+      { baseUrl: 'https://a.example.com', authEndpointCount: { low: 0, high: 0 },
+        declaredAuthCount: { low: 1, high: 0 }, vulnTags: ['missing_coop'] },
+      { baseUrl: 'https://b.example.com', authEndpointCount: { low: 2, high: 0 }, vulnTags: [] },
+    ]
+    const body = await (await webInitRoute.GET(makeRequest('p1'))).json()
+    expect(body.rows.map((r: { declaredAuthCount: number }) => r.declaredAuthCount)).toEqual([1, 0])
   })
 })
 
@@ -385,6 +407,39 @@ describe('/api/analytics/redzone/dnsEmail', () => {
     expect(r.dnssecMissing).toBe(true)
     expect(r.dnssecEnabled).toBe(false)
     expect(r.zoneTransferOpen).toBe(true)
+  })
+})
+
+describe('/api/analytics/redzone/dnsEmail: one row per org (WEB-16)', () => {
+  const base = {
+    domain: 'example.com', dnssec: null, domainNameServers: [], whoisEmails: [], registrar: null,
+    organization: null, country: null, expirationDate: null, registrarStatus: [], vtMaliciousCount: null,
+    vtReputation: null, otxPulseCount: null, mxRecords: [], nsRecords: [], txtRecords: [], soaRecords: [],
+  }
+
+  test('an apex that was no target reads "not resolved", never missing', async () => {
+    runReturn = [{ ...base, apexResolved: false, vulnTags: [] }]
+    const r = (await (await dnsEmailRoute.GET(makeRequest('p1'))).json()).rows[0]
+    expect(r.apexResolved).toBe(false)
+    expect(r.apexNote).toBe('not resolved (apex not in scope)')
+    expect(r.spfPresent).toBeNull()
+    expect(r.dmarcPresent).toBeNull()
+    expect(r.spfMissing).toBe(false)
+    expect(r.dmarcMissing).toBe(false)
+  })
+
+  test("the org-level findings still mark it, apex or not", async () => {
+    runReturn = [{ ...base, apexResolved: false, vulnTags: ['spf_missing', 'dmarc_missing'] }]
+    const r = (await (await dnsEmailRoute.GET(makeRequest('p1'))).json()).rows[0]
+    expect(r.spfMissing).toBe(true)
+    expect(r.dmarcMissing).toBe(true)
+  })
+
+  test('NS providers count by registrable domain', async () => {
+    runReturn = [{ ...base, apexResolved: true, vulnTags: [],
+      nsRecords: ['ns1.dns.example.co.uk.', 'ns2.dns.example.co.uk.', 'a.ns.other.net.'] }]
+    const r = (await (await dnsEmailRoute.GET(makeRequest('p1'))).json()).rows[0]
+    expect(r.nsDistinctProviders).toBe(2)
   })
 })
 

@@ -8,7 +8,10 @@ import { existsSync } from 'fs'
 import path from 'path'
 import { orchestratorFetch } from '@/lib/orchestrator'
 import { normalizeOrchestratorStartError } from '@/lib/orchestratorError'
+import { internalError, readUpstreamBody, upstreamFailureResponse } from '@/lib/routeErrors'
 import { assertGraphNotActivating } from '@/lib/activationLock'
+import { legacyGraphDomains, legacyGraphRefusal } from '@/lib/legacyGraph'
+import { resolveScopeGroups } from '@/lib/scopeGroups'
 
 const RECON_ORCHESTRATOR_URL = process.env.RECON_ORCHESTRATOR_URL || 'http://localhost:8010'
 const WEBAPP_URL = process.env.WEBAPP_URL || 'http://localhost:3000'
@@ -34,7 +37,7 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       where: { id: projectId },
       select: {
         id: true, userId: true, name: true, targetDomain: true, ipMode: true, targetIps: true,
-        domainBatchMode: true, domainBatchHosts: true,
+        domainBatchMode: true, domainBatchHosts: true, subdomainList: true,
       }
     })
 
@@ -80,28 +83,42 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       )
     }
 
+    // GVM attaches its findings to Domain nodes: an old-model graph would take
+    // them under the wrong one (§4.11.6).
+    const legacy = await legacyGraphDomains(project.userId, projectId, resolveScopeGroups(project).groups)
+    if (legacy && legacy.length > 0) {
+      return NextResponse.json(legacyGraphRefusal(legacy), { status: 409 })
+    }
+
     // Call recon orchestrator to start the GVM scan
     // Read before the start, so a RoE replaced mid-start cannot misattribute the run.
     const roeTextSha256 = await currentRoeTextSha256(projectId)
-    const response = await orchestratorFetch(`${RECON_ORCHESTRATOR_URL}/gvm/${projectId}/start`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        project_id: projectId,
-        user_id: project.userId,
-        webapp_api_url: WEBAPP_URL,
-      }),
-    })
+    let response: Response
+    try {
+      response = await orchestratorFetch(`${RECON_ORCHESTRATOR_URL}/gvm/${projectId}/start`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          project_id: projectId,
+          user_id: project.userId,
+          webapp_api_url: WEBAPP_URL,
+        }),
+      })
+    } catch (error) {
+      return upstreamFailureResponse('orchestrator', error, 'Failed to start GVM scan')
+    }
 
     if (!response.ok) {
-      const errorData = await response.json().catch(() => ({}))
       // Governor rejections carry a structured object detail; normalize to a
       // string message (+ limit) so it is never rendered as a raw React child.
-      const { error, limit } = normalizeOrchestratorStartError(errorData, 'Failed to start GVM scan')
+      // A body that is not JSON (uvicorn's plain-text 500) still says which
+      // status the orchestrator answered.
+      const body = await readUpstreamBody(response)
+      const { error, limit, code } = normalizeOrchestratorStartError(body.json ?? {}, 'Failed to start GVM scan')
       return NextResponse.json(
-        { error, ...(limit ? { limit } : {}) },
+        { error, code: code ?? body.code ?? 'orchestrator_error', upstreamStatus: response.status, ...(limit ? { limit } : {}) },
         { status: response.status }
       )
     }
@@ -117,10 +134,6 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
     return NextResponse.json(data)
 
   } catch (error) {
-    console.error('Error starting GVM scan:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Internal server error' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to start GVM scan', { log: 'Error starting GVM scan' })
   }
 }

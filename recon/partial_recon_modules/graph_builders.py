@@ -6,7 +6,33 @@ from urllib.parse import urlencode
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from recon.partial_recon_modules.helpers import _classify_ip, allowed_hosts_for, include_root_for, root_for_host
+from recon.partial_recon_modules.helpers import (
+    _classify_ip, allowed_hosts_for, include_root_for, org_for_root, project_scan_roots, root_for_host,
+)
+
+#: A path known only from an API specification is requested with GET or HEAD
+#: only (D15). A node with openapi_declared but no openapi_declared_only was
+#: written by an earlier release and counts as declared-only: fail closed.
+DECLARED_ONLY = "coalesce({a}.openapi_declared_only, {a}.openapi_declared, false)"
+DECLARED_ONLY_UNSAFE = "(" + DECLARED_ONLY + " AND NOT {a}.method IN ['GET','HEAD'])"
+
+
+def declared_only(alias: str = "e") -> str:
+    """Cypher, true for an Endpoint known only from an API specification."""
+    return DECLARED_ONLY.format(a=alias)
+
+
+def declared_only_unsafe(alias: str = "e") -> str:
+    """Cypher, true for an Endpoint a GET consumer must not request."""
+    return DECLARED_ONLY_UNSAFE.format(a=alias)
+
+
+#: True for a RESOLVES_TO edge `r` that is forward DNS. Shodan's reverse-DNS
+#: and domain-DNS answers write the same edge with source 'shodan_rdns' /
+#: 'shodan_dns'; a partial run reading them would take a PTR record for the
+#: name's current address. An edge with no source (DNS, or older) counts.
+FORWARD_DNS = "NOT coalesce(r.source, '') STARTS WITH 'shodan_'"
+
 
 #: A BaseURL is a thin service-identity node: httpx writes the response data
 #: (status, content type, CDN flags) onto the Endpoint it probed, never onto the
@@ -196,6 +222,115 @@ def _host_allowed(root: str, host: str, allowed: dict) -> bool:
     return hosts is None or (host or "").strip().lower() in hosts
 
 
+class _GraphScope:
+    """Which graph hosts are this partial run's targets.
+
+    With the run's scope groups the graph names a Domain after the org (P6):
+    hosts are read under the selected groups' orgs (``orgs``) and each one is
+    assigned to the LONGEST scan root of the whole project it sits under. It is
+    a target only when that root is one of this run's and the root's group
+    admits it (§4.6: strictly under an ENUMERATE root, an EXACT group's listed
+    hosts, the root itself only with includeRoot). A host of a root removed
+    from scope, or of another group of the same org, is never a target.
+
+    Without scope groups (IP mode, whose hosts are dashed addresses under the
+    synthetic root, or a caller not yet migrated) the Domain names are the
+    roots, as before, and only a literal group's list narrows.
+    """
+
+    def __init__(self, roots: list, domain_groups, include_root_domain: bool):
+        self.roots = roots
+        self.apex_roots, self.allowed = _root_scope(roots, domain_groups, include_root_domain)
+        self.scoped = bool(domain_groups) and all(
+            isinstance(g, dict) and "scanRoot" in g for g in domain_groups)
+        if self.scoped:
+            self.orgs = list(dict.fromkeys(org_for_root(r, domain_groups).lower() for r in roots))
+            self._selected = {r.lower(): r for r in roots}
+            self.project_roots = sorted({*self._selected, *project_scan_roots()}, key=len, reverse=True)
+        else:
+            self.orgs = list(roots)
+            self.project_roots = []
+
+    def root_of(self, host, record_root=None, apex: bool = True):
+        """The run's root ``host`` is a target of, or None. ``apex=False`` keeps
+        a root itself even when its group leaves it out (the tools that never
+        honoured Include Root)."""
+        h = (host or "").strip().strip(".").lower()
+        if not self.scoped:
+            root = record_root or root_for_host(h, self.roots)
+            return root if root is not None and _host_allowed(root, h, self.allowed) else None
+        best = next((r for r in self.project_roots if h == r or h.endswith("." + r)), None)
+        root = self._selected.get(best) if best else None
+        if root is None:
+            return None
+        if h == best:
+            return root if (not apex or root in self.apex_roots) else None
+        return root if _host_allowed(root, h, self.allowed) else None
+
+    def keeps(self, host, record_root=None) -> bool:
+        if not self.scoped:
+            # A host under no root (IP mode's dashed names) was always kept.
+            root = record_root or root_for_host(host, self.roots)
+            return _host_allowed(root, host, self.allowed)
+        return self.root_of(host, record_root) is not None
+
+    def under_project(self, host) -> bool:
+        """``host`` sits under a scan root of the project (a target or not)."""
+        h = (host or "").strip().strip(".").lower()
+        return any(h == r or h.endswith("." + r) for r in self.project_roots)
+
+
+def _apex_rows(session, user_id: str, project_id: str, apex_roots: list, returns: str):
+    """The included roots' own addresses, from the apex Subdomain: a Domain
+    never carries RESOLVES_TO (its writers record HAS_IP), so an apex is read
+    where its records live. ``returns`` is the RETURN tail after the root."""
+    by_lower = {r.lower(): r for r in apex_roots}
+    rows = session.run(
+        """
+        MATCH (s:Subdomain {user_id: $uid, project_id: $pid})-[r:RESOLVES_TO]->(i:IP)
+        WHERE toLower(s.name) IN $apex_roots AND """ + FORWARD_DNS + """
+        """ + returns.replace("{ROOT}", "s.name AS root"),
+        apex_roots=list(by_lower), uid=user_id, pid=project_id,
+    )
+    return [_ApexRow(record, by_lower) for record in rows]
+
+
+class _ApexRow:
+    """A row whose `root` is the run's root as the caller spelled it (the query
+    matched it case-insensitively); every other key reads through."""
+
+    __slots__ = ("_record", "_root")
+
+    def __init__(self, record, by_lower: dict):
+        self._record = record
+        root = record["root"]
+        self._root = by_lower.get(str(root or "").lower(), root)
+
+    def __getitem__(self, key):
+        return self._root if key == "root" else self._record[key]
+
+
+def graph_scope_subdomains(session, user_id: str, project_id: str, roots: list,
+                           domain_groups) -> list:
+    """The run's Subdomain names for a writer's scope list: every name under
+    the run's org Domains that belongs to one of its scan roots (the roots
+    themselves included). Without scope groups, every Subdomain under the
+    roots, as before."""
+    scope = _GraphScope(roots, domain_groups, include_root_domain=False)
+    record = session.run(
+        """
+        MATCH (d:Domain {user_id: $uid, project_id: $pid})-[:HAS_SUBDOMAIN]->(s:Subdomain)
+        WHERE toLower(d.name) IN $domains
+        RETURN collect(DISTINCT s.name) AS subdomains
+        """,
+        domains=scope.orgs, uid=user_id, pid=project_id,
+    ).single()
+    subs = (record["subdomains"] if record else None) or []
+    if not scope.scoped:
+        return subs
+    return [sub for sub in subs if scope.root_of(sub, apex=False) is not None]
+
+
 def _other_domains(session, user_id: str, project_id: str, roots: list) -> list:
     """The project's Domain nodes this run does not cover.
 
@@ -255,10 +390,12 @@ def graph_url_scope(session, user_id: str, project_id: str, domains, domain_grou
     excludes (the tools that always honoured Include Root Domain). A host under
     no project root (an IP, a third-party host) is kept, as before, unless the
     graph knows it only as a co-hosted vhost name (_co_hosted_vhost_hosts). A caller
-    not yet migrated (no domain_groups) gets only the apex rule it had.
+    not yet migrated (no domain_groups) gets only the apex rule it had. With
+    scope groups the decision is _GraphScope's (§4.6, longest scan root).
     """
     roots = _as_roots(domains)
-    apex_roots, allowed = _root_scope(roots, domain_groups, include_root_domain)
+    scope = _GraphScope(roots, domain_groups, include_root_domain)
+    apex_roots, allowed = scope.apex_roots, scope.allowed
     other_roots = _other_domains(session, user_id, project_id, roots) if domain_groups is not None else []
     known = roots + other_roots
     # Loaded lazily, and only when a host under no project root turns up: the
@@ -275,6 +412,14 @@ def graph_url_scope(session, user_id: str, project_id: str, domains, domain_grou
         host = (host or "").strip().lower()
         if not host:
             return True
+        if scope.scoped:
+            if scope.root_of(host, apex=apex_filter) is not None:
+                return True
+            # Under the project (another group, a removed scan root, an org's
+            # names outside every scan root) but no target of this run.
+            if scope.under_project(host) or root_for_host(host, other_roots) is not None:
+                return False
+            return host not in _co_hosted()
         root = root_for_host(host, known)
         if root is None:
             return host not in _co_hosted()
@@ -312,12 +457,17 @@ def graph_target_hosts(user_id: str, project_id: str, domains, domain_groups,
     from graph_db import Neo4jClient
 
     roots = _as_roots(domains)
-    _apex_roots, allowed = _root_scope(roots, domain_groups, include_root_domain)
+    scope = _GraphScope(roots, domain_groups, include_root_domain)
+    allowed = scope.allowed
     hosts = set()
     for root in roots:
-        # A wildcard/single root has no allowed set: its apex is always a target,
-        # as today. A literal group lists its apex only when it wrote ".".
-        if root not in allowed or root.lower() in allowed[root]:
+        if scope.scoped:
+            # §4.6: a scan root is a target only with Include Root.
+            if root in scope.apex_roots:
+                hosts.add(root)
+        elif root not in allowed or root.lower() in allowed[root]:
+            # Without scope groups a wildcard/single root keeps its apex, and a
+            # literal group lists its apex only when it wrote ".".
             hosts.add(root)
     if not include_graph or not roots:
         return sorted(hosts)
@@ -330,15 +480,59 @@ def graph_target_hosts(user_id: str, project_id: str, domains, domain_groups,
             result = session.run(
                 """
                 MATCH (d:Domain {user_id: $uid, project_id: $pid})-[:HAS_SUBDOMAIN]->(s:Subdomain)
-                WHERE d.name IN $domains
+                WHERE toLower(d.name) IN $domains
                 RETURN d.name AS root, s.name AS sub
                 """,
-                domains=roots, uid=user_id, pid=project_id,
+                domains=scope.orgs, uid=user_id, pid=project_id,
             )
             for record in result:
-                if _host_allowed(record["root"], record["sub"], allowed):
+                if scope.keeps(record["sub"], record["root"]):
                     hosts.add(record["sub"])
     return sorted(hosts)
+
+
+def _recon_data_ips(recon_data: dict) -> list:
+    ips = set(((recon_data.get("port_scan") or {}).get("by_ip")) or {})
+    dns = recon_data.get("dns") or {}
+    for entry in [dns.get("domain") or {}, *((dns.get("subdomains") or {}).values())]:
+        ip_lists = (entry or {}).get("ips") or {}
+        ips.update(ip_lists.get("ipv4") or [])
+        ips.update(ip_lists.get("ipv6") or [])
+    return sorted(ip for ip in ips if ip)
+
+
+def attach_graph_ownership(recon_data: dict, user_id: str, project_id: str) -> None:
+    """Load the IP attribution tag (IP.ownership) of the run's IPs from the graph.
+
+    A partial run does not re-run IP attribution, so the consumers that read
+    its tag (vhost/SNI, origin discovery, the Shodan and Netlas CVE writers)
+    read the last one written, in the shape the full run leaves in memory. An
+    IP with no tag is absent, and the consumers fall back to their own CDN
+    checks. Never raises: on any failure nothing is loaded.
+    """
+    ips = _recon_data_ips(recon_data)
+    if not ips:
+        return
+    try:
+        from graph_db import Neo4jClient
+        with Neo4jClient() as graph_client:
+            if not graph_client.verify_connection():
+                return
+            with graph_client.driver.session() as session:
+                rows = session.run(
+                    """
+                    MATCH (i:IP {user_id: $uid, project_id: $pid})
+                    WHERE i.address IN $ips AND i.ownership IS NOT NULL
+                    RETURN i.address AS ip, i.ownership AS ownership
+                    """,
+                    ips=ips, uid=user_id, pid=project_id,
+                )
+                by_ip = {r["ip"]: {"ownership": r["ownership"]} for r in rows if r["ip"]}
+    except Exception as e:  # noqa: BLE001 - no tag only means the CDN fallbacks apply
+        print(f"[!][Partial Recon] Could not read the IP attribution tags: {type(e).__name__}")
+        return
+    if by_ip:
+        recon_data["ip_attribution"] = {"by_ip": by_ip, "source": "graph"}
 
 
 def _build_recon_data_from_graph(domains, user_id: str, project_id: str,
@@ -360,7 +554,8 @@ def _build_recon_data_from_graph(domains, user_id: str, project_id: str,
     from graph_db import Neo4jClient
 
     roots = _as_roots(domains)
-    apex_roots, allowed = _root_scope(roots, domain_groups, include_root_domain)
+    scope = _GraphScope(roots, domain_groups, include_root_domain)
+    apex_roots, allowed = scope.apex_roots, scope.allowed
     primary = roots[0] if roots else ""
 
     recon_data = {
@@ -392,14 +587,8 @@ def _build_recon_data_from_graph(domains, user_id: str, project_id: str,
         driver = graph_client.driver
         with driver.session() as session:
             if apex_roots:
-                result = session.run(
-                    """
-                    MATCH (d:Domain {user_id: $uid, project_id: $pid})-[:RESOLVES_TO]->(i:IP)
-                    WHERE d.name IN $apex_roots
-                    RETURN d.name AS root, i.address AS address, i.version AS version
-                    """,
-                    apex_roots=apex_roots, uid=user_id, pid=project_id,
-                )
+                result = _apex_rows(session, user_id, project_id, apex_roots,
+                                    "RETURN {ROOT}, i.address AS address, i.version AS version")
                 for record in result:
                     if record["root"] == primary:
                         _add_ip(recon_data["dns"]["domain"]["ips"], record["address"], record["version"])
@@ -411,14 +600,14 @@ def _build_recon_data_from_graph(domains, user_id: str, project_id: str,
                 """
                 MATCH (d:Domain {user_id: $uid, project_id: $pid})
                       -[:HAS_SUBDOMAIN]->(s:Subdomain)
-                      -[:RESOLVES_TO]->(i:IP)
-                WHERE d.name IN $domains
+                      -[r:RESOLVES_TO]->(i:IP)
+                WHERE toLower(d.name) IN $domains AND """ + FORWARD_DNS + """
                 RETURN d.name AS root, s.name AS subdomain, i.address AS address, i.version AS version
                 """,
-                domains=roots, uid=user_id, pid=project_id,
+                domains=scope.orgs, uid=user_id, pid=project_id,
             )
             for record in result:
-                if not _host_allowed(record["root"], record["subdomain"], allowed):
+                if not scope.keeps(record["subdomain"], record["root"]):
                     continue
                 _add_ip(_dns_entry(record["subdomain"])["ips"], record["address"], record["version"])
 
@@ -446,7 +635,8 @@ def _build_port_scan_data_from_graph(domains, user_id: str, project_id: str,
     from graph_db import Neo4jClient
 
     roots = _as_roots(domains)
-    apex_roots, allowed = _root_scope(roots, domain_groups, include_root_domain)
+    scope = _GraphScope(roots, domain_groups, include_root_domain)
+    apex_roots, allowed = scope.apex_roots, scope.allowed
     primary = roots[0] if roots else ""
 
     recon_data = {
@@ -469,14 +659,25 @@ def _build_port_scan_data_from_graph(domains, user_id: str, project_id: str,
 
     all_ports_set = set()
 
-    def _add_host(host: str, ip_addr: str, port_numbers: list, port_details: list) -> None:
-        """Record one host -> IP -> ports row in by_ip, by_host and ip_to_hostnames."""
+    def _add_host(host: str, ip_addr: str, port_numbers: list, port_details: list,
+                  record=None) -> None:
+        """Record one host -> IP -> ports row in by_ip, by_host and ip_to_hostnames.
+
+        The IP's CDN tag rides along: a partial run writes this data back through
+        update_graph_from_port_scan, which sets IP.is_cdn from it, so an entry
+        without the tag would reset every tagged IP to false.
+        """
+        get = getattr(record, "get", None)
+        is_cdn = bool(get("is_cdn")) if get else False
+        cdn = (get("cdn_name") if get else None) or None
         if ip_addr not in recon_data["port_scan"]["by_ip"]:
             recon_data["port_scan"]["by_ip"][ip_addr] = {
                 "ip": ip_addr,
                 "hostnames": [host],
                 "ports": list(port_numbers),
                 "port_details": list(port_details),
+                "is_cdn": is_cdn,
+                "cdn": cdn,
             }
         else:
             existing = recon_data["port_scan"]["by_ip"][ip_addr]
@@ -495,6 +696,8 @@ def _build_port_scan_data_from_graph(domains, user_id: str, project_id: str,
                 "ip": ip_addr,
                 "ports": list(port_numbers),
                 "port_details": list(port_details),
+                "is_cdn": is_cdn,
+                "cdn": cdn,
             }
         else:
             existing = recon_data["port_scan"]["by_host"][host]
@@ -537,16 +740,12 @@ def _build_port_scan_data_from_graph(domains, user_id: str, project_id: str,
             # Apex Domain -> IP -> Port, only for the roots whose scope includes it.
             apex_records = []
             if apex_roots:
-                apex_records = list(session.run(
-                    """
-                    MATCH (d:Domain {user_id: $uid, project_id: $pid})-[:RESOLVES_TO]->(i:IP)
-                    WHERE d.name IN $apex_roots
-                    OPTIONAL MATCH (i)-[:HAS_PORT]->(p:Port)
-                    RETURN d.name AS root, i.address AS ip, i.version AS version,
-                           collect(DISTINCT {number: p.number, protocol: p.protocol}) AS ports
-                    """,
-                    apex_roots=apex_roots, uid=user_id, pid=project_id,
-                ))
+                apex_records = _apex_rows(
+                    session, user_id, project_id, apex_roots,
+                    "OPTIONAL MATCH (i)-[:HAS_PORT]->(p:Port)\n"
+                    "RETURN {ROOT}, i.address AS ip, i.version AS version, "
+                    "i.is_cdn AS is_cdn, i.cdn_name AS cdn_name, "
+                    "collect(DISTINCT {number: p.number, protocol: p.protocol}) AS ports")
             for record in apex_records:
                 root = record["root"]
                 ip_addr = record["ip"]
@@ -560,23 +759,24 @@ def _build_port_scan_data_from_graph(domains, user_id: str, project_id: str,
                     if ip_addr not in ips:
                         ips.append(ip_addr)
                 port_numbers, port_details = _ports(record["ports"])
-                _add_host(root, ip_addr, port_numbers, port_details)
+                _add_host(root, ip_addr, port_numbers, port_details, record)
 
             # Subdomain -> IP -> Port relationships
             result = session.run(
                 """
                 MATCH (d:Domain {user_id: $uid, project_id: $pid})
-                      -[:HAS_SUBDOMAIN]->(s:Subdomain)-[:RESOLVES_TO]->(i:IP)
-                WHERE d.name IN $domains
+                      -[:HAS_SUBDOMAIN]->(s:Subdomain)-[r:RESOLVES_TO]->(i:IP)
+                WHERE toLower(d.name) IN $domains AND """ + FORWARD_DNS + """
                 OPTIONAL MATCH (i)-[:HAS_PORT]->(p:Port)
                 RETURN d.name AS root, s.name AS subdomain, i.address AS ip, i.version AS version,
+                       i.is_cdn AS is_cdn, i.cdn_name AS cdn_name,
                        collect(DISTINCT {number: p.number, protocol: p.protocol}) AS ports
                 """,
-                domains=roots, uid=user_id, pid=project_id,
+                domains=scope.orgs, uid=user_id, pid=project_id,
             )
             for record in result:
                 subdomain = record["subdomain"]
-                if not _host_allowed(record["root"], subdomain, allowed):
+                if not scope.keeps(subdomain, record["root"]):
                     continue
                 ip_addr = record["ip"]
                 bucket = _classify_ip(ip_addr, record["version"])
@@ -584,7 +784,7 @@ def _build_port_scan_data_from_graph(domains, user_id: str, project_id: str,
                 if ip_addr not in sub_ips[bucket]:
                     sub_ips[bucket].append(ip_addr)
                 port_numbers, port_details = _ports(record["ports"])
-                _add_host(subdomain, ip_addr, port_numbers, port_details)
+                _add_host(subdomain, ip_addr, port_numbers, port_details, record)
 
     recon_data["port_scan"]["all_ports"] = sorted(all_ports_set)
     return recon_data
@@ -614,7 +814,8 @@ def _build_http_probe_data_from_graph(domains, user_id: str, project_id: str,
     from graph_db import Neo4jClient
 
     roots = _as_roots(domains)
-    apex_roots, allowed = _root_scope(roots, domain_groups, include_root_domain)
+    scope = _GraphScope(roots, domain_groups, include_root_domain)
+    apex_roots, allowed = scope.apex_roots, scope.allowed
     primary = roots[0] if roots else ""
 
     recon_data = {
@@ -651,14 +852,8 @@ def _build_http_probe_data_from_graph(domains, user_id: str, project_id: str,
         with driver.session() as session:
             # 1) Apex Domain -> IP (Source 3 fallback), only for included apexes.
             if apex_roots:
-                result = session.run(
-                    """
-                    MATCH (d:Domain {user_id: $uid, project_id: $pid})-[:RESOLVES_TO]->(i:IP)
-                    WHERE d.name IN $apex_roots
-                    RETURN d.name AS root, i.address AS address, i.version AS version
-                    """,
-                    apex_roots=apex_roots, uid=user_id, pid=project_id,
-                )
+                result = _apex_rows(session, user_id, project_id, apex_roots,
+                                    "RETURN {ROOT}, i.address AS address, i.version AS version")
                 for record in result:
                     if record["root"] == primary:
                         _add_ip(recon_data["dns"]["domain"]["ips"], record["address"], record["version"])
@@ -671,14 +866,14 @@ def _build_http_probe_data_from_graph(domains, user_id: str, project_id: str,
                 """
                 MATCH (d:Domain {user_id: $uid, project_id: $pid})
                       -[:HAS_SUBDOMAIN]->(s:Subdomain)
-                      -[:RESOLVES_TO]->(i:IP)
-                WHERE d.name IN $domains
+                      -[r:RESOLVES_TO]->(i:IP)
+                WHERE toLower(d.name) IN $domains AND """ + FORWARD_DNS + """
                 RETURN d.name AS root, s.name AS subdomain, i.address AS address, i.version AS version
                 """,
-                domains=roots, uid=user_id, pid=project_id,
+                domains=scope.orgs, uid=user_id, pid=project_id,
             )
             for record in result:
-                if not _host_allowed(record["root"], record["subdomain"], allowed):
+                if not scope.keeps(record["subdomain"], record["root"]):
                     continue
                 _add_ip(_dns_entry(record["subdomain"])["ips"], record["address"], record["version"])
 
@@ -714,16 +909,16 @@ def _build_http_probe_data_from_graph(domains, user_id: str, project_id: str,
                 """
                 MATCH (d:Domain {user_id: $uid, project_id: $pid})
                       -[:HAS_SUBDOMAIN]->(s:Subdomain)
-                WHERE d.name IN $domains
+                WHERE toLower(d.name) IN $domains
                 RETURN collect(DISTINCT s.name) AS subdomains
                 """,
-                domains=roots, uid=user_id, pid=project_id,
+                domains=scope.orgs, uid=user_id, pid=project_id,
             )
             record = result.single()
             if record:
                 recon_data["subdomains"] = [
                     sub for sub in record["subdomains"] or []
-                    if _host_allowed(root_for_host(sub, roots), sub, allowed)
+                    if scope.keeps(sub)
                 ]
 
     return recon_data
@@ -748,7 +943,8 @@ def _build_vuln_scan_data_from_graph(domains, user_id: str, project_id: str,
     from graph_db import Neo4jClient
 
     roots = _as_roots(domains)
-    apex_roots, allowed = _root_scope(roots, domain_groups, include_root_domain)
+    scope = _GraphScope(roots, domain_groups, include_root_domain)
+    apex_roots, allowed = scope.apex_roots, scope.allowed
     primary = roots[0] if roots else ""
 
     recon_data = {
@@ -812,15 +1008,9 @@ def _build_vuln_scan_data_from_graph(domains, user_id: str, project_id: str,
         with driver.session() as session:
             # 1) Apex Domain -> IP, only for the roots whose group includes it.
             if apex_roots:
-                result = session.run(
-                    """
-                    MATCH (d:Domain {user_id: $uid, project_id: $pid})-[:RESOLVES_TO]->(i:IP)
-                    WHERE d.name IN $apex_roots
-                    RETURN d.name AS root, i.address AS address, i.version AS version,
-                           i.is_cdn AS is_cdn, i.cdn_name AS cdn_name, i.asn AS asn
-                    """,
-                    apex_roots=apex_roots, uid=user_id, pid=project_id,
-                )
+                result = _apex_rows(session, user_id, project_id, apex_roots,
+                                    "RETURN {ROOT}, i.address AS address, i.version AS version, "
+                                    "i.is_cdn AS is_cdn, i.cdn_name AS cdn_name, i.asn AS asn")
                 for record in result:
                     addr = record["address"]
                     if record["root"] == primary:
@@ -835,15 +1025,15 @@ def _build_vuln_scan_data_from_graph(domains, user_id: str, project_id: str,
                 """
                 MATCH (d:Domain {user_id: $uid, project_id: $pid})
                       -[:HAS_SUBDOMAIN]->(s:Subdomain)
-                      -[:RESOLVES_TO]->(i:IP)
-                WHERE d.name IN $domains
+                      -[r:RESOLVES_TO]->(i:IP)
+                WHERE toLower(d.name) IN $domains AND """ + FORWARD_DNS + """
                 RETURN d.name AS root, s.name AS subdomain, i.address AS address, i.version AS version,
                        i.is_cdn AS is_cdn, i.cdn_name AS cdn_name, i.asn AS asn
                 """,
-                domains=roots, uid=user_id, pid=project_id,
+                domains=scope.orgs, uid=user_id, pid=project_id,
             )
             for record in result:
-                if not _host_allowed(record["root"], record["subdomain"], allowed):
+                if not scope.keeps(record["subdomain"], record["root"]):
                     continue
                 addr = record["address"]
                 _add_ip(_dns_entry(record["subdomain"])["ips"], addr, record["version"])
@@ -854,16 +1044,16 @@ def _build_vuln_scan_data_from_graph(domains, user_id: str, project_id: str,
                 """
                 MATCH (d:Domain {user_id: $uid, project_id: $pid})
                       -[:HAS_SUBDOMAIN]->(s:Subdomain)
-                WHERE d.name IN $domains
+                WHERE toLower(d.name) IN $domains
                 RETURN collect(DISTINCT s.name) AS subdomains
                 """,
-                domains=roots, uid=user_id, pid=project_id,
+                domains=scope.orgs, uid=user_id, pid=project_id,
             )
             record = result.single()
             if record:
                 recon_data["subdomains"] = [
                     sub for sub in record["subdomains"] or []
-                    if _host_allowed(root_for_host(sub, roots), sub, allowed)
+                    if scope.keeps(sub)
                 ]
 
             # 3) BaseURL nodes (for build_target_urls http_probe fallback)
@@ -962,6 +1152,7 @@ def _build_vuln_scan_data_from_graph(domains, user_id: str, project_id: str,
                       -[:HAS_ENDPOINT]->(e:Endpoint)
                       -[:HAS_PARAMETER]->(p:Parameter)
                 WHERE p.position = 'query' AND p.name IS NOT NULL AND e.path IS NOT NULL
+                  AND NOT """ + declared_only_unsafe("e") + """
                 WITH b, e, p ORDER BY p.name
                 RETURN b.url AS baseurl, e.path AS path,
                        collect(DISTINCT [p.name, coalesce(head(p.sample_values), '1')]) AS params
@@ -998,13 +1189,17 @@ def _build_graphql_data_from_graph(domains, user_id: str, project_id: str,
     """
     Build recon_data for GraphQL security scanning.
 
-    Populates the three sections discover_graphql_endpoints() reads:
-      - http_probe.by_url        (from BaseURL nodes -- headers, status_code)
-      - resource_enum.endpoints  ({base_url: [{path, method}]} -- from Endpoint nodes)
-      - resource_enum.parameters ({base_url: [{name}]}         -- from Parameter nodes)
-      - js_recon.findings        ([{type, path, method}]       -- GraphQL-tagged JsReconFindings)
-    Plus metadata.roe so filter_by_roe() still works. `settings` is the run's
-    preloaded settings (partial_settings); only a direct caller omits it.
+    Populates the sections discover_graphql_endpoints() reads, in the shapes
+    the full pipeline's writers produce, so one discovery serves both:
+      - http_probe.by_url          ({url: {status_code, content_type}} -- BaseURL nodes)
+      - resource_enum.by_base_url  ({base: {endpoints: {path: {path, methods,
+                                     parameters: {query, body, path}}}}} -- Endpoint
+                                     nodes and their Parameter nodes)
+      - js_recon.endpoints         ([{type, path, full_url, source_js}] -- the
+                                     GraphQL Endpoint nodes JS Recon wrote)
+    Plus metadata.roe, the fallback discovery reads when the settings carry no
+    RoE. `settings` is the run's preloaded settings (partial_settings); only a
+    direct caller omits it.
 
     BaseURLs, Endpoints and Parameters are read project-wide; with
     domain_groups, those on a host under a Domain this run does not cover, or a
@@ -1021,8 +1216,8 @@ def _build_graphql_data_from_graph(domains, user_id: str, project_id: str,
         "domain": roots[0] if roots else "",
         "domains": roots,
         "http_probe": {"by_url": {}},
-        "resource_enum": {"endpoints": {}, "parameters": {}, "discovered_urls": []},
-        "js_recon": {"findings": []},
+        "resource_enum": {"by_base_url": {}, "discovered_urls": []},
+        "js_recon": {"endpoints": []},
         "metadata": {
             "roe": {
                 "ROE_ENABLED": settings.get("ROE_ENABLED", False),
@@ -1065,63 +1260,57 @@ def _build_graphql_data_from_graph(domains, user_id: str, project_id: str,
                     "headers": {},
                 }
 
-            # 2) Endpoints grouped by BaseURL -> resource_enum.endpoints
+            # 2) Endpoints and their parameters -> resource_enum.by_base_url
             result = session.run(
                 """
                 MATCH (b:BaseURL {user_id: $uid, project_id: $pid})
                       -[:HAS_ENDPOINT]->(e:Endpoint)
-                WHERE e.path IS NOT NULL
-                RETURN b.url AS base_url,
-                       collect(DISTINCT {path: e.path, method: coalesce(e.method, 'GET')}) AS endpoints
+                WHERE e.path IS NOT NULL AND NOT """ + declared_only_unsafe("e") + """
+                OPTIONAL MATCH (e)-[:HAS_PARAMETER]->(p:Parameter)
+                RETURN b.url AS base_url, e.path AS path,
+                       coalesce(e.method, 'GET') AS method,
+                       [n IN collect(DISTINCT p.name) WHERE n IS NOT NULL] AS parameters
                 """,
                 uid=user_id, pid=project_id,
             )
+            by_base = recon_data["resource_enum"]["by_base_url"]
             for record in result:
                 base = record["base_url"]
-                if base and keep(url_host(base)):
-                    recon_data["resource_enum"]["endpoints"][base] = list(record["endpoints"] or [])
-
-            # 3) Parameters grouped by BaseURL -> resource_enum.parameters
-            result = session.run(
-                """
-                MATCH (b:BaseURL {user_id: $uid, project_id: $pid})
-                      -[:HAS_ENDPOINT]->(e:Endpoint)
-                      -[:HAS_PARAMETER]->(p:Parameter)
-                WHERE p.name IS NOT NULL
-                RETURN b.url AS base_url,
-                       collect(DISTINCT {name: p.name}) AS parameters
-                """,
-                uid=user_id, pid=project_id,
-            )
-            for record in result:
-                base = record["base_url"]
-                if base and keep(url_host(base)):
-                    recon_data["resource_enum"]["parameters"][base] = list(record["parameters"] or [])
-
-            # 4) GraphQL-tagged JsReconFindings -> js_recon.findings
-            result = session.run(
-                """
-                MATCH (jr:JsReconFinding {user_id: $uid, project_id: $pid})
-                WHERE (jr.finding_type IN ['graphql', 'graphql_introspection']
-                   OR (jr.finding_type = 'rest' AND toLower(coalesce(jr.path, '')) CONTAINS 'graphql'))
-                  // An operator's mute keeps a finding out of the target list. A
-                  // node-filter RULE mute does not: it hides noise from display,
-                  // and full recon scans its in-memory results either way.
-                  AND NOT (jr:Muted AND NOT coalesce(jr.muted_by, '') STARTS WITH 'rule:')
-                RETURN jr.finding_type AS type,
-                       jr.path AS path,
-                       coalesce(jr.method, 'POST') AS method
-                """,
-                uid=user_id, pid=project_id,
-            )
-            for record in result:
-                path = record["path"]
-                if not path:
+                if not base or not keep(url_host(base)):
                     continue
-                recon_data["js_recon"]["findings"].append({
-                    "type": record["type"] or "rest",
-                    "path": path,
-                    "method": record["method"] or "POST",
+                endpoints = by_base.setdefault(base, {"endpoints": {}})["endpoints"]
+                entry = endpoints.setdefault(record["path"], {
+                    "path": record["path"], "methods": [],
+                    "parameters": {"query": [], "body": [], "path": []},
+                })
+                if record["method"] not in entry["methods"]:
+                    entry["methods"].append(record["method"])
+                known = {p["name"] for p in entry["parameters"]["query"]}
+                entry["parameters"]["query"].extend(
+                    {"name": name} for name in record["parameters"] or [] if name not in known)
+
+            # 3) The GraphQL endpoints JS Recon found -> js_recon.endpoints.
+            # js_recon_mixin writes them as Endpoint nodes with endpoint_type;
+            # a JsReconFinding never carries them.
+            result = session.run(
+                """
+                MATCH (b:BaseURL {user_id: $uid, project_id: $pid})
+                      -[:HAS_ENDPOINT]->(e:Endpoint)
+                WHERE e.endpoint_type IN ['graphql', 'graphql_introspection']
+                RETURN b.url AS base_url, e.path AS path, e.endpoint_type AS type,
+                       coalesce(e.full_url, '') AS full_url
+                """,
+                uid=user_id, pid=project_id,
+            )
+            for record in result:
+                base = record["base_url"]
+                if not base or not record["path"] or not keep(url_host(base)):
+                    continue
+                recon_data["js_recon"]["endpoints"].append({
+                    "type": record["type"],
+                    "path": record["path"],
+                    "full_url": record["full_url"],
+                    "source_js": base,
                 })
 
     return recon_data
@@ -1237,7 +1426,7 @@ def _build_serialized_data_from_graph(domains, user_id: str, project_id: str,
             result = session.run(
                 """
                 MATCH (b:BaseURL {user_id: $uid, project_id: $pid})-[:HAS_ENDPOINT]->(e:Endpoint)
-                WHERE e.path IS NOT NULL
+                WHERE e.path IS NOT NULL AND NOT """ + declared_only_unsafe("e") + """
                 OPTIONAL MATCH (e)-[:HAS_PARAMETER]->(p:Parameter)
                 WHERE p.name IS NOT NULL
                 RETURN b.url AS base, b.host AS host, e.path AS path,
@@ -1280,6 +1469,162 @@ def _build_serialized_data_from_graph(domains, user_id: str, project_id: str,
                     "action": endpoint_url,
                     "method": record["method"],
                     "inputs": [{"name": n, "value": ""} for n in (record["names"] or []) if n],
+                })
+
+    return recon_data
+
+
+def _build_route_exposure_data_from_graph(domains, user_id: str, project_id: str,
+                                          settings: dict = None, domain_groups: list = None) -> dict:
+    """Build recon_data for the route exposure scan from the existing graph.
+
+    The scanner reads four sections (recon/route_exposure/harvest.py): the
+    probed base URLs with their page class and technologies (http_probe.by_url),
+    the enumerated routes with their methods, category, sources and OpenAPI
+    metadata (resource_enum.by_base_url), JS recon's endpoints with the bundle
+    each came from (js_recon.endpoints), and the run's scope (subdomains,
+    metadata). A declared-only route that is not GET or HEAD is never read: a
+    GET consumer must not request it. Scope is graph_url_scope, as for the
+    other builders; ``subdomains`` is left for the caller, which adds the typed
+    URLs' hosts through _scope_partial_urls.
+    """
+    from graph_db import Neo4jClient
+
+    from recon.partial_recon_modules.helpers import _should_include_root_domain
+
+    if settings is None:
+        from recon.project_settings import get_settings
+        settings = get_settings()
+    roots = _as_roots(domains)
+    include_root_domain = _should_include_root_domain(settings)
+    recon_data = {
+        "domain": roots[0] if roots else "",
+        "domains": roots,
+        "subdomains": [],
+        "http_probe": {"by_url": {}},
+        "resource_enum": {"by_base_url": {}},
+        "metadata": {
+            "include_root_domain": include_root_domain,
+            "expanded_ips": list(settings.get("TARGET_IPS") or []) if settings.get("IP_MODE") else [],
+            "roe": {
+                "ROE_ENABLED": settings.get("ROE_ENABLED", False),
+                "ROE_EXCLUDED_HOSTS": settings.get("ROE_EXCLUDED_HOSTS", []) or [],
+            },
+        },
+    }
+    if not roots:
+        return recon_data
+
+    by_url = recon_data["http_probe"]["by_url"]
+    by_base = recon_data["resource_enum"]["by_base_url"]
+
+    with Neo4jClient() as graph_client:
+        if not graph_client.verify_connection():
+            print("[!][Partial Recon] Neo4j not reachable, cannot fetch graph inputs")
+            return recon_data
+
+        with graph_client.driver.session() as session:
+            keep = graph_url_scope(session, user_id, project_id, roots, domain_groups,
+                                   include_root_domain=include_root_domain)
+            result = session.run(
+                """
+                MATCH (b:BaseURL {user_id: $uid, project_id: $pid})
+                """ + _PROBED_ENDPOINT + """
+                RETURN b.url AS url, b.host AS host,
+                       coalesce(b.status_code, probe.status_code) AS status_code,
+                       probe.page_class AS page_class
+                """,
+                uid=user_id, pid=project_id,
+            )
+            for record in result:
+                url = record["url"]
+                if not url or not keep(url_host(url, record["host"] or "")):
+                    continue
+                by_url[url] = {
+                    "url": url,
+                    "host": record["host"] or url_host(url),
+                    "status_code": int(record["status_code"]) if record["status_code"] is not None else 200,
+                    "page_class": _field(record, "page_class") or "",
+                    "technologies": [],
+                }
+            for url, techs in _graph_url_technologies(session, user_id, project_id,
+                                                      urls=list(by_url) or None).items():
+                if url in by_url:
+                    by_url[url]["technologies"] = techs
+
+            result = session.run(
+                """
+                MATCH (b:BaseURL {user_id: $uid, project_id: $pid})-[:HAS_ENDPOINT]->(e:Endpoint)
+                WHERE e.path IS NOT NULL AND NOT """ + declared_only_unsafe("e") + """
+                RETURN b.url AS base, b.host AS host, e.path AS path,
+                       coalesce(e.method, 'GET') AS method, e.category AS category,
+                       coalesce(e.sources, CASE WHEN e.source IS NULL THEN [] ELSE [e.source] END) AS sources,
+                       e.source AS creator,
+                       e.openapi_security AS openapi_security, e.openapi_tags AS openapi_tags,
+                       e.openapi_declared_only AS declared_only, e.status_code AS discovery_status
+                """,
+                uid=user_id, pid=project_id,
+            )
+            for record in result:
+                base = record["base"]
+                if not base or not keep(url_host(base, record["host"] or "")):
+                    continue
+                sources = [s for s in (record["sources"] or []) if isinstance(s, str)]
+                # A route the scan itself generated and wrote is not recon's input: a
+                # full run never reads it. Read back, it became a found route, lost its
+                # generated_by and variant_of (an old API version stopped being
+                # version_locked) and seeded variants of its own. The generators make it
+                # again from the same inputs. The creator is checked too, because the
+                # scan's enrichment sets sources to ['route_exposure'] on a crawler's
+                # route that had none.
+                if (_field(record, "creator") == "route_exposure"
+                        and all(s == "route_exposure" for s in sources)):
+                    continue
+                endpoints = by_base.setdefault(base, {"endpoints": {}})["endpoints"]
+                entry = endpoints.setdefault(record["path"], {
+                    "methods": [], "category": record["category"] or "other",
+                    "sources": sources,
+                    "declared_only": record["declared_only"] is True,
+                })
+                method = str(record["method"] or "GET").upper()
+                if method not in entry["methods"]:
+                    entry["methods"].append(method)
+                security = record["openapi_security"]
+                if security is not None and method in ("GET", "HEAD"):
+                    entry.setdefault("openapi", {})[method] = {
+                        "security": list(security), "tags": list(record["openapi_tags"] or [])}
+                status = record["discovery_status"]
+                # A discovery tool's 401/403 is the seen_denied hint.
+                if isinstance(status, int) and status in (401, 403):
+                    entry["status_code"] = status
+
+            # JS recon's endpoints, rebuilt as its endpoint list with the bundle each
+            # came from: harvest tags an API client_gated when the bundle defining a
+            # router route calls it, and only the bundle -> endpoint edges keep that
+            # pairing in the graph.
+            js_endpoints = recon_data.setdefault("js_recon", {}).setdefault("endpoints", [])
+            result = session.run(
+                """
+                MATCH (f:JsReconFinding {user_id: $uid, project_id: $pid, finding_type: 'js_file'})
+                      -[:HAS_ENDPOINT]->(e:Endpoint)
+                WHERE NOT f:Muted AND e.path IS NOT NULL AND e.endpoint_type IS NOT NULL
+                RETURN f.source_url AS source_js, e.baseurl AS base, e.path AS path,
+                       coalesce(e.method, 'GET') AS method, e.endpoint_type AS kind,
+                       e.category AS category, e.path_template AS template
+                """,
+                uid=user_id, pid=project_id,
+            )
+            for record in result:
+                base = record["base"]
+                if (record["kind"] not in ("route", "rest") or not isinstance(base, str)
+                        or not base.startswith(("http://", "https://")) or not keep(url_host(base))):
+                    continue
+                js_endpoints.append({
+                    "type": record["kind"], "path": record["path"], "method": record["method"],
+                    "category": record["category"] or "endpoint",
+                    "resolved_url": base.rstrip("/") + record["path"],
+                    "source_js": record["source_js"] or "",
+                    "parameterized": record["template"] is not None,
                 })
 
     return recon_data

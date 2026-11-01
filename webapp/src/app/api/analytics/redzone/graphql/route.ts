@@ -3,6 +3,8 @@ import { rowCap } from '../rowCap'
 import { guardProject } from '@/lib/access'
 import { getGraphSession } from '@/app/api/graph/neo4j'
 import { notMuted } from '@/lib/graphMute'
+import { reportCountable } from '@/lib/triage/reportable'
+import { internalError } from '@/lib/routeErrors'
 
 function toNum(val: unknown): number {
   if (val && typeof val === 'object' && 'low' in val) return (val as { low: number }).low
@@ -26,7 +28,7 @@ export async function GET(request: NextRequest) {
        OPTIONAL MATCH (sd:Subdomain)-[:HAS_BASE_URL]->(bu)
        OPTIONAL MATCH (ep)-[:HAS_VULNERABILITY]->(v:Vulnerability)
          WHERE v.source IN ['graphql_scan','graphql_cop']
-           AND ${notMuted('v')}
+           AND ${notMuted('v')} AND ${reportCountable('v')}
        RETURN toString(id(ep))                        AS nodeId,
               ep.full_url                             AS endpointUrl,
               ep.path                                 AS path,
@@ -84,11 +86,7 @@ export async function GET(request: NextRequest) {
 
     return NextResponse.json({ rows, meta: { totalRows: rows.length } })
   } catch (error) {
-    console.error('Red-zone graphql error:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Query failed' },
-      { status: 500 }
-    )
+    return internalError(error, 'Query failed', { log: 'Red-zone graphql error' })
   } finally {
     await session.close()
   }

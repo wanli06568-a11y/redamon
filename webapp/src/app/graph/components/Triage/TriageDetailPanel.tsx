@@ -20,6 +20,10 @@ import {
   personDecided, reviewChip, tierForScore, tierOf,
   type TriageFinding, type VerdictResult, type VerdictStatus,
 } from './triageLayers'
+import { DispositionLine } from './DispositionChip'
+import { readDisposition } from '@/lib/triage/disposition'
+import { triageBodyErrorText } from '@/lib/triage/errorText'
+import { toApiError } from '@/lib/apiError'
 import styles from './TriageDetailPanel.module.css'
 
 interface GroupMember {
@@ -84,10 +88,10 @@ async function readJson(res: Response): Promise<Record<string, unknown>> {
 }
 
 function failureText(body: Record<string, unknown>, what: string, status: number): string {
-  return typeof body.error === 'string' && body.error
-    ? body.error
-    : `The ${what} could not be loaded (${status}).`
+  return triageBodyErrorText(body, status, `The ${what} could not be loaded.`)
 }
+
+const NO_ANSWER = 'The findings service did not answer.'
 
 export function TriageDetailPanel({
   projectId, target, row, onClose, onVerdict, onGone, onReload,
@@ -125,8 +129,8 @@ export function TriageDetailPanel({
         }
         setRowAtLoad(row)
         setDetail({ kind: 'ready', data: body as unknown as FindingDetail })
-      } catch {
-        if (live) setDetail({ kind: 'error', message: 'The findings service did not answer.' })
+      } catch (e) {
+        if (live) setDetail({ kind: 'error', message: toApiError(e, NO_ANSWER).message })
       }
     })()
     return () => { live = false }
@@ -152,8 +156,8 @@ export function TriageDetailPanel({
           return
         }
         setEvidence({ kind: 'ready', data: body as unknown as EvidenceAnswer })
-      } catch {
-        if (live) setEvidence({ kind: 'error', message: 'The findings service did not answer.' })
+      } catch (e) {
+        if (live) setEvidence({ kind: 'error', message: toApiError(e, NO_ANSWER).message })
       }
     })()
     return () => { live = false }
@@ -285,10 +289,12 @@ function neverScored(row: TriageFinding): boolean {
 }
 
 function ResultSection({ row }: { row: TriageFinding }) {
+  const disposition = <DispositionLine result={readDisposition(row)} className={styles.disposition} />
   if (neverScored(row)) {
     return (
       <Section title="Result">
         <p className={styles.lead}>Not triaged yet.</p>
+        {disposition}
         <p className={styles.muted}>
           No run has scored it. Run triage to rank it; a decision you make now is kept.
         </p>
@@ -306,6 +312,7 @@ function ResultSection({ row }: { row: TriageFinding }) {
         <span className={`${styles.tierChip} ${styles[`tier${tier}`] ?? ''}`}>{TIER_LABELS[tier]}</span>
         <span className={styles.muted}>{row.triage_state || 'open'}</span>
       </div>
+      {disposition}
       {row.triage_tier_rule && <p className={styles.muted}>{row.triage_tier_rule}</p>}
       {base && (
         <p className={styles.baseLine} title={base.title}>

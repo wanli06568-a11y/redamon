@@ -79,8 +79,32 @@ describe('the record of what authorized an engagement outlives the engagement', 
     h.archiveTransaction.mockRejectedValue(new Error('archive table missing'))
     const res = await DELETE(del(), params('p1'))
     expect(res.status).toBe(500)
-    expect((await res.json()).error).toMatch(/must outlive/)
+    const body = await res.json()
+    expect(body.error).toMatch(/must outlive/)
+    expect(body.code).toBe('authorization_archive_failed')
     expect(h.projectDelete).not.toHaveBeenCalled()
+  })
+})
+
+describe('a delete that fails says why without quoting the error', () => {
+  test('a database failure answers the fixed sentence and the Prisma code', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    h.projectDelete.mockRejectedValue(Object.assign(
+      new Error('Timed out fetching a new connection: DELETE FROM "Project" WHERE id = \'p1\''),
+      { code: 'P2024', name: 'PrismaClientKnownRequestError' },
+    ))
+    const res = await DELETE(del(), params('p1'))
+    expect(res.status).toBe(500)
+    const body = await res.json()
+    expect(body).toEqual({ error: 'Failed to delete project', code: 'P2024' })
+    expect(JSON.stringify(body)).not.toContain('DELETE FROM')
+  })
+
+  test('a row that is already gone is a 404', async () => {
+    h.projectDelete.mockRejectedValue(Object.assign(new Error('not found'), { code: 'P2025' }))
+    const res = await DELETE(del(), params('p1'))
+    expect(res.status).toBe(404)
+    expect((await res.json()).error).toBe('Project not found')
   })
 })
 
@@ -121,11 +145,15 @@ describe('test_regression_gvm_backstop_writes_after_project_delete', () => {
     }
   })
 
-  test('the other stops are called exactly as before', async () => {
+  test('the supply-chain stop is called exactly as before', async () => {
     await DELETE(del(), params('p1'))
-    for (const kind of ['recon', 'supply-chain']) {
-      expect(stopUrl(kind)).toMatch(new RegExp(`/${kind}/p1/stop$`))
-    }
+    expect(stopUrl('supply-chain')).toMatch(/\/supply-chain\/p1\/stop$/)
+  })
+
+  test('the recon stop is hard, so a draining run writes nothing after the clear (plan 12.3)', async () => {
+    await DELETE(del(), params('p1'))
+    const url = new URL(stopUrl('recon') as string)
+    expect(url.searchParams.get('graceful')).toBe('false')
   })
 
   test('the stops still finish before the graph is cleared', async () => {
@@ -162,19 +190,21 @@ describe('running partial recons are stopped too', () => {
     ))
   }
 
-  test('each running or starting run gets a stop, finished ones do not', async () => {
+  test('each running, starting or stopping run gets a hard stop, finished ones do not', async () => {
     withRuns([
       { run_id: 'r-running', status: 'running' },
       { run_id: 'r-done', status: 'completed' },
       { run_id: 'r-starting', status: 'starting' },
+      { run_id: 'r-stopping', status: 'stopping' },
     ])
     expect((await DELETE(del(), params('p1'))).status).toBe(200)
     const stops = h.orchestratorFetch.mock.calls
-      .filter(c => String(c[0]).includes('/partial/') && String(c[0]).endsWith('/stop'))
+      .filter(c => String(c[0]).includes('/partial/') && String(c[0]).split('?')[0].endsWith('/stop'))
       .map(c => [String(c[0]), (c[1] as { method?: string } | undefined)?.method])
     expect(stops).toEqual([
-      [expect.stringContaining('/recon/p1/partial/r-running/stop'), 'POST'],
-      [expect.stringContaining('/recon/p1/partial/r-starting/stop'), 'POST'],
+      [expect.stringContaining('/recon/p1/partial/r-running/stop?graceful=false'), 'POST'],
+      [expect.stringContaining('/recon/p1/partial/r-starting/stop?graceful=false'), 'POST'],
+      [expect.stringContaining('/recon/p1/partial/r-stopping/stop?graceful=false'), 'POST'],
     ])
   })
 
@@ -182,7 +212,7 @@ describe('running partial recons are stopped too', () => {
     withRuns([{ run_id: 'r1', status: 'running' }])
     await DELETE(del(), params('p1'))
     const stopIdx = h.orchestratorFetch.mock.calls
-      .findIndex(c => String(c[0]).endsWith('/partial/r1/stop'))
+      .findIndex(c => String(c[0]).split('?')[0].endsWith('/partial/r1/stop'))
     expect(h.orchestratorFetch.mock.invocationCallOrder[stopIdx])
       .toBeLessThan(h.projectDelete.mock.invocationCallOrder[0])
   })

@@ -2,6 +2,9 @@ import { NextRequest, NextResponse } from 'next/server'
 import { guardProject } from '@/lib/access'
 import { getGraphSession } from '@/app/api/graph/neo4j'
 import { notMuted } from '@/lib/graphMute'
+import { DECLARED_ONLY } from '@/lib/declaredOnly'
+import { ipVersionIs } from '@/lib/ipVersion'
+import { internalError } from '@/lib/routeErrors'
 
 function toNum(val: unknown): number {
   if (val && typeof val === 'object' && 'low' in val) return (val as { low: number }).low
@@ -56,18 +59,25 @@ export async function GET(request: NextRequest) {
       ? { total: toNum(subRec.get('total')), resolved: toNum(subRec.get('resolved')), uniqueIps: toNum(subRec.get('uniqueIps')) }
       : { total: 0, resolved: 0, uniqueIps: 0 }
 
-    // Q4: Endpoint coverage
+    // Q4: Endpoint coverage. Observed only: an endpoint known only from an API
+    // specification is counted apart, so the posture radar is not inflated.
     const epResult = await session.run(
       `MATCH (b:BaseURL {project_id: $pid})
        OPTIONAL MATCH (b)-[:HAS_ENDPOINT]->(e:Endpoint)
        OPTIONAL MATCH (e)-[:HAS_PARAMETER]->(p:Parameter)
-       RETURN count(DISTINCT b) AS baseUrls, count(DISTINCT e) AS endpoints, count(DISTINCT p) AS parameters`,
+       WITH b, e, p, ${DECLARED_ONLY('e')} AS declared
+       RETURN count(DISTINCT b) AS baseUrls,
+              count(DISTINCT CASE WHEN NOT declared THEN e END) AS endpoints,
+              count(DISTINCT CASE WHEN NOT declared THEN p END) AS parameters,
+              count(DISTINCT CASE WHEN declared THEN e END) AS declaredEndpoints,
+              count(DISTINCT CASE WHEN declared THEN p END) AS declaredParameters`,
       { pid: projectId }
     )
     const epRec = epResult.records[0]
     const endpointCoverage = epRec
-      ? { baseUrls: toNum(epRec.get('baseUrls')), endpoints: toNum(epRec.get('endpoints')), parameters: toNum(epRec.get('parameters')) }
-      : { baseUrls: 0, endpoints: 0, parameters: 0 }
+      ? { baseUrls: toNum(epRec.get('baseUrls')), endpoints: toNum(epRec.get('endpoints')), parameters: toNum(epRec.get('parameters')),
+          declaredEndpoints: toNum(epRec.get('declaredEndpoints')), declaredParameters: toNum(epRec.get('declaredParameters')) }
+      : { baseUrls: 0, endpoints: 0, parameters: 0, declaredEndpoints: 0, declaredParameters: 0 }
 
     // Q5: Certificate health - match both BaseURL and IP certificate paths,
     // cast string not_after to datetime for correct comparison
@@ -113,8 +123,8 @@ export async function GET(request: NextRequest) {
     const infraResult = await session.run(
       `MATCH (ip:IP {project_id: $pid})
        RETURN count(ip) AS total,
-              count(CASE WHEN ip.version = 'ipv4' THEN 1 END) AS ipv4,
-              count(CASE WHEN ip.version = 'ipv6' THEN 1 END) AS ipv6,
+              count(CASE WHEN ${ipVersionIs('ip', 'ipv4')} THEN 1 END) AS ipv4,
+              count(CASE WHEN ${ipVersionIs('ip', 'ipv6')} THEN 1 END) AS ipv6,
               count(CASE WHEN ip.is_cdn = true THEN 1 END) AS cdnCount,
               count(DISTINCT CASE WHEN ip.asn IS NOT NULL THEN ip.asn END) AS uniqueAsns,
               count(DISTINCT CASE WHEN ip.cdn_name IS NOT NULL THEN ip.cdn_name END) AS uniqueCdns`,
@@ -144,11 +154,7 @@ export async function GET(request: NextRequest) {
       infrastructureStats,
     })
   } catch (error) {
-    console.error('Analytics graph-overview error:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Query failed' },
-      { status: 500 }
-    )
+    return internalError(error, 'Query failed', { log: 'Analytics graph-overview error' })
   } finally {
     await session.close()
   }

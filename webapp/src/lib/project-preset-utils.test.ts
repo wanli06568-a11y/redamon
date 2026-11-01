@@ -76,6 +76,7 @@ describe('PRESET_EXCLUDED_FIELDS', () => {
       ...fieldsWhere(f => f.read_deny_reason === 'credential').map(f => f.key),
       ...fieldsWhere(f => f.deny_reason === 'escalation' || f.deny_reason === 'not-tuning').map(f => f.key),
       ...bookkeeping.map(f => f.key),
+      ...fieldsWhere(f => f.deny_reason === 'secret').map(f => f.key),
     ])
     expect([...PRESET_EXCLUDED_FIELDS].sort()).toEqual([...expected].sort())
   })
@@ -85,6 +86,14 @@ describe('PRESET_EXCLUDED_FIELDS', () => {
     // to their default on every apply - and mcpKaliExecEnabled defaults to ON.
     expect(PRESET_EXCLUDED_FIELDS.has('mcpKaliExecEnabled')).toBe(true)
     expect(PRESET_EXCLUDED_FIELDS.has('updateGraphDb')).toBe(true)
+  })
+
+  test('OpenAPI credentials cannot be captured or applied by presets', () => {
+    const settings = { openapiSources: [{ url: 'https://docs.example.test/spec.json?token=fixture-token' }], openapiEnabled: true }
+    for (const result of [extractPresetSettings(settings), pickPresetFields(settings)]) {
+      expect(result).not.toHaveProperty('openapiSources')
+      expect(result.openapiEnabled).toBe(true)
+    }
   })
 
   test('the scope never travels: target, batch, ownership proof, guardrail', () => {
@@ -225,13 +234,14 @@ describe('extractPresetSettings', () => {
       jsReconUploadedFiles: ['file1.js'],
       roeGlobalMaxRps: 5,
       roeClientName: 'ACME',
+      openapiSources: [{ url: 'https://docs.example.test/openapi.json?token=secret' }],
       naabuEnabled: true,
       nucleiEnabled: false,
       agentMaxIterations: 50,
     })
     for (const key of ['name', 'description', 'targetDomain', 'subdomainList', 'ipMode',
       'targetIps', 'roeDocumentData', 'roeDocumentName', 'jsReconUploadedFiles',
-      'roeGlobalMaxRps', 'roeClientName']) {
+      'roeGlobalMaxRps', 'roeClientName', 'openapiSources']) {
       expect(result, key).not.toHaveProperty(key)
     }
     expect(result.naabuEnabled).toBe(true)
@@ -397,6 +407,9 @@ describe('applyPresetSettings', () => {
     resourceEnumJevToolHealth: true,
     hakrawlerJevSeedOrder: true,
     serializedScanJevRank: true,
+    routeExposureJevRank: true,
+    routeExposureJevWallCheck: true,
+    routeExposureJevAssess: true,
     naabuEnabled: false,
     katanaDepth: 9,
     sqliLevel: 5,
@@ -418,9 +431,15 @@ describe('applyPresetSettings', () => {
   })
 
   test('the backend default wins over the Prisma default', () => {
-    const next = applyPresetSettings({}, {}, { fireteamTimeoutSec: 7200 })
-    expect(next.fireteamTimeoutSec).toBe(7200)
-    expect(applyPresetSettings({}, {}, {}).fireteamTimeoutSec).toBe(3600)
+    // Read the Prisma default rather than naming it, and pick a backend value
+    // that differs from it, so the test keeps proving precedence when the two
+    // defaults are aligned.
+    const prismaDefault = field('fireteamTimeoutSec')?.default
+    expect(typeof prismaDefault).toBe('number')
+    const backend = (prismaDefault as number) + 60
+    const next = applyPresetSettings({}, {}, { fireteamTimeoutSec: backend })
+    expect(next.fireteamTimeoutSec).toBe(backend)
+    expect(applyPresetSettings({}, {}, {}).fireteamTimeoutSec).toBe(prismaDefault)
   })
 
   test('never touches an excluded field, even when a stale preset carries it', () => {

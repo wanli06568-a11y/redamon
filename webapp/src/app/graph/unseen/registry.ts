@@ -30,7 +30,7 @@ import type { TableViewMode } from '../components/ViewTabs'
  */
 export const ALL_GRAPH_LABELS = [
   'AttackChain', 'BaseURL', 'Capec', 'Certificate', 'ChainDecision', 'ChainFailure',
-  'ChainFinding', 'ChainStep', 'CVE', 'DNSRecord', 'Domain', 'Endpoint', 'Exploit',
+  'ChainFinding', 'ChainStep', 'CVE', 'DNSRecord', 'Domain', 'Endpoint',
   'ExploitGvm', 'ExternalDomain', 'GithubHunt', 'GithubPath', 'GithubRepository',
   'GithubSecret', 'GithubSensitiveFile', 'Header', 'IP', 'JsReconFinding',
   'MalPackageFinding', 'Malware', 'MitreData', 'MultiscannerBucket',
@@ -67,7 +67,7 @@ export const BADGED_TABS = [
   'nodeDetails', 'all', 'jsRecon', 'aiSurface', 'aiRisk', 'killChain', 'blastRadius',
   'takeover', 'secrets', 'netInitAccess', 'graphql', 'webInitAccess', 'paramMatrix',
   'sharedInfra', 'dnsEmail', 'threatIntel', 'jsDepSignals', 'supplyChainSca',
-  'dnsDrift', 'webCachePoison',
+  'dnsDrift', 'webCachePoison', 'routeExposure',
 ] as const satisfies readonly Exclude<
   TableViewMode, 'reconDelta' | 'scanSchedule' | 'triage' | 'nodeFilters' | 'muted'
 >[]

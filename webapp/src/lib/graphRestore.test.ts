@@ -94,6 +94,70 @@ describe('clearProjectGraph', () => {
   })
 })
 
+describe('restoreGraph — retired properties', () => {
+  test('a snapshot or export from before their retirement does not bring them back', async () => {
+    const { session, calls } = fakeSession([{ label: 'Endpoint', properties: ['path', 'method', 'baseurl', 'user_id', 'project_id'] }])
+    await restoreGraph(
+      session,
+      [
+        node('Endpoint', {
+          path: '/users/{id}', method: 'GET', baseurl: 'https://api.example.com',
+          openapi_declared: true, openapi_declarations: '[{"operation":{}}]', _openapi_write_lock: 'tx',
+        }, 'n1'),
+        node('Domain', { name: 'example.com', openapi_summary: '{}', openapi_last_import_at: 'then' }, 'n2'),
+      ],
+      [],
+      { projectId: 'p1' }
+    )
+    const written = calls
+      .filter(c => c.cypher.includes('apoc.merge.node') || c.cypher.includes('apoc.create.node'))
+      .flatMap(c => c.params.nodes as Array<{ properties: Record<string, unknown> }>)
+      .map(n => n.properties)
+    expect(written).toHaveLength(2)
+    for (const props of written) {
+      for (const retired of ['openapi_declarations', 'openapi_summary', 'openapi_last_import_at', '_openapi_write_lock']) {
+        expect(props).not.toHaveProperty(retired)
+      }
+    }
+    // What is still a live property is kept.
+    expect(written[0]).toMatchObject({ openapi_declared: true, path: '/users/{id}' })
+  })
+})
+
+describe('restoreGraph — retired props are per label (GDB-13)', () => {
+  async function restored(nodes: ReturnType<typeof node>[]) {
+    const { session, calls } = fakeSession()
+    await restoreGraph(session, nodes, [], { projectId: 'p1' })
+    return calls
+      .filter(c => c.cypher.includes('apoc.merge.node') || c.cypher.includes('apoc.create.node'))
+      .flatMap(c => c.params.nodes as Array<{ properties: Record<string, unknown> }>)
+      .map(n => n.properties)
+  }
+
+  test("a Domain's flat per-run props are dropped; the latest scan_timestamp stays", async () => {
+    const [d] = await restored([node('Domain', {
+      name: 'example.com', target: 'api.example.com', filtered_mode: true, wildcard_mode: false,
+      subdomain_filter: ['www.api.example.com'], modules_executed: ['domain_discovery'], anonymous_mode: false,
+      bruteforce_mode: false, scan_type: 'full', scan_timestamp: 't1', registrar: 'R',
+    }, 'n1')])
+    for (const k of ['target', 'filtered_mode', 'wildcard_mode', 'subdomain_filter', 'modules_executed',
+      'anonymous_mode', 'bruteforce_mode', 'scan_type']) expect(d).not.toHaveProperty(k)
+    expect(d).toMatchObject({ scan_timestamp: 't1', registrar: 'R' })
+  })
+
+  test('a GithubHunt keeps its target', async () => {
+    const [g] = await restored([node('GithubHunt', { id: 'h1', target: 'acme-org', scan_type: 'org' }, 'n1')])
+    expect(g).toMatchObject({ target: 'acme-org', scan_type: 'org' })
+  })
+
+  test("an IP-mode Domain keeps its own scan_type and modules_executed", async () => {
+    const [d] = await restored([node('Domain', {
+      name: 'ip-targets.p1', ip_mode: true, scan_type: 'ip', modules_executed: ['ip_recon'],
+    }, 'n1')])
+    expect(d).toMatchObject({ scan_type: 'ip', modules_executed: ['ip_recon'] })
+  })
+})
+
 describe('restoreGraph — tenancy', () => {
   test('stamps the CALLER project id onto every node, overriding the payload', async () => {
     const { session, calls } = fakeSession()
@@ -222,6 +286,82 @@ describe('restoreGraph — strategy', () => {
       { projectId: 'p1' }
     )
     expect(res).toEqual({ nodes: 2, relationships: 1 })
+  })
+})
+
+describe('restoreGraph — the global reference catalogue (plan 09.5)', () => {
+  const cveLink = {
+    startExportId: 'n1', endExportId: null, type: 'INCLUDES_CVE',
+    refLabel: 'CVE', refKey: 'CVE-2021-44228', properties: {},
+  }
+
+  test('a bundle that carries a reference node never creates or overwrites one', async () => {
+    // One CVE node is shared by every tenant and keyed on its id alone, so a
+    // MERGE of a bundle's CVE would rewrite the shared node's properties.
+    const { session, calls } = fakeSession([{ label: 'CVE', properties: ['id'] }])
+    const res = await restoreGraph(session, [
+      node('Vulnerability', { id: 'v1' }, 'n1'),
+      node('CVE', { id: 'CVE-2021-44228', cvss: 0, description: 'forged' }, 'n2'),
+      { labels: ['MitreData'], properties: { id: 'CVE-2021-44228-CWE-502' }, _exportId: 'n3' },
+    ], [], { projectId: 'p1' })
+    const written = calls.filter(c => c.cypher.includes('apoc.merge.node') || c.cypher.includes('apoc.create.node'))
+    for (const c of written) {
+      for (const n of c.params.nodes as { labels: string[] }[]) {
+        expect(n.labels).not.toContain('CVE')
+        expect(n.labels).not.toContain('MitreData')
+      }
+    }
+    expect(res.nodes).toBe(1)
+  })
+
+  test("a carried reference node's edges become links to the existing node, not lost", async () => {
+    // A snapshot stored before the reference catalogue lost its tenant stamp
+    // holds the CVE as a node and its edge as an ordinary relationship.
+    const { session, calls } = fakeSession()
+    await restoreGraph(session, [
+      node('Vulnerability', { id: 'v1' }, 'n1'),
+      node('CVE', { id: 'CVE-2021-44228', project_id: 'old' }, 'n2'),
+      node('Capec', { capec_id: 'not-a-capec' }, 'n3'),
+    ], [
+      { startExportId: 'n1', endExportId: 'n2', type: 'INCLUDES_CVE', properties: { w: 1 } },
+      { startExportId: 'n1', endExportId: 'n3', type: 'HAS_CAPEC', properties: {} },
+    ], { projectId: 'p1' })
+    const rels = calls.filter(c => c.cypher.includes('MATCH (a {_exportId: rel.startExportId'))
+    expect(rels.flatMap(c => c.params.rels as unknown[])).toEqual([])
+    const link = calls.find(c => c.cypher.includes('MATCH (ref:CVE {id: link.refKey})'))!
+    expect(link.params.links).toEqual([
+      { localExportId: 'n1', refKey: 'CVE-2021-44228', type: 'INCLUDES_CVE', properties: { w: 1 } }])
+  })
+
+  test('links to the catalogue are restored before the export ids are stripped', async () => {
+    const { session, calls } = fakeSession()
+    const res = await restoreGraph(session, [node('Vulnerability', { id: 'v1' }, 'n1')], [],
+      { projectId: 'p1', referenceLinks: [cveLink, { ...cveLink, refKey: 'bad' }] })
+    const linkAt = calls.findIndex(c => c.cypher.includes('MATCH (ref:CVE {id: link.refKey})'))
+    const stripAt = calls.findIndex(c => c.cypher.includes('REMOVE n._exportId'))
+    expect(linkAt).toBeGreaterThan(-1)
+    expect(linkAt).toBeLessThan(stripAt)
+    // The fake session reports no edge made: the CVE node "does not exist".
+    expect(res.referenceLinks).toEqual({ restored: 0, skipped: 2 })
+  })
+
+  test('a payload with no link records restores exactly as before', async () => {
+    const { session, calls } = fakeSession()
+    const res = await restoreGraph(session, [node('IP', { address: '1.1.1.1' }, 'n1')], [], { projectId: 'p1' })
+    expect(res).toEqual({ nodes: 1, relationships: 0 })
+    expect(calls.some(c => c.cypher.includes('(ref:'))).toBe(false)
+  })
+})
+
+describe('clearProjectGraph — sweeping after a restore (plan 09.5)', () => {
+  test('a caller that restores next can defer the orphan sweep', async () => {
+    // Activation clears, then restores the version's links to the catalogue:
+    // sweeping in between would delete a CVE only this project linked, and the
+    // restore would find nothing to link back to.
+    const { session, calls } = fakeSession()
+    await clearProjectGraph(session, 'p1', [], { sweep: false })
+    expect(calls.some(c => c.cypher.includes('NOT EXISTS'))).toBe(false)
+    expect(calls).toHaveLength(1)
   })
 })
 

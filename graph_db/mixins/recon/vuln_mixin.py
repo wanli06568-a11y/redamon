@@ -9,8 +9,9 @@ import re
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs
 
+from graph_db.coverage_stamps import stamp_base_url_coverage
 from graph_db.cpe_resolver import _is_ip_address
-from graph_db.mixins.recon.scope import build_host_scope, host_in_scope
+from graph_db.mixins.recon.scope import build_host_scope, host_in_scope, org_for_scan_root
 
 
 def stable_vuln_id(finding_type: str, url: str, ip_or_host: str = "",
@@ -61,6 +62,7 @@ def _ip_port_key(ip: str, port) -> str:
 #: classifier was (triage weighs a finding by them), and a port's service.
 _SECURITY_CHECK_EXTRA_FIELDS = (
     "detection_method", "waf_confidence", "waf_type", "ai_reasoning", "service",
+    "control_check",
 )
 
 #: Words nmap and the fingerprinters put after a product name without making
@@ -397,6 +399,7 @@ class VulnMixin:
                                 e.full_url = $full_url,
                                 e.source = 'katana_crawl',
                                 e.updated_at = datetime()
+                            SET e.openapi_declared_only = CASE WHEN coalesce(e.openapi_declared_only, e.openapi_declared, false) THEN false ELSE e.openapi_declared_only END
                             """,
                             path=path, method=method, baseurl=base_url,
                             user_id=user_id, project_id=project_id,
@@ -608,6 +611,7 @@ class VulnMixin:
                                     e.has_parameters = true,
                                     e.source = 'vuln_scan',
                                     e.updated_at = datetime()
+                                SET e.openapi_declared_only = CASE WHEN coalesce(e.openapi_declared_only, e.openapi_declared, false) THEN false ELSE e.openapi_declared_only END
                                 """,
                                 path=vuln_path, method=fuzzing_method, baseurl=vuln_base_url,
                                 user_id=user_id, project_id=project_id
@@ -1035,11 +1039,11 @@ class VulnMixin:
                     # origin_discovery on the same (type, url, ip/host) exposure
                     # within this tenant and survives re-runs.
                     # A domain-level finding (SPF, DMARC, DNSSEC, zone transfer)
-                    # has no url, host or ip, so every root of a Domain batch
-                    # would hash to one node; a batch keys it on its domain. A
+                    # has no url, host or ip, so every org of a Domain batch
+                    # would hash to one node; a batch keys it on its org. A
                     # single-domain project keeps the id its fix items and mute
-                    # exemptions already reference.
-                    finding_domain = (finding.get("domain") or ""
+                    # exemptions already reference (D-23).
+                    finding_domain = (org_for_scan_root(finding.get("domain") or "", recon_data)
                                       if domain_batch and not (url or matched_ip or hostname) else "")
                     vuln_id = stable_vuln_id(finding_type, url,
                                              ip_port_key or matched_ip or hostname or finding_domain,
@@ -1213,10 +1217,13 @@ class VulnMixin:
                         stats["relationships_created"] += 1
                         relationship_created = True
 
-                    # For domain-only findings (e.g., SPF/DMARC missing): connect to Domain
+                    # For domain-only findings (e.g., SPF/DMARC missing): connect to
+                    # the org Domain (the checks run on the org; a legacy file
+                    # names its scan root, which maps to the org).
                     if not relationship_created:
                         finding_domain = finding.get("domain")
                         if finding_domain:
+                            finding_domain = org_for_scan_root(finding_domain, recon_data)
                             result = session.run(
                                 """
                                 MATCH (d:Domain {name: $domain, user_id: $user_id, project_id: $project_id})
@@ -1236,9 +1243,12 @@ class VulnMixin:
             if security_checks_created > 0:
                 print(f"[+][graph-db] Created {security_checks_created} SecurityCheck Vulnerability nodes")
 
-            # Update Domain node with vuln_scan metadata
+            # Update the org Domain node with vuln_scan metadata (flat, latest
+            # group wins; §4.11.3)
             metadata = recon_data.get("metadata", {})
             root_domain = metadata.get("root_domain", "")
+            if root_domain:
+                root_domain = metadata.get("org_domain") or org_for_scan_root(root_domain, recon_data)
             summary = vuln_scan_data.get("summary", {})
 
             if root_domain:
@@ -1327,6 +1337,14 @@ class VulnMixin:
                     stats["relationships_created"] += apex_linked
             except Exception as e:
                 stats["errors"].append(f"Apex BaseURL cleanup failed: {e}")
+
+            coverage = scan_metadata.get("coverage")
+            if coverage:
+                try:
+                    stats["coverage_stamped"] = stamp_base_url_coverage(
+                        session, "nuclei", coverage, user_id, project_id, in_scope=is_in_scope)
+                except Exception as e:
+                    stats["errors"].append(f"Nuclei coverage stamp failed: {e}")
 
             print(f"[+][graph-db] Created {stats['endpoints_created']} Endpoint nodes")
             print(f"[+][graph-db] Created {stats['parameters_created']} Parameter nodes")

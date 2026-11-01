@@ -17,7 +17,9 @@ import { MasscanSection } from '../sections/MasscanSection'
 import { NmapSection } from '../sections/NmapSection'
 import { TlsxSection } from '../sections/TlsxSection'
 import { HttpxSection } from '../sections/HttpxSection'
+import { IpAttributionSection } from '../sections/IpAttributionSection'
 import { KatanaSection } from '../sections/KatanaSection'
+import { OpenApiSection } from '../sections/OpenApiSection'
 import { ZapAjaxSpiderSection } from '../sections/ZapAjaxSpiderSection'
 import { HakrawlerSection } from '../sections/HakrawlerSection'
 import { JsluiceSection } from '../sections/JsluiceSection'
@@ -36,6 +38,7 @@ import { GraphqlScanSection } from '../sections/GraphqlScanSection'
 import { TakeoverSection } from '../sections/TakeoverSection'
 import { VhostSniSection } from '../sections/VhostSniSection'
 import { WebCachePoisonSection } from '../sections/WebCachePoisonSection'
+import { RouteExposureSection } from '../sections/RouteExposureSection'
 import { CveLookupSection } from '../sections/CveLookupSection'
 import { MitreSection } from '../sections/MitreSection'
 import { SecurityChecksSection } from '../sections/SecurityChecksSection'
@@ -108,7 +111,9 @@ export function WorkflowNodeModal({
       case 'Nmap':              return <NmapSection {...baseProps} />
       case 'Tlsx':              return <TlsxSection {...baseProps} />
       case 'Httpx':             return <HttpxSection {...baseProps} />
+      case 'IpAttribution':     return <IpAttributionSection {...baseProps} />
       case 'Katana':            return <KatanaSection {...baseProps} />
+      case 'OpenAPI':           return <OpenApiSection {...baseProps} projectId={mode === 'edit' ? projectId : undefined} />
       case 'ZapAjaxSpider':     return <ZapAjaxSpiderSection {...baseProps} />
       case 'Hakrawler':         return <HakrawlerSection {...baseProps} />
       case 'Jsluice':           return <JsluiceSection {...baseProps} />
@@ -127,6 +132,7 @@ export function WorkflowNodeModal({
       case 'SubdomainTakeover': return <TakeoverSection {...baseProps} />
       case 'VhostSni':          return <VhostSniSection {...baseProps} />
       case 'WebCachePoison':    return <WebCachePoisonSection {...baseProps} />
+      case 'RouteExposure':     return <RouteExposureSection {...baseProps} />
       case 'CveLookup':         return <CveLookupSection {...baseProps} />
       case 'Mitre':             return <MitreSection {...baseProps} />
       case 'SecurityChecks':    return <SecurityChecksSection {...baseProps} />

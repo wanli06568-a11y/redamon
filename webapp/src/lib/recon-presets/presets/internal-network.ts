@@ -34,6 +34,7 @@ Internal penetration testers and red teamers assessing a corporate LAN, a VPN-re
 - Nuclei -- this preset discovers and maps the network; template-based vulnerability testing is a follow-up step against the hosts it finds
 - VHost & SNI enumeration -- a per-IP serial loop is impractical across a subnet
 - WAF classification / bypass checks -- there is no public WAF in front of an internal service
+- OpenAPI import (fetches API specification documents from the target)
 
 ### How it works
 1. Each target IP gets a reverse-DNS lookup to recover its internal hostname
@@ -118,6 +119,7 @@ Internal penetration testers and red teamers assessing a corporate LAN, a VPN-re
 
     // --- httpx: internal web apps, admin panels, appliance UIs ---
     httpxEnabled: true,
+    ipAttributionEnabled: true,
     httpxThreads: 50,
     httpxTimeout: 15,
     httpxRetries: 2,
@@ -179,6 +181,7 @@ Internal penetration testers and red teamers assessing a corporate LAN, a VPN-re
     // --- DISABLE directory/API fuzzing and parameter discovery ---
     ffufEnabled: false,
     kiterunnerEnabled: false,
+    openapiEnabled: false,
     arjunEnabled: false,
 
     // --- DISABLE Nuclei (map first; template testing is a follow-up) ---

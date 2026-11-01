@@ -30,12 +30,14 @@ import {
 } from '@/lib/mcpAuth'
 import { projectReconSettings, reconSettingsSelect } from '@/lib/reconSettings/filter'
 import { assertReadableSelect } from '@/lib/mcpReadableFields'
+import { resolveScopeGroups, scopeSummary } from '@/lib/scopeGroups'
 import { McpToolError } from '@/lib/mcp/errors'
 import { assertTenantScoped, TenantViolation } from '@/lib/mcp/graphGuard'
 import { agentBaseUrl } from '@/lib/agentFetch'
 import { internalKeyHeaders } from '@/lib/agentAuth'
 import { execCypher, graphSchemaDoc, nlQuery, type GraphRecords } from '@/lib/mcp/graphClient'
 import { staleFindingsCypher } from '@/lib/mcp/findingLabels'
+import { coverageCountsBlock } from '@/lib/coverageStamps'
 import { kaliToolboxDoc } from '@/lib/mcp/kaliClient'
 
 const RECON_ORCHESTRATOR_URL = process.env.RECON_ORCHESTRATOR_URL || 'http://localhost:8010'
@@ -109,10 +111,11 @@ export async function listProjects(ctx: McpContext) {
   const select = {
     id: true, name: true, targetDomain: true, targetIps: true,
     ipMode: true, domainBatchMode: true, updatedAt: true,
-    // The groups themselves are internal, but whether any of them enumerates is
-    // the difference between a five-host scan and a multi-hour one, so a caller
-    // choosing a project needs it. Reduced to a count below; never returned raw.
-    domainBatchGroups: true,
+    // The host and prefix lists derive the scope groups: whether any of them
+    // enumerates is the difference between a five-host scan and a multi-hour
+    // one, so a caller choosing a project needs it. Reduced to counts and a
+    // one-line summary below; never returned raw.
+    domainBatchHosts: true, subdomainList: true,
   }
   assertReadableSelect(select, 'list_projects')
 
@@ -124,13 +127,18 @@ export async function listProjects(ctx: McpContext) {
     orderBy: { updatedAt: 'desc' },
   })
   return {
-    projects: projects.map(({ domainBatchGroups, ...p }) => ({
-      ...p,
-      wildcardDomainCount: Array.isArray(domainBatchGroups)
-        ? (domainBatchGroups as Array<{ prefixes?: string[] }>)
-            .filter(g => (g?.prefixes || []).includes('*')).length
-        : 0,
-    })),
+    projects: projects.map(({ domainBatchHosts, subdomainList, ...p }) => {
+      const { groups } = resolveScopeGroups({ ...p, domainBatchHosts, subdomainList })
+      const enumerated = groups.filter(g => g.mode === 'enumerate').length
+      return {
+        ...p,
+        // Enumerated Domain-batch groups, as before; 0 for a single domain.
+        wildcardDomainCount: p.domainBatchMode ? enumerated : 0,
+        // Enumerated scope groups in every mode, a single domain included.
+        enumerateGroupCount: enumerated,
+        scopeSummary: scopeSummary(groups),
+      }
+    }),
   }
 }
 
@@ -395,10 +403,13 @@ export async function graphSummary(ctx: McpContext, projectId: string) {
   enforceRate(ctx, 'read')
   await assertMcpProjectAccess(ctx.token.userId, projectId)
 
-  const version = await prisma.scanVersion.findFirst({
+  const current = await prisma.scanVersion.findFirst({
     where: { projectId, isCurrent: true },
-    select: { id: true, seq: true, label: true, createdAt: true },
+    select: { id: true, seq: true, label: true, createdAt: true, nodeCount: true },
   })
+  // nodeCount is the graph-loss check's reference, not part of the answer:
+  // it is null on a version scanned into, and only a saved one carries it.
+  const { nodeCount: currentNodeCount, ...version } = current ?? { nodeCount: null }
 
   // Counts FIRST, then the state. Sampling the state first meant a scan that
   // started in between was reported as `stable` alongside mid-wipe near-zero
@@ -408,6 +419,14 @@ export async function graphSummary(ctx: McpContext, projectId: string) {
   const summary = await summaryCounts(ctx, projectId)
   const stale = await staleFindingCount(ctx, projectId)
   const liveGraphState = await resolveLiveGraphState(projectId)
+  // Computed by the agent inside the same summary op, so the block costs this
+  // most-called tool no round trip of its own.
+  const coverage = coverageCountsBlock(summary.coverage)
+  // Only a settled graph can be called lost: a running state already explains
+  // near-zero counts, and says so in its own warning.
+  const missing = liveGraphState === 'stable'
+    ? await graphDataMissing(projectId, summary.nodes, currentNodeCount, current?.seq ?? null)
+    : null
 
   return {
     projectId,
@@ -415,14 +434,95 @@ export async function graphSummary(ctx: McpContext, projectId: string) {
     // near-zero, which a reader would otherwise take for "never scanned".
     liveGraphState,
     ...(liveGraphState === 'stable' ? {} : { warning: STATE_WARNING[liveGraphState] }),
-    scanVersion: version,
+    ...(missing ? { warning: 'graph_data_missing', graphDataMissing: missing } : {}),
+    scanVersion: current ? version : null,
     nodes: summary.nodes,
     relationships: summary.relationships,
     // Omitted entirely when it could not be read. Reporting 0 for "could not
     // count" would be the same false negative the rest of this tool exists to
     // prevent, one field down.
     ...(stale === null ? {} : { hiddenFromCounts: { stale } }),
+    // Per module, the web hosts (BaseURL) it analyzed in each state and the
+    // live ones it never looked at. Same rule as above: absent, never zeros.
+    ...(coverage === null ? {} : { coverage }),
   }
+}
+
+/** Below this share of the version it should hold, a settled graph reads as lost. */
+const LOST_GRAPH_RATIO = 0.1
+
+export interface GraphDataMissing {
+  liveNodes: number
+  expectedNodes: number | null
+  basis: 'scan_version' | 'completed_scan'
+  versionSeq?: number
+  detail: string
+}
+
+const UNKNOWN_CONTENTS =
+  'Treat the live graph\'s contents as UNKNOWN: an absent node type or finding proves nothing until ' +
+  'the data is restored or rescanned. list_scan_versions and get_recon_status show the history.'
+
+/**
+ * Whether the settled live graph is missing data the project's own history
+ * says it had. A reset Neo4j volume or a failed restore otherwise makes a
+ * project scanned yesterday read as "never scanned".
+ *
+ * The reference is the current version's node count when it has one (a
+ * restored version does), else the newest saved version's: the one scanned
+ * into carries none until it is saved. A census below a tenth of it, or an
+ * empty census after a completed full scan, is graph_data_missing. `null` when
+ * the history cannot be read: an invented warning is no better than none.
+ */
+async function graphDataMissing(
+  projectId: string,
+  nodes: { count: number }[],
+  currentNodeCount: number | null,
+  currentSeq: number | null,
+): Promise<GraphDataMissing | null> {
+  const liveNodes = nodes.reduce((sum, n) => sum + (Number(n.count) || 0), 0)
+  try {
+    const reference = currentNodeCount && currentNodeCount > 0
+      ? { seq: currentSeq, nodeCount: currentNodeCount }
+      : await prisma.scanVersion.findFirst({
+        where: { projectId, nodeCount: { gt: 0 } },
+        orderBy: { seq: 'desc' },
+        select: { seq: true, nodeCount: true },
+      })
+    if (reference?.nodeCount && liveNodes < reference.nodeCount * LOST_GRAPH_RATIO) {
+      return {
+        liveNodes,
+        expectedNodes: reference.nodeCount,
+        basis: 'scan_version',
+        ...(reference.seq != null ? { versionSeq: reference.seq } : {}),
+        detail:
+          `The live graph holds ${liveNodes} node(s), but version ${reference.seq} of this project held ` +
+          `${reference.nodeCount}. Its data was most likely lost (a reset database volume or a failed ` +
+          `restore), unless the scope shrank sharply since. ${UNKNOWN_CONTENTS}`,
+      }
+    }
+    if (liveNodes === 0) {
+      const scanned = await prisma.scanJob.findFirst({
+        where: { projectId, kind: 'full_recon', status: 'completed' },
+        orderBy: { finishedAt: 'desc' },
+        select: { finishedAt: true },
+      })
+      if (scanned) {
+        return {
+          liveNodes,
+          expectedNodes: null,
+          basis: 'completed_scan',
+          detail:
+            `The live graph is empty, but a full scan of this project completed` +
+            `${scanned.finishedAt ? ` on ${scanned.finishedAt.toISOString()}` : ''}. Its data was most ` +
+            `likely lost (a reset database volume or a failed restore). ${UNKNOWN_CONTENTS}`,
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[mcp] graph-loss check could not read the scan history:', err)
+  }
+  return null
 }
 
 export type LiveGraphState = 'stable' | 'scan_running' | 'agent_writing' | 'activating' | 'unknown'
@@ -489,6 +589,7 @@ async function summaryCounts(ctx: McpContext, projectId: string) {
   return (await resp.json()) as {
     nodes: { label: string; count: number }[]
     relationships: { type: string; count: number }[]
+    coverage?: unknown
   }
 }
 

@@ -14,6 +14,7 @@ const h = vi.hoisted(() => ({
   findUnique: vi.fn(),
   orchestratorFetch: vi.fn(),
   recordScanStart: vi.fn(),
+  legacy: vi.fn(),
 }))
 
 vi.mock('@/lib/access', () => ({ guardProject: (...a: unknown[]) => h.guard(...a) }))
@@ -23,6 +24,10 @@ vi.mock('@/lib/prisma', () => ({ default: { project: { findUnique: (...a: unknow
 vi.mock('@/lib/orchestrator', () => ({ orchestratorFetch: (...a: unknown[]) => h.orchestratorFetch(...a) }))
 vi.mock('@/lib/activationLock', () => ({ assertGraphNotActivating: async () => null }))
 vi.mock('@/lib/nodeFilterRun', () => ({ describeNodeFilterWriter: async () => null }))
+vi.mock('@/lib/legacyGraph', async orig => ({
+  ...(await orig<typeof import('@/lib/legacyGraph')>()),
+  legacyGraphDomains: (...a: unknown[]) => h.legacy(...a),
+}))
 
 import { POST } from './route'
 
@@ -37,6 +42,7 @@ beforeEach(() => {
   vi.clearAllMocks()
   h.guard.mockResolvedValue(null)
   h.findUnique.mockResolvedValue({ id: 'p1', userId: 'u1', targetDomain: '' })
+  h.legacy.mockResolvedValue([])
   h.orchestratorFetch.mockResolvedValue({
     ok: true,
     json: async () => ({ run_id: 'r1', status: 'running', roots: ['alpha.test', 'beta.test'] }),
@@ -73,5 +79,78 @@ describe('partial recon start', () => {
     const res = await post({ tool_id: 'Tlsx', graph_inputs: { domains: ['evil.test'] } })
     expect(res.status).toBe(400)
     expect(h.recordScanStart).not.toHaveBeenCalled()
+  })
+})
+
+describe('an old-model graph (§4.11.6)', () => {
+  test('refuses the start with 409 and the message, before any container', async () => {
+    h.findUnique.mockResolvedValue({
+      id: 'p1', userId: 'u1', targetDomain: '', domainBatchMode: true,
+      domainBatchHosts: ['www.acme.co.uk', '*.beta.test'],
+    })
+    h.legacy.mockResolvedValue(['co.uk'])
+    const res = await post({ tool_id: 'Tlsx', graph_inputs: { domains: ['acme.co.uk'] } })
+    expect(res.status).toBe(409)
+    const body = await res.json()
+    expect(body.error).toContain("This project's graph was built before the current scope model; run a full recon first")
+    expect(body.code).toBe('legacy_graph')
+    expect(h.orchestratorFetch).not.toHaveBeenCalled()
+    expect(h.recordScanStart).not.toHaveBeenCalled()
+    // the scope it judged is the PSL-regrouped one
+    expect(h.legacy.mock.calls[0][2].map((g: { scanRoot: string }) => g.scanRoot))
+      .toEqual(['acme.co.uk', 'beta.test'])
+  })
+
+  test('a check Neo4j could not answer lets the start through to the container backstop', async () => {
+    h.legacy.mockResolvedValue(null)
+    const res = await post({ tool_id: 'Tlsx', graph_inputs: { domains: ['alpha.test'] } })
+    expect(res.status).toBe(200)
+  })
+})
+
+describe('a partial start that got no answer says whether it may have started', () => {
+  beforeEach(() => { vi.spyOn(console, 'error').mockImplementation(() => {}) })
+
+  test('a refused connection is 503 orchestrator_unreachable: not started, safe to retry', async () => {
+    h.orchestratorFetch.mockRejectedValue(Object.assign(new TypeError('fetch failed'), {
+      cause: Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:8010'), { code: 'ECONNREFUSED' }),
+    }))
+    const res = await post({ tool_id: 'Tlsx', graph_inputs: { domains: ['alpha.test'] } })
+    expect(res.status).toBe(503)
+    expect(await res.json()).toEqual({
+      error: 'The orchestrator could not be reached, so the partial recon was not started.',
+      code: 'orchestrator_unreachable', cause: 'ECONNREFUSED',
+    })
+    expect(h.recordScanStart).not.toHaveBeenCalled()
+  })
+
+  test('a timeout is 504 orchestrator_timeout with an unknown outcome, never the bare abort message', async () => {
+    h.orchestratorFetch.mockRejectedValue(
+      Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' }))
+    const res = await post({ tool_id: 'Tlsx', graph_inputs: { domains: ['alpha.test'] } })
+    expect(res.status).toBe(504)
+    const body = await res.json()
+    expect(body).toMatchObject({ code: 'orchestrator_timeout', startOutcome: 'unknown' })
+    expect(body.error).toMatch(/unknown whether the partial recon started/)
+    expect(JSON.stringify(body)).not.toMatch(/aborted due to timeout/)
+  })
+
+  test('an answered refusal keeps the orchestrator code and status', async () => {
+    h.orchestratorFetch.mockResolvedValue({
+      ok: false, status: 500,
+      json: async () => ({ detail: { detail: 'Failed to start: image missing', code: 'spawn_failed' } }),
+    })
+    const res = await post({ tool_id: 'Tlsx', graph_inputs: { domains: ['alpha.test'] } })
+    expect(res.status).toBe(500)
+    expect(await res.json()).toMatchObject({
+      error: 'Failed to start: image missing', code: 'spawn_failed', upstreamStatus: 500,
+    })
+  })
+
+  test('an unexpected throw answers a fixed sentence and a code', async () => {
+    h.findUnique.mockRejectedValue(Object.assign(new Error('select * from "Project" where id = p1'), { code: 'P1001' }))
+    const res = await post({ tool_id: 'Tlsx' })
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({ error: 'Failed to start partial recon', code: 'P1001' })
   })
 })

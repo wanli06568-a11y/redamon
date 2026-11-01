@@ -3,6 +3,7 @@ import { Prisma } from '@prisma/client'
 import prisma from '@/lib/prisma'
 import { getGraphSession } from '@/app/api/graph/neo4j'
 import { clearProjectGraph, restoreGraph } from '@/lib/graphRestore'
+import { REFERENCE_LINKS_BUNDLE_PATH } from '@/lib/graphReferenceLinks'
 import { requireEffectiveUser } from '@/lib/access'
 import JSZip from 'jszip'
 import { randomUUID } from 'crypto'
@@ -22,12 +23,17 @@ import {
 } from '@/lib/reconPresets/server'
 import { MUTEABLE_FINDING_LABELS } from '@/lib/mcp/findingLabels'
 import { pickProjectColumns } from '@/lib/projectColumns'
+import { normalizeImportedScope } from '@/lib/importScope'
 import { sanitizeImportedRoeParsedJson } from '@/lib/roe/createRoe'
+import { sanitizeImportedOpenApiSettings } from '@/lib/validation/openapiSettings'
 import { importRevision, MAX_IMPORTED_REVISIONS, REVISIONS_BUNDLE_PATH } from '@/lib/roe/revisionBundle'
 import { jevImportWarnings } from '@/lib/reconSettings/jevEngine'
 import { PROJECT_EXPORT_EXCLUDED, isPluginArchivePath } from '@/lib/projectExport/pluginExclusion'
 import { validateSerializedScanChange } from '@/lib/reconSettings/serializedScanGate'
 import { skillToggleWarnings, trimImportedSkillToggles } from '@/lib/userSkills'
+import { declaredBodyTooLarge } from '@/lib/roe/upload'
+import { internalError } from '@/lib/routeErrors'
+import { DEFAULT_IMPORT_MAX_UPLOAD_BYTES } from './limits'
 
 const MUTEABLE_LABELS = new Set<string>(MUTEABLE_FINDING_LABELS)
 
@@ -150,31 +156,50 @@ export async function POST(request: NextRequest) {
     if (eff instanceof NextResponse) return eff
     const userId = eff.userId
 
+    // D10: zip-bomb defense. Cap the upload size, the total DECLARED uncompressed
+    // size, and the entry count BEFORE decompressing any entry, so a small crafted
+    // archive cannot inflate to tens of GB and OOM-kill the webapp (mem_limit 1g).
+    // Caps are sized generously off the real export shape (tens of MB uncompressed)
+    // and env-overridable; an upload cap raised past Next's body cap is unreachable.
+    const MAX_UPLOAD_BYTES = parseInt(process.env.PROJECT_IMPORT_MAX_UPLOAD_BYTES || '', 10) || DEFAULT_IMPORT_MAX_UPLOAD_BYTES
+    const MAX_UNCOMPRESSED_BYTES = parseInt(process.env.PROJECT_IMPORT_MAX_UNCOMPRESSED_BYTES || '', 10) || 500 * 1024 * 1024
+    const MAX_ENTRIES = parseInt(process.env.PROJECT_IMPORT_MAX_ENTRIES || '', 10) || 5000
+
+    const lengthProblem = declaredBodyTooLarge(request, MAX_UPLOAD_BYTES)
+    if (lengthProblem) return lengthProblem
+
     // Parse uploaded ZIP
-    const formData = await request.formData()
+    let formData: FormData
+    try {
+      formData = await request.formData()
+    } catch {
+      return NextResponse.json(
+        { error: 'The upload could not be read as multipart form data.', code: 'invalid_multipart' },
+        { status: 400 }
+      )
+    }
     const file = formData.get('file') as File | null
     if (!file) {
       return NextResponse.json({ error: 'No file uploaded' }, { status: 400 })
     }
 
-    // D10: zip-bomb defense. Cap the upload size, the total DECLARED uncompressed
-    // size, and the entry count BEFORE decompressing any entry, so a small crafted
-    // archive cannot inflate to tens of GB and OOM-kill the webapp (mem_limit 1g).
-    // Caps are sized generously off the real export shape (tens of MB uncompressed)
-    // and env-overridable.
-    const MAX_UPLOAD_BYTES = parseInt(process.env.PROJECT_IMPORT_MAX_UPLOAD_BYTES || '', 10) || 100 * 1024 * 1024
-    const MAX_UNCOMPRESSED_BYTES = parseInt(process.env.PROJECT_IMPORT_MAX_UNCOMPRESSED_BYTES || '', 10) || 500 * 1024 * 1024
-    const MAX_ENTRIES = parseInt(process.env.PROJECT_IMPORT_MAX_ENTRIES || '', 10) || 5000
-
     if (file.size > MAX_UPLOAD_BYTES) {
       return NextResponse.json(
-        { error: `Upload too large (${file.size} bytes; max ${MAX_UPLOAD_BYTES})` },
+        { error: `Upload too large (${file.size} bytes; max ${MAX_UPLOAD_BYTES})`, code: 'file_too_large', limitBytes: MAX_UPLOAD_BYTES },
         { status: 413 }
       )
     }
 
     const arrayBuffer = await file.arrayBuffer()
-    const zip = await JSZip.loadAsync(arrayBuffer)
+    let zip: JSZip
+    try {
+      zip = await JSZip.loadAsync(arrayBuffer)
+    } catch {
+      return NextResponse.json(
+        { error: 'The file is not a readable ZIP archive. Select a RedAmon export ZIP.', code: 'invalid_zip' },
+        { status: 400 }
+      )
+    }
 
     // Enforce entry-count + total declared uncompressed size from the central
     // directory (available without decompressing).
@@ -237,6 +262,13 @@ export async function POST(request: NextRequest) {
     // arriving armed, a run that never goes stale). Export writes columns only.
     const projectFields = pickProjectColumns(bundleFields)
 
+    // The scope columns get the create routes' rules: groups re-derived from the
+    // hosts, one targeting mode, and the hard guardrail in every mode.
+    const scope = normalizeImportedScope(projectFields)
+    if (scope.error) {
+      return NextResponse.json({ error: scope.error }, { status: scope.status ?? 400 })
+    }
+
     // Restore binary RoE document from base64 encoding
     if (roeDocumentDataBase64 && typeof roeDocumentDataBase64 === 'string') {
       projectFields.roeDocumentData = Buffer.from(roeDocumentDataBase64, 'base64')
@@ -251,6 +283,9 @@ export async function POST(request: NextRequest) {
       if (sanitized) projectFields.roeParsedJson = sanitized
       else delete projectFields.roeParsedJson
     }
+    // The OpenAPI columns create and update validate: a bad row is dropped, a
+    // number clamped, so an older or edited bundle still imports.
+    sanitizeImportedOpenApiSettings(projectFields)
 
     // Import is a SECOND creation path, and it has to apply the same rule
     // create_project does or it is the way around it. A bundle that claims a
@@ -345,6 +380,10 @@ export async function POST(request: NextRequest) {
       reports: 0,
       neo4jNodes: 0,
       neo4jRelationships: 0,
+      // Links to the global CVE / MitreData / Capec nodes re-made, and skipped
+      // (the node is not in this database, or the record failed validation).
+      neo4jReferenceLinks: 0,
+      neo4jReferenceLinksSkipped: 0,
       artifacts: 0,
     }
 
@@ -735,12 +774,16 @@ export async function POST(request: NextRequest) {
     // Import Neo4j data
     const nodesFile = zip.file('neo4j/nodes.json')
     const relsFile = zip.file('neo4j/relationships.json')
+    // Absent from bundles exported before manifest 1.1.0. Each record is
+    // validated by the restore, which only ever MATCHes a reference node.
+    const linksFile = zip.file(REFERENCE_LINKS_BUNDLE_PATH)
 
     if (nodesFile) {
       const nodes: ExportedNode[] = JSON.parse(await nodesFile.async('text'))
       const relationships: ExportedRelationship[] = relsFile
         ? JSON.parse(await relsFile.async('text'))
         : []
+      const referenceLinks: unknown = linksFile ? JSON.parse(await linksFile.async('text')) : null
 
       if (nodes.length > 0) {
         const session = getGraphSession()
@@ -766,9 +809,14 @@ export async function POST(request: NextRequest) {
           const restored = await restoreGraph(session, nodes, relationships, {
             projectId: newProject.id,
             userId,
+            ...(Array.isArray(referenceLinks) ? { referenceLinks } : {}),
           })
           stats.neo4jNodes = restored.nodes
           stats.neo4jRelationships = restored.relationships
+          if (restored.referenceLinks) {
+            stats.neo4jReferenceLinks = restored.referenceLinks.restored
+            stats.neo4jReferenceLinksSkipped = restored.referenceLinks.skipped
+          }
         } finally {
           await session.close()
         }
@@ -817,6 +865,7 @@ export async function POST(request: NextRequest) {
         ? [`This archive holds plugin files (${pluginFiles.slice(0, 3).join(', ')}${pluginFiles.length > 3 ? ', …' : ''}); plugin skill versions and plugin data are not imported.`]
         : []),
       ...skillToggleNotes,
+      ...scope.warnings,
     ]
 
     return NextResponse.json({
@@ -829,10 +878,6 @@ export async function POST(request: NextRequest) {
       excludedReason: 'Plugin skill versions and plugin data are not imported.',
     })
   } catch (error) {
-    console.error('Import failed:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Import failed' },
-      { status: 500 }
-    )
+    return internalError(error, 'Import failed')
   }
 }

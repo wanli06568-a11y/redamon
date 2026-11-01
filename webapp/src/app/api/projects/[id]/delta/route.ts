@@ -13,6 +13,9 @@
  */
 import { NextRequest, NextResponse } from 'next/server'
 import { requireEffectiveUser, requireProjectAccess } from '@/lib/access'
+import { internalError, withRouteErrors } from '@/lib/routeErrors'
+import prisma from '@/lib/prisma'
+import { SCOPE_SELECT, currentScanRoots } from '@/lib/scanCoverage'
 import { resolveVersionSelector, isCurrentSelector } from '@/lib/scanVersionAccess'
 import { captureGraphSnapshot, loadSnapshot, snapshotToGraphPayload } from '@/lib/scanSnapshot'
 import { computeReconDelta, buildDeltaOverlay } from '@/lib/reconDelta'
@@ -30,7 +33,7 @@ interface SideDescriptor {
   isCurrent: boolean
 }
 
-export async function GET(request: NextRequest, { params }: RouteParams) {
+export const GET = withRouteErrors('Failed to compute the delta', async (request: NextRequest, { params }: RouteParams) => {
   const { id } = await params
 
   const eff = await requireEffectiveUser()
@@ -98,10 +101,12 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
     const toLoaded = await load(toSel)
     if (toLoaded instanceof NextResponse) return toLoaded
 
+    // Coverage of a scan root removed since the run is not this scope's gap.
+    const scope = await prisma.project.findUnique({ where: { id }, select: SCOPE_SELECT })
     const delta = computeReconDelta(fromLoaded.data, toLoaded.data, {
       from: fromLoaded.liveNodeIds,
       to: toLoaded.liveNodeIds,
-    })
+    }, scope ? currentScanRoots(scope) : null)
 
     return NextResponse.json(
       {
@@ -115,10 +120,6 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
       { headers: { 'Cache-Control': 'private, no-cache' } }
     )
   } catch (error) {
-    console.error('[scanTimeline] delta failed:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Failed to compute the delta' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to compute the delta', { log: '[scanTimeline] delta failed' })
   }
-}
+})

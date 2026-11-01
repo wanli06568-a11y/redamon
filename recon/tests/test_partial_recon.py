@@ -1522,8 +1522,10 @@ class TestRunNmap(unittest.TestCase):
         mock_nmap_mod = MagicMock()
         mock_nmap_mod.run_nmap_scan = mock_nmap_scan
 
-        mock_main_mod = MagicMock()
-        mock_main_mod.merge_nmap_into_port_scan = mock_merge
+        # run_nmap takes the merge from recon.helpers.nmap_merge (plan 12.15:
+        # importing recon.main re-ran the pipeline's top level).
+        mock_merge_mod = MagicMock()
+        mock_merge_mod.merge_nmap_into_port_scan = mock_merge
 
         mock_graph_db = MagicMock()
         mock_graph_db.Neo4jClient = mock_neo4j_cls
@@ -1533,7 +1535,7 @@ class TestRunNmap(unittest.TestCase):
         modules_to_mock = {
             'recon.project_settings': mock_project_settings,
             'recon.main_recon_modules.nmap_scan': mock_nmap_mod,
-            'recon.main': mock_main_mod,
+            'recon.helpers.nmap_merge': mock_merge_mod,
             'graph_db': mock_graph_db,
         }
         for name, mod in modules_to_mock.items():
@@ -1724,8 +1726,8 @@ class TestRunNmapStructuredTargets(unittest.TestCase):
         mock_nmap_mod = MagicMock()
         mock_nmap_mod.run_nmap_scan = mock_nmap_scan
 
-        mock_main_mod = MagicMock()
-        mock_main_mod.merge_nmap_into_port_scan = mock_merge
+        mock_merge_mod = MagicMock()
+        mock_merge_mod.merge_nmap_into_port_scan = mock_merge
 
         mock_graph_db = MagicMock()
         mock_graph_db.Neo4jClient = mock_neo4j_cls
@@ -1734,7 +1736,7 @@ class TestRunNmapStructuredTargets(unittest.TestCase):
         modules_to_mock = {
             'recon.project_settings': mock_project_settings,
             'recon.main_recon_modules.nmap_scan': mock_nmap_mod,
-            'recon.main': mock_main_mod,
+            'recon.helpers.nmap_merge': mock_merge_mod,
             'graph_db': mock_graph_db,
         }
         for name, mod in modules_to_mock.items():
@@ -3772,7 +3774,8 @@ class TestRunJsRecon(unittest.TestCase):
     """Tests for run_jsrecon using module-level mocks."""
 
     def _run_with_mocks(self, config, neo4j_connected=True, graph_endpoints=None, graph_baseurls=None,
-                        graph_subdomains=None, settings_override=None):
+                        graph_subdomains=None, settings_override=None, graph_js_files=(),
+                        js_recon_output=None):
         """Helper that sets up all mocks and runs run_jsrecon."""
         mock_settings = MagicMock()
         mock_settings.return_value = {
@@ -3785,6 +3788,9 @@ class TestRunJsRecon(unittest.TestCase):
 
         # Mock run_js_recon: mutates combined_result by adding 'js_recon' key
         def mock_js_recon_fn(combined_result, settings=None):
+            if js_recon_output is not None:
+                combined_result['js_recon'] = js_recon_output
+                return combined_result
             combined_result['js_recon'] = {
                 'scan_metadata': {'mode': 'post_recon', 'js_files_analyzed': 3, 'duration_seconds': 5.0},
                 'secrets': [
@@ -3839,6 +3845,13 @@ class TestRunJsRecon(unittest.TestCase):
                 record.__getitem__ = lambda self, key: _graph_subdomains
                 result.single.return_value = record
                 result.__iter__ = lambda self: iter([])
+            elif "JsReconFinding" in query and "js_file" in query:
+                records = []
+                for url in graph_js_files:
+                    record = MagicMock()
+                    record.__getitem__ = lambda self, key, u=url: u
+                    records.append(record)
+                result.__iter__ = lambda self, r=records: iter(r)
             else:
                 result.__iter__ = lambda self: iter([])
                 result.single.return_value = None
@@ -3914,6 +3927,38 @@ class TestRunJsRecon(unittest.TestCase):
         mocks = self._run_with_mocks({"domain": "example.com", "user_inputs": []})
         mocks["run_js_recon"].assert_called_once()
         mocks["neo4j_client"].update_graph_from_js_recon.assert_called_once()
+
+    def test_a_run_that_found_nothing_still_stamps_its_coverage(self):
+        """Plan 09.1: "analyzed, no findings" is the answer the BaseURL stamp
+        records, so the writer runs whenever the run covered a host."""
+        coverage = {"at": "2026-10-25T08:00:00+00:00", "hosts": {"https://example.com:443": {
+            "status": "complete", "inputs": 2, "outputs": 0, "reason": None}}}
+        mocks = self._run_with_mocks({"domain": "example.com", "user_inputs": []}, js_recon_output={
+            "scan_metadata": {"js_files_analyzed": 2, "coverage": coverage},
+            "secrets": [], "endpoints": [], "summary": {}})
+        mocks["neo4j_client"].update_graph_from_js_recon.assert_called_once()
+        written = mocks["neo4j_client"].update_graph_from_js_recon.call_args.kwargs["recon_data"]
+        self.assertEqual(written["js_recon"]["scan_metadata"]["coverage"], coverage)
+
+    def test_a_run_that_covered_no_host_and_found_nothing_writes_nothing(self):
+        mocks = self._run_with_mocks({"domain": "example.com", "user_inputs": []}, js_recon_output={
+            "scan_metadata": {"js_files_analyzed": 0, "coverage": {"at": "x", "hosts": {}}},
+            "secrets": [], "endpoints": [], "summary": {}})
+        mocks["neo4j_client"].update_graph_from_js_recon.assert_not_called()
+
+    def test_js_files_a_full_run_analyzed_are_read_again(self):
+        """Plan 06.1: a bundle under /static/ never became an Endpoint (the
+        crawler's exclude list), so the graph's Endpoints alone never fed it to a
+        partial run. The js_file nodes the last run wrote name it."""
+        bundle = "https://example.com/static/js/main.4f3a.js"
+        mocks = self._run_with_mocks(
+            {"domain": "example.com", "user_inputs": []},
+            graph_js_files=[bundle, "https://example.com/static/js/main.4f3a.js.map#src/config.ts",
+                            "upload://local.js", "https://cdn.vendor-example.test/lib.js"],
+        )
+        resource_enum = mocks["run_js_recon"].call_args[0][0]["resource_enum"]
+        self.assertEqual(resource_enum["js_urls"], [bundle])
+        self.assertNotIn(bundle, resource_enum["discovered_urls"])
 
     def test_user_urls_injected(self):
         """User-provided URLs are added to JS Recon targets."""
@@ -4030,10 +4075,10 @@ class TestRunJsRecon(unittest.TestCase):
             "user_targets": {"urls": ["https://shop.partner.test/app.js"], "url_attach_to": None},
         })
         written = mocks["neo4j_client"].update_graph_from_js_recon.call_args.kwargs["recon_data"]
-        # The typed URL is kept (as web_crawling keeps it) and so is its host;
-        # without a top-level list the scope collapses to the apex alone.
-        self.assertEqual(written["subdomains"],
-                         ["example.com", "shop.partner.test", "www.example.com"])
+        # The typed URL is kept (the run's start filters typed input), but a host
+        # outside the scope never joins the writer's scope (PAR-10). Without a
+        # top-level list the scope would collapse to the apex alone.
+        self.assertEqual(written["subdomains"], ["example.com", "www.example.com"])
 
     def test_ip_mode_scope_is_the_target_ip_not_the_placeholder_subdomain(self):
         mocks = self._run_with_mocks(
@@ -4064,7 +4109,9 @@ class TestScopePartialUrls(unittest.TestCase):
             user_urls=["https://elsewhere.test/c.js", "https://example.com/a.js"],
         )
         self.assertEqual(urls, ["https://example.com/a.js", "https://elsewhere.test/c.js"])
-        self.assertEqual(hosts, ["elsewhere.test", "example.com"])
+        # A typed URL's host joins the writer's scope only when the scope admits
+        # it (PAR-10); the run's start already dropped the unscoped URL itself.
+        self.assertEqual(hosts, ["example.com"])
 
     def test_apex_needs_include_root_domain(self):
         urls, hosts = self._scope(["https://example.com/a.js", "https://api.example.com/b.js"],
@@ -4437,7 +4484,8 @@ class TestShodanMainDispatcher(unittest.TestCase):
             import partial_recon as pr
             importlib.reload(pr)
             with patch.object(pr, 'run_shodan') as mock_run, \
-                 patch.object(pr, 'get_settings', return_value=dict(_EXAMPLE_PROJECT_SETTINGS)):
+                 patch.object(pr, 'get_settings', return_value=dict(_EXAMPLE_PROJECT_SETTINGS)),\
+                 patch.object(pr, '_legacy_graph_refusal', return_value=None):
                 pr.main()
                 mock_run.assert_called_once()
                 passed = mock_run.call_args[0][0]
@@ -4543,11 +4591,15 @@ class TestRunOsintEnrichment(unittest.TestCase):
             # Patch _build_recon_data_from_graph at the submodule level (where it's actually called)
             _orig_build_recon = _osint_enrichment_mod._build_recon_data_from_graph
             _osint_enrichment_mod._build_recon_data_from_graph = MagicMock(return_value=recon_data)
+            # The IP attribution tag read has its own tests; these count the graph update.
+            _orig_ownership = _osint_enrichment_mod.attach_graph_ownership
+            _osint_enrichment_mod.attach_graph_ownership = MagicMock()
 
             try:
                 pr.run_osint_enrichment(config)
             finally:
                 _osint_enrichment_mod._build_recon_data_from_graph = _orig_build_recon
+                _osint_enrichment_mod.attach_graph_ownership = _orig_ownership
         finally:
             for name, mod in saved.items():
                 if mod is None:
@@ -5226,7 +5278,8 @@ class TestUncoverMainDispatcher(unittest.TestCase):
             import partial_recon as pr
             importlib.reload(pr)
             with patch.object(pr, 'run_uncover') as mock_run, \
-                 patch.object(pr, 'get_settings', return_value=dict(_EXAMPLE_PROJECT_SETTINGS)):
+                 patch.object(pr, 'get_settings', return_value=dict(_EXAMPLE_PROJECT_SETTINGS)),\
+                 patch.object(pr, '_legacy_graph_refusal', return_value=None):
                 pr.main()
                 mock_run.assert_called_once()
                 passed = mock_run.call_args[0][0]
@@ -5520,6 +5573,7 @@ class TestRunVhostSni(unittest.TestCase):
                 importlib.reload(pr)
                 with patch.object(pr, "run_vhost_sni_partial") as mock_runner, \
                      patch.object(pr, "_cleanup_orphan_user_inputs"), \
+                     patch.object(pr, "_legacy_graph_refusal", return_value=None), \
                      patch.object(pr, "get_settings", return_value=dict(_EXAMPLE_PROJECT_SETTINGS)):
                     pr.main()
                 mock_runner.assert_called_once()
@@ -5541,6 +5595,7 @@ class TestRunVhostSni(unittest.TestCase):
                 importlib.reload(pr)
                 with patch.object(pr, "run_vhost_sni_partial") as mock_runner, \
                      patch.object(pr, "_cleanup_orphan_user_inputs"), \
+                     patch.object(pr, "_legacy_graph_refusal", return_value=None), \
                      patch.object(pr, "get_settings", return_value=dict(_EXAMPLE_PROJECT_SETTINGS)):
                     with self.assertRaises(SystemExit) as cm:
                         pr.main()
@@ -5774,3 +5829,95 @@ class TestRunTlsx(unittest.TestCase):
         targets = self._run([], ports=(443, 993))
         self.assertNotIn(f"{self.IP}:443", targets)
         self.assertIn(f"{self.IP}:993", targets)
+
+
+class TestRunOpenAPI(unittest.TestCase):
+    """Partial OpenAPI: one engine, merged and written through resource enumeration."""
+
+    SETTINGS = {'TARGET_DOMAIN': 'example.com', 'SUBDOMAIN_LIST': ['api.'], 'OPENAPI_AUTO_DISCOVER': False,
+                'UPDATE_GRAPH_DB': True}
+    DOC = 'https://api.example.com/openapi.json'
+
+    def _payload(self, custom=True):
+        return {
+            'documents': [{'url': self.DOC, 'version': '3.0.3', 'operation_count': 1}],
+            'operations': [{'baseurl': 'https://api.example.com', 'path': '/users/{id}', 'method': 'GET',
+                            'source_url': self.DOC, 'operation_ref': '#/paths/~1users~1{id}/get',
+                            'custom': custom, 'operation': {'parameters': [
+                                {'name': 'id', 'in': 'path', 'schema': {'example': 7}}]}}],
+            'diagnostics': [], 'skipped_servers': [], 'source_status': [], 'requests': [],
+        }
+
+    def _run(self, config, settings=None, payload=None):
+        client = MagicMock()
+        client.__enter__.return_value = client
+        client.verify_connection.return_value = True
+        client.update_graph_from_resource_enum.return_value = {'errors': [], 'endpoints_created': 2}
+        discover = MagicMock(return_value=payload or self._payload())
+        with patch('recon.partial_recon_modules.helpers.partial_settings',
+                   return_value=dict(settings or self.SETTINGS)), \
+             patch('recon.helpers.openapi.discovery.run_openapi_discovery', discover), \
+             patch('graph_db.Neo4jClient', return_value=client), \
+             patch('recon.partial_recon_modules.helpers.ROOT_PAUSE_S', 0), \
+             patch.dict(os.environ, {'USER_ID': 'u1', 'PROJECT_ID': 'p1'}):
+            from recon.partial_recon_modules.openapi_recon import run_openapi_partial
+            statuses = run_openapi_partial(config)
+        return statuses, discover, client
+
+    def test_custom_urls_are_documents_and_out_of_root_ones_are_skipped(self):
+        _, discover, _ = self._run({'domains': ['example.com'], 'include_graph_targets': False,
+                                    'user_targets': {'urls': [self.DOC + '?token=fixture-secret',
+                                                              'https://elsewhere.example.org/spec']}})
+        args, kwargs = discover.call_args
+        self.assertEqual(kwargs['documents'], [self.DOC + '?token=fixture-secret'])
+        self.assertEqual(args[2], [])  # no seeds without the graph
+
+    def test_graph_off_branch_stamps_the_root_domain_scope(self):
+        _, discover, _ = self._run({'domains': ['example.com'], 'include_graph_targets': False})
+        recon_data = discover.call_args.args[0]
+        self.assertEqual(recon_data['metadata'], {'include_root_domain': False})
+        self.assertEqual(recon_data['domain'], 'example.com')
+
+    def test_writes_through_resource_enum_and_links_custom_documents(self):
+        _, _, client = self._run({'domains': ['example.com'], 'include_graph_targets': False,
+                                  'user_targets': {'urls': [self.DOC + '?token=fixture-secret']}})
+        result = client.update_graph_from_resource_enum.call_args.kwargs.get('recon_data') \
+            or client.update_graph_from_resource_enum.call_args.args[0]
+        endpoints = result['resource_enum']['by_base_url']['https://api.example.com']['endpoints']
+        self.assertTrue(endpoints['/users/7']['declared_only'])
+        self.assertNotIn('operations', result['resource_enum']['openapi'])
+        self.assertIn('api.example.com', result['subdomains'])
+        client.update_graph_from_openapi.assert_not_called()
+        user_input = client.create_user_input_node.call_args.kwargs['user_input_data']
+        self.assertEqual(user_input['values'], [self.DOC])
+        self.assertEqual(user_input['tool_id'], 'OpenAPI')
+        rows = client.driver.session.return_value.__enter__.return_value.run.call_args.kwargs['rows']
+        self.assertEqual(rows, [{'baseurl': 'https://api.example.com', 'path': '/users/7', 'method': 'GET'}])
+
+    def test_graph_declarations_get_no_user_input(self):
+        _, _, client = self._run({'domains': ['example.com'], 'include_graph_targets': False},
+                                 payload=self._payload(custom=False))
+        client.update_graph_from_resource_enum.assert_called_once()
+        client.create_user_input_node.assert_not_called()
+
+    def test_stealth_mode_runs_nothing(self):
+        statuses, discover, client = self._run({'domains': ['example.com']},
+                                               settings={**self.SETTINGS, 'STEALTH_MODE': True})
+        self.assertIsNone(statuses)
+        discover.assert_not_called()
+        client.update_graph_from_resource_enum.assert_not_called()
+
+    def test_withdrawal_runs_after_the_write_for_parsed_documents_only(self):
+        _, _, client = self._run({'domains': ['example.com'], 'include_graph_targets': False})
+        args = client.prune_withdrawn_openapi_declarations.call_args.args
+        self.assertEqual(args[:3], ('u1', 'p1', [self.DOC]))
+        self.assertEqual(args[4], {f'GET https://api.example.com/users/7': [self.DOC]})
+        calls = [c[0] for c in client.mock_calls]
+        self.assertLess(calls.index('update_graph_from_resource_enum'),
+                        calls.index('prune_withdrawn_openapi_declarations'))
+
+    def test_no_document_parsed_withdraws_nothing(self):
+        payload = self._payload()
+        payload['documents'] = []
+        _, _, client = self._run({'domains': ['example.com'], 'include_graph_targets': False}, payload=payload)
+        client.prune_withdrawn_openapi_declarations.assert_not_called()

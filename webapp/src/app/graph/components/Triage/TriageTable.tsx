@@ -32,13 +32,21 @@ import { TriageRunBanner } from '@/components/triage/TriageRunBanner'
 import { MuteButton, MultiMuteButton, useMuteNode } from '../MuteNode'
 import { NodeIdCell, NodeIdTh } from '../RedZoneTables/nodeId'
 import { TriageDetailPanel, type DetailTarget } from './TriageDetailPanel'
+import { DispositionChip } from './DispositionChip'
+import {
+  DISPOSITIONS, DISPOSITION_LABELS, readDisposition, type Disposition, type DispositionResult,
+} from '@/lib/triage/disposition'
 import {
   FACTOR_KEYS, FACTOR_NAMES, TIER_LABELS, TIER_ORDER, baseLine, changedFactors,
   decisionChip, factorEvidence, fmtWhen, formatFactor, parseFactors, personDecided,
   resetConfirmText, reviewChip, tierOf, whyText, REVIEW_VERDICT_TONE,
   type Factors, type TriageFinding, type TriageTier, type VerdictResult, type VerdictStatus,
 } from './triageLayers'
+import { triageBodyErrorText } from '@/lib/triage/errorText'
+import { toApiError } from '@/lib/apiError'
 import styles from './TriageTable.module.css'
+
+const BOARD_LOAD_FAILED = 'The Priority Board could not be loaded'
 
 export type { TriageFinding, TriageStatus, TriageTier } from './triageLayers'
 export { TIER_LABELS } from './triageLayers'
@@ -223,6 +231,7 @@ export function TriageTable({ projectId, onViewMuted }: TriageTableProps) {
   const [latestRunId, setLatestRunId] = useState<string | null>(null)
   const [tierFilter, setTierFilter] = useState<TriageTier | 'all'>('all')
   const [boardFilter, setBoardFilter] = useState<BoardFilter | null>(null)
+  const [dispositionFilter, setDispositionFilter] = useState<Disposition | 'all'>('all')
   const [rowErrors, setRowErrors] = useState<Record<string, { message: string; reload: boolean }>>({})
   const [selected, setSelected] = useState<DetailTarget | null>(null)
   const [showProgress, setShowProgress] = useState(false)
@@ -247,7 +256,9 @@ export function TriageTable({ projectId, onViewMuted }: TriageTableProps) {
       const query = new URLSearchParams({ projectId })
       if (boardFilter) query.set(boardFilter.param, boardFilter.value)
       const f = await fetch(`/api/triage/findings?${query.toString()}`)
-      if (!f.ok) throw new Error((await f.json().catch(() => ({}))).error || `Findings: ${f.status}`)
+      if (!f.ok) {
+        throw new Error(triageBodyErrorText(await f.json().catch(() => ({})), f.status, BOARD_LOAD_FAILED))
+      }
       const findingsBody = await f.json()
       if (seq !== loadSeqRef.current) return
       setFindings(findingsBody.findings ?? [])
@@ -257,7 +268,9 @@ export function TriageTable({ projectId, onViewMuted }: TriageTableProps) {
       setRowErrors({})
     } catch (e) {
       if (seq !== loadSeqRef.current) return
-      setError(e instanceof Error ? e.message : 'Failed to load Priority Board data')
+      // A TypeError is fetch getting no answer at all; its "Failed to fetch" says nothing.
+      setError(e instanceof Error && !(e instanceof TypeError)
+        ? e.message : toApiError(e, BOARD_LOAD_FAILED).message)
     } finally {
       if (seq === loadSeqRef.current) setLoading(false)
     }
@@ -270,6 +283,7 @@ export function TriageTable({ projectId, onViewMuted }: TriageTableProps) {
   useEffect(() => {
     setSelected(null)
     setBoardFilter(null)
+    setDispositionFilter('all')
   }, [projectId])
 
   // Triage is a run of the CypherFix pipeline (score -> group -> review ->
@@ -352,6 +366,19 @@ export function TriageTable({ projectId, onViewMuted }: TriageTableProps) {
     [muteNode, load],
   )
 
+  /** Each loaded row's disposition (lib/triage/disposition.ts), read once per
+   *  load from the props the row carries. Null for a row it cannot read. */
+  const dispositions = useMemo(
+    () => new Map<string, DispositionResult | null>(findings.map(f => [rowKey(f), readDisposition(f)])),
+    [findings])
+
+  /** Loaded rows per disposition, for the filter's counts. */
+  const dispositionCounts = useMemo(() => {
+    const c: Partial<Record<Disposition, number>> = {}
+    for (const d of dispositions.values()) if (d) c[d.disposition] = (c[d.disposition] ?? 0) + 1
+    return c
+  }, [dispositions])
+
   /**
    * The board's four sections, in their fixed order.
    *
@@ -360,12 +387,13 @@ export function TriageTable({ projectId, onViewMuted }: TriageTableProps) {
    * order as it arrived and never re-sorts: a client sort with its own idea of
    * severity is how the board and the server came to disagree (U8). A tier
    * filter keeps RANKED rows only, since an unscored row has no tier (U6).
+   * The disposition filter, like the tier chips, narrows the loaded rows.
    */
   const sections = useMemo(() => {
-    const rows = tierFilter === 'all'
-      ? findings
-      : findings.filter(f =>
-        (f.section ?? SECTION_NOT_TRIAGED) === SECTION_RANKED && tierOf(f) === tierFilter)
+    const rows = findings.filter(f =>
+      (tierFilter === 'all' ||
+        ((f.section ?? SECTION_NOT_TRIAGED) === SECTION_RANKED && tierOf(f) === tierFilter)) &&
+      (dispositionFilter === 'all' || dispositions.get(rowKey(f))?.disposition === dispositionFilter))
 
     const bySection = new Map<number, TriageFinding[]>()
     for (const f of rows) {
@@ -378,7 +406,7 @@ export function TriageTable({ projectId, onViewMuted }: TriageTableProps) {
             SECTION_RESOLVED]
       .map(key => ({ key, rows: bySection.get(key) ?? [] }))
       .filter(section => section.rows.length > 0)
-  }, [findings, tierFilter])
+  }, [findings, tierFilter, dispositionFilter, dispositions])
 
   const visible = useMemo(
     () => sections.flatMap(section => section.rows), [sections])
@@ -450,7 +478,7 @@ export function TriageTable({ projectId, onViewMuted }: TriageTableProps) {
             message: res.status === 404
               ? 'This finding is no longer on the board: a rescan or a version switch ' +
                 'replaced it. Reload to see the current list.'
-              : body.error || 'The verdict could not be saved.',
+              : triageBodyErrorText(body, res.status, 'The verdict could not be saved.'),
           }
         }
         const row = body.row as TriageFinding | null | undefined
@@ -463,8 +491,8 @@ export function TriageTable({ projectId, onViewMuted }: TriageTableProps) {
         toast.success(VERDICT_TOASTS[status] +
           (body.rescored === false ? ' The score follows at the next run.' : ''))
         return { ok: true }
-      } catch {
-        return { ok: false, message: 'The verdict could not be saved: the server did not answer.' }
+      } catch (e) {
+        return { ok: false, message: toApiError(e, 'The verdict could not be saved: the server did not answer.').message }
       }
     },
     [projectId, dangerConfirm, toast, load],
@@ -586,6 +614,19 @@ export function TriageTable({ projectId, onViewMuted }: TriageTableProps) {
               </optgroup>
             ))}
           </select>
+          <select
+            className={`${styles.filterSelect} ${dispositionFilter !== 'all' ? styles.filterSelectActive : ''}`}
+            aria-label="Disposition"
+            value={dispositionFilter === 'all' ? '' : dispositionFilter}
+            onChange={e => setDispositionFilter((e.target.value || 'all') as Disposition | 'all')}
+            title={'Filter by whether a finding can go in a report. Applies to the findings ' +
+              'loaded here, like the tier chips.'}
+          >
+            <option value="">Disposition: any ({findings.length})</option>
+            {DISPOSITIONS.map(d => (
+              <option key={d} value={d}>{DISPOSITION_LABELS[d]} ({dispositionCounts[d] ?? 0})</option>
+            ))}
+          </select>
           <button
             className={`${styles.chip} ${tierFilter === 'all' ? styles.chipActive : ''}`}
             onClick={() => setTierFilter('all')}
@@ -663,6 +704,7 @@ export function TriageTable({ projectId, onViewMuted }: TriageTableProps) {
                       <th>#</th>
                       <th>Finding</th>
                       <th>Type</th>
+                      <th>Disposition</th>
                       <th>Score</th>
                       <th>Decided by</th>
                       <th>Signals</th>
@@ -722,6 +764,9 @@ export function TriageTable({ projectId, onViewMuted }: TriageTableProps) {
                             )}
                           </td>
                           <td>{f.label}</td>
+                          <td className={styles.dispositionCell}>
+                            <DispositionChip result={dispositions.get(key) ?? null} />
+                          </td>
                           <td className={styles.scoreCell}>
                             {score === null || score === undefined ? (
                               <span className={styles.confidence}>-</span>

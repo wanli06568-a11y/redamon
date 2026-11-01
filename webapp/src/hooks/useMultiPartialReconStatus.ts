@@ -2,7 +2,8 @@
 
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import type { PartialReconState, PartialReconStatus, PartialReconParams } from '@/lib/recon-types'
-import type { ScanStartError } from '@/lib/scanStartError'
+import { readScanStartError, scanStartNetworkError, type ScanStartError } from '@/lib/scanStartError'
+import { formatApiError, readApiError, toApiError } from '@/lib/apiError'
 
 interface UseMultiPartialReconStatusOptions {
   projectId: string | null
@@ -54,10 +55,7 @@ export function useMultiPartialReconStatus({
 
     try {
       const response = await fetch(`/api/recon/${projectId}/partial/all`)
-      if (!response.ok) {
-        const data = await response.json().catch(() => ({}))
-        throw new Error(data.error || 'Failed to fetch partial recon statuses')
-      }
+      if (!response.ok) throw await readApiError(response, 'Partial recon list unavailable')
 
       const data = await response.json()
       const newRuns: PartialReconState[] = data.runs || []
@@ -84,8 +82,8 @@ export function useMultiPartialReconStatus({
       previousStatusesRef.current = newStatuses
 
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : 'Unknown error'
-      setError(errorMessage)
+      // The runs already listed stay: a failed read says nothing about them.
+      setError(toApiError(err, 'Partial recon list unavailable').message)
     }
   }, [projectId])
 
@@ -104,9 +102,8 @@ export function useMultiPartialReconStatus({
       })
 
       if (!response.ok) {
-        const data = await response.json().catch(() => ({}))
-        lastStartErrorRef.current = { message: data.error || 'Failed to start partial recon', limit: data.limit, status: response.status }
-        throw new Error(data.error || 'Failed to start partial recon')
+        lastStartErrorRef.current = await readScanStartError(response, 'Failed to start partial recon')
+        throw new Error(lastStartErrorRef.current.message)
       }
 
       const data: PartialReconState = await response.json()
@@ -116,8 +113,9 @@ export function useMultiPartialReconStatus({
       return data
 
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : 'Unknown error'
-      if (!lastStartErrorRef.current) lastStartErrorRef.current = { message: errorMessage }
+      if (!lastStartErrorRef.current) lastStartErrorRef.current = scanStartNetworkError(err, 'Failed to start partial recon')
+      const last = lastStartErrorRef.current
+      const errorMessage = formatApiError({ reason: last.message, code: last.code, status: last.status ?? 0, upstreamStatus: last.upstreamStatus })
       setError(errorMessage)
       onRunErrorRef.current?.('', errorMessage)
       return null
@@ -142,22 +140,25 @@ export function useMultiPartialReconStatus({
         method: 'POST',
       })
 
-      if (!response.ok) {
-        const data = await response.json().catch(() => ({}))
-        throw new Error(data.error || 'Failed to stop partial recon')
-      }
+      if (!response.ok) throw await readApiError(response, 'Failed to stop partial recon')
 
       const data: PartialReconState = await response.json()
-      // Remove from list since backend deletes it on stop
-      setRuns(prev => prev.filter(r => r.run_id !== runId))
-      delete previousStatusesRef.current[runId]
+      if (data.status === 'stopping') {
+        // The run drains its graph writes and applies the mute rules first, so
+        // it stays listed as stopping until a poll finds it gone.
+        setRuns(prev => prev.map(r => (r.run_id === runId ? { ...r, ...data } : r)))
+      } else {
+        setRuns(prev => prev.filter(r => r.run_id !== runId))
+        delete previousStatusesRef.current[runId]
+      }
       return data
 
     } catch (err) {
-      const errorMessage = err instanceof Error ? err.message : 'Unknown error'
-      setError(errorMessage)
-      // Revert optimistic update
+      const errorMessage = toApiError(err, 'Failed to stop partial recon').message
+      // Revert optimistic update. A successful refetch clears the error, so the
+      // stop's reason is set after it.
       await fetchAllStatuses()
+      setError(errorMessage)
       return null
     }
   }, [projectId, fetchAllStatuses])

@@ -4,7 +4,10 @@ import { requireEffectiveUser } from '@/lib/access'
 import { reconPresetSchema, extractJson, RECON_PARAMETER_CATALOG } from '@/lib/recon-preset-schema'
 import { assertSafeLlmBaseUrl, BaseUrlValidationError } from '@/lib/llm-url-guard'
 import { readFeatureModel, featureModelErrorResponse } from '@/lib/featureModels'
+import { readFeatureModelCode } from '@/lib/llmFeatures'
+import { safeErrorCode } from '@/lib/routeErrors'
 import { isChatProvider } from '@/lib/llmProviderKinds'
+import { builtinSendsTemperature, customSendsTemperature, rejectsTemperature } from '@/lib/llmTemperature'
 
 // ---------------------------------------------------------------------------
 // POST /api/presets/generate
@@ -32,6 +35,7 @@ RULES:
 - Numbers must be plain integers or floats (not strings).
 - Arrays must use JSON array syntax.
 - Do NOT include target-specific fields (targetDomain, subdomainList, ipMode, etc.).
+- Do NOT include OpenAPI source URLs or the project Authenticated Session profile; they are target-specific and may contain credentials.
 - Do NOT include agent behaviour, attack skills, RoE, or CypherFix fields.
 - Focus on enabling/disabling tools and tuning their numeric settings to match the user's intent.
 
@@ -105,8 +109,38 @@ interface OpenAICompatOptions {
   extraHeaders?: Record<string, string>
   timeout?: number
   temperature?: number
+  /** False for a model that rejects `temperature`: the field is then left out. */
+  sendTemperature: boolean
   maxTokens?: number
   sslVerify?: boolean
+}
+
+/**
+ * POST a chat request and return the parsed reply.
+ *
+ * A 400 that names `temperature` is retried once without it: the lists in
+ * llmTemperature.ts only know today's model families, and this is the same
+ * self-heal the agent's llm_retry.py applies to a model they miss.
+ */
+async function postChat(
+  provider: string,
+  url: string,
+  init: RequestInit & { dispatcher?: unknown },
+  payload: Record<string, unknown>,
+  temperature: number | undefined,
+): Promise<unknown> {
+  const send = (withTemperature: boolean) => fetch(url, {
+    ...init,
+    body: JSON.stringify(withTemperature ? { ...payload, temperature } : payload),
+  })
+  let res = await send(temperature !== undefined)
+  if (!res.ok && temperature !== undefined) {
+    const text = await res.text().catch(() => '')
+    if (!rejectsTemperature(res.status, text)) throw providerError(provider, res.status, text)
+    res = await send(false)
+  }
+  if (!res.ok) throw providerError(provider, res.status, await res.text().catch(() => ''))
+  return res.json()
 }
 
 /**
@@ -129,17 +163,16 @@ async function callOpenAICompatible(opts: OpenAICompatOptions): Promise<string> 
       'Authorization': `Bearer ${opts.apiKey}`,
       ...opts.extraHeaders,
     },
-    body: JSON.stringify({
-      model: opts.modelId,
-      messages: [
-        { role: 'system', content: opts.systemPrompt },
-        { role: 'user', content: opts.userPrompt },
-      ],
-      temperature: opts.temperature ?? 0.3,
-      max_tokens: opts.maxTokens ?? 4096,
-      response_format: { type: 'json_object' },
-    }),
     signal: controller.signal,
+  }
+  const payload = {
+    model: opts.modelId,
+    messages: [
+      { role: 'system', content: opts.systemPrompt },
+      { role: 'user', content: opts.userPrompt },
+    ],
+    max_tokens: opts.maxTokens ?? 4096,
+    response_format: { type: 'json_object' },
   }
 
   // SSL bypass for internal endpoints with self-signed certs (mirrors
@@ -150,29 +183,48 @@ async function callOpenAICompatible(opts: OpenAICompatOptions): Promise<string> 
   }
 
   try {
-    const res = await fetch(`${opts.baseUrl}/chat/completions`, init)
-
-    if (!res.ok) throw await providerError('LLM', res)
-
-    const data = await res.json()
+    const data = await postChat(
+      'LLM', `${opts.baseUrl}/chat/completions`, init, payload,
+      opts.sendTemperature ? (opts.temperature ?? 0.3) : undefined,
+    ) as { choices?: { message?: { content?: string } }[] }
     return data.choices?.[0]?.message?.content ?? ''
   } finally {
     clearTimeout(timer)
   }
 }
 
+class ProviderHttpError extends Error {
+  constructor(provider: string, readonly status: number, readonly kind: string | undefined) {
+    super(`${provider} API returned ${status}: ${kind ?? 'no error code'}`)
+    this.name = 'ProviderHttpError'
+  }
+}
+
 /**
- * A provider's refusal as something safe to log: the status and, when the body
- * is JSON, its short error type or code. Never the body's text: a 401 body can
+ * A provider's refusal as something safe to log and show: the status and, when the
+ * body is JSON, its short error type or code. Never the body's text: a 401 body can
  * quote part of the key it refused.
  */
-async function providerError(provider: string, res: Response): Promise<Error> {
-  const body: unknown = await res.json().catch(() => null)
+function providerError(provider: string, status: number, text: string): ProviderHttpError {
+  let body: unknown = null
+  try { body = JSON.parse(text) } catch { /* not JSON: the status alone is logged */ }
   const error = body && typeof body === 'object' ? (body as { error?: unknown }).error : null
   const fields = error && typeof error === 'object' ? error as { type?: unknown; code?: unknown } : {}
   const kind = [fields.type, fields.code].find(
     (v): v is string => typeof v === 'string' && /^[A-Za-z0-9_.-]{1,60}$/.test(v))
-  return new Error(`${provider} API returned ${res.status}: ${kind ?? 'no error code'}`)
+  return new ProviderHttpError(provider, status, kind)
+}
+
+// OpenSSL names a certificate failure (DEPTH_ZERO_SELF_SIGNED_CERT, CERT_HAS_EXPIRED) in
+// undici's `cause`, in a shape safeErrorCode does not take for an errno; without it a
+// self-signed custom base URL would read as a bare TypeError.
+const OPENSSL_CODE = /^[A-Z][A-Z0-9_]{2,60}$/
+
+function failureCode(error: unknown): string {
+  const code = safeErrorCode(error)
+  if (code !== 'TypeError') return code
+  const nested = (error as { cause?: { code?: unknown } }).cause?.code
+  return typeof nested === 'string' && OPENSSL_CODE.test(nested) ? nested : code
 }
 
 /**
@@ -191,27 +243,22 @@ async function callAnthropic(
   const timer = setTimeout(() => controller.abort(), (timeout || 120) * 1000)
 
   try {
-    const res = await fetch('https://api.anthropic.com/v1/messages', {
+    const data = await postChat('Anthropic', 'https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'x-api-key': apiKey,
         'anthropic-version': '2023-06-01',
       },
-      body: JSON.stringify({
-        model: modelId,
-        system: systemPrompt,
-        messages: [{ role: 'user', content: userPrompt }],
-        max_tokens: maxTokens ?? 4096,
-        temperature: temperature ?? 0.3,
-      }),
       signal: controller.signal,
-    })
-
-    if (!res.ok) throw await providerError('Anthropic', res)
-
-    const data = await res.json()
-    const textBlock = data.content?.find((b: { type: string }) => b.type === 'text')
+    }, {
+      model: modelId,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: userPrompt }],
+      max_tokens: maxTokens ?? 4096,
+    }, builtinSendsTemperature('anthropic', modelId) ? (temperature ?? 0.3) : undefined,
+    ) as { content?: { type: string; text?: string }[] }
+    const textBlock = data.content?.find((b) => b.type === 'text')
     return textBlock?.text ?? ''
   } finally {
     clearTimeout(timer)
@@ -301,6 +348,7 @@ export async function POST(request: NextRequest) {
         extraHeaders,
         timeout: provider.timeout,
         temperature: provider.temperature,
+        sendTemperature: customSendsTemperature(provider.providerType, apiModel),
         maxTokens: provider.maxTokens,
         sslVerify: provider.sslVerify,
       })
@@ -353,6 +401,7 @@ export async function POST(request: NextRequest) {
           extraHeaders,
           timeout: provider.timeout,
           temperature: provider.temperature,
+          sendTemperature: builtinSendsTemperature(providerType, modelId),
           maxTokens: provider.maxTokens,
           sslVerify: provider.sslVerify,
         })
@@ -399,7 +448,7 @@ export async function POST(request: NextRequest) {
 
     if (error instanceof Error && error.name === 'AbortError') {
       return NextResponse.json(
-        { error: 'LLM request timed out. Try a simpler description or check your provider settings.' },
+        { error: 'LLM request timed out. Try a simpler description or check your provider settings.', code: 'timeout' },
         { status: 504 },
       )
     }
@@ -407,14 +456,26 @@ export async function POST(request: NextRequest) {
     console.error('Preset generation failed:', message)
     // A refused key or an unknown model opens the model picker. Neither the
     // log nor the answer carries the provider's own text (`providerError`).
-    if (/API returned (401|403|404):/.test(message)) {
+    if (error instanceof ProviderHttpError && [401, 403, 404].includes(error.status)) {
       return featureModelErrorResponse('model_unavailable', 'preset_generator', {
         model: savedModel || undefined,
       })
     }
-    const status = /API returned (\d{3}):/.exec(message)?.[1]
+    if (error instanceof ProviderHttpError) {
+      // The provider's own type (insufficient_quota, overloaded_error) says why; one that
+      // reads as a model-gate code would open the picker for a model that is fine.
+      const kind = error.kind && !readFeatureModelCode({ code: error.kind }) ? error.kind : undefined
+      return NextResponse.json(
+        {
+          error: `The model provider answered ${error.status}. Try again in a moment.`,
+          code: kind ?? 'provider_error',
+          upstreamStatus: error.status,
+        },
+        { status: 502 },
+      )
+    }
     return NextResponse.json(
-      { error: status ? `The model provider answered ${status}. Try again in a moment.` : 'Failed to generate preset. The details are in the webapp log.' },
+      { error: 'Failed to generate preset. The details are in the webapp log.', code: failureCode(error) },
       { status: 502 },
     )
   }

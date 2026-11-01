@@ -3,6 +3,8 @@ import { rowCap } from '../rowCap'
 import { guardProject } from '@/lib/access'
 import { getGraphSession } from '@/app/api/graph/neo4j'
 import { notMuted } from '@/lib/graphMute'
+import { reportCountable } from '@/lib/triage/reportable'
+import { internalError } from '@/lib/routeErrors'
 
 /**
  * Supply-Chain SCA: the Package / MalPackageFinding / Vulnerability model that
@@ -75,7 +77,7 @@ export async function GET(request: NextRequest) {
     // --- verdicts: MalPackageFinding joined to its package + anchors ---------
     const verdicts = await session.run(
       `MATCH (p:Package {project_id: $pid})-[:FLAGGED_AS]->(f:MalPackageFinding {project_id: $pid})
-       WHERE ${notMuted('f')}
+       WHERE ${notMuted('f')} AND ${reportCountable('f')}
        WITH p, f,${ANCHORS}
        RETURN toString(id(f))   AS nodeId,
               f.finding_id      AS findingId,
@@ -121,9 +123,9 @@ export async function GET(request: NextRequest) {
       `MATCH (p:Package {project_id: $pid})
        WITH p,${ANCHORS},
             [(p)-[:FLAGGED_AS]->(f:MalPackageFinding)
-              WHERE f.project_id = $pid AND ${notMuted('f')} | f] AS findings,
+              WHERE f.project_id = $pid AND ${notMuted('f')} AND ${reportCountable('f')} | f] AS findings,
             [(p)-[:HAS_VULNERABILITY]->(v:Vulnerability)
-              WHERE v.project_id = $pid AND ${notMuted('v')} | v] AS vulns
+              WHERE v.project_id = $pid AND ${notMuted('v')} AND ${reportCountable('v')} | v] AS vulns
        RETURN toString(id(p)) AS nodeId,
               p.purl        AS purl,
               p.name        AS name,
@@ -152,7 +154,7 @@ export async function GET(request: NextRequest) {
     // nuclei and the GraphQL scanner also write into.
     const advisories = await session.run(
       `MATCH (p:Package {project_id: $pid})-[:HAS_VULNERABILITY]->(v:Vulnerability {project_id: $pid})
-       WHERE v.source = 'osv' AND ${notMuted('v')}
+       WHERE v.source = 'osv' AND ${notMuted('v')} AND ${reportCountable('v')}
        WITH p, v,${ANCHORS}
        RETURN toString(id(v)) AS nodeId,
               v.id           AS advisoryId,
@@ -183,7 +185,7 @@ export async function GET(request: NextRequest) {
 
     const verdictTotals = await session.run(
       `MATCH (:Package {project_id: $pid})-[:FLAGGED_AS]->(f:MalPackageFinding {project_id: $pid})
-       WHERE ${notMuted('f')}
+       WHERE ${notMuted('f')} AND ${reportCountable('f')}
        RETURN f.verdict AS verdict, ${NOT_ANALYSED} AS notAnalysed, count(*) AS c`,
       { pid })
 
@@ -310,9 +312,7 @@ export async function GET(request: NextRequest) {
       },
     })
   } catch (error) {
-    console.error('Red-zone supplyChainSca error:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Query failed' }, { status: 500 })
+    return internalError(error, 'Query failed', { log: 'Red-zone supplyChainSca error' })
   } finally {
     await session.close()
   }

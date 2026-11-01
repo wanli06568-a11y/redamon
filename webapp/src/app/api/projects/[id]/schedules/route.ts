@@ -14,6 +14,8 @@ import {
   ScheduleValidationError,
 } from '@/lib/scanSchedule'
 import { fetchScanEnvelope } from '@/lib/scanEnvelope'
+import { scopeStartProblem } from '@/lib/scopeGroups'
+import { internalError, withRouteErrors } from '@/lib/routeErrors'
 
 interface RouteParams {
   params: Promise<{ id: string }>
@@ -24,7 +26,7 @@ interface RouteParams {
 // finished queue jobs) is capped, then merged and re-capped newest-first.
 const JOB_HISTORY_LIMIT = 1000
 
-export async function GET(_request: NextRequest, { params }: RouteParams) {
+export const GET = withRouteErrors('Failed to list schedules', async (_request: NextRequest, { params }: RouteParams) => {
   const { id } = await params
   const eff = await requireEffectiveUser()
   if (eff instanceof NextResponse) return eff
@@ -117,15 +119,11 @@ export async function GET(_request: NextRequest, { params }: RouteParams) {
       { headers: { 'Cache-Control': 'private, no-cache' } }
     )
   } catch (error) {
-    console.error('[scanTimeline] schedule list failed:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Failed to list schedules' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to list schedules', { log: '[scanTimeline] schedule list failed' })
   }
-}
+})
 
-export async function POST(request: NextRequest, { params }: RouteParams) {
+export const POST = withRouteErrors('Failed to create the schedule', async (request: NextRequest, { params }: RouteParams) => {
   const { id } = await params
   const eff = await requireEffectiveUser()
   if (eff instanceof NextResponse) return eff
@@ -142,6 +140,27 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       return NextResponse.json({ error: err.message }, { status: 400 })
     }
     throw err
+  }
+
+  // An enabled schedule on a scope the current rules refuse would only be
+  // refused and paused at its first run; say so now, as re-enabling one does.
+  // A disabled one may be created, to be enabled after the target is fixed.
+  if (validated.enabled) {
+    const project = await prisma.project.findUnique({
+      where: { id },
+      select: { ipMode: true, domainBatchMode: true, domainBatchHosts: true, targetDomain: true, subdomainList: true },
+    })
+    const problem = project ? scopeStartProblem(project) : null
+    if (problem) {
+      return NextResponse.json(
+        {
+          error: `${problem.message} Edit the target list, then create this schedule.`,
+          code: 'scope_invalid',
+          invalidEntries: problem.invalid,
+        },
+        { status: 422 },
+      )
+    }
   }
 
   try {
@@ -212,10 +231,6 @@ export async function POST(request: NextRequest, { params }: RouteParams) {
       },
     })
   } catch (error) {
-    console.error('[scanTimeline] schedule create failed:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Failed to create the schedule' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to create the schedule', { log: '[scanTimeline] schedule create failed' })
   }
-}
+})

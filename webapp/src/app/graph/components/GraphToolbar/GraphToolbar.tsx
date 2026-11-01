@@ -6,6 +6,8 @@ import { Toggle, WikiInfoButton } from '@/components/ui'
 import type { ReconStatus, GvmStatus, GithubHuntStatus, TrufflehogStatus, PartialReconState } from '@/lib/recon-types'
 import { PartialReconBadges } from '@/components/PartialReconBadges'
 import { VersionSwitch } from '../VersionSwitch'
+import { ScanStatusWarning } from '@/components/scans/ScanStatusWarning'
+import { GVM_NOT_INSTALLED } from '@/components/scans/scanErrors'
 import type { ScanVersionSummary } from '../../hooks/useScanVersions'
 import styles from './GraphToolbar.module.css'
 
@@ -20,8 +22,10 @@ interface GraphToolbarProps {
   onOpenFileSystem?: () => void
   isFileSystemOpen?: boolean
   // Target info
-  targetDomain?: string
-  subdomainList?: string[]
+  /** One line naming the target (projectTargetLabel). */
+  targetLabel?: string
+  /** One line per scope group, shown on hover. */
+  scopeLines?: string[]
   // Recon props
   onStartRecon?: () => void
   onPauseRecon?: () => void
@@ -31,9 +35,13 @@ interface GraphToolbarProps {
   onToggleLogs?: () => void
   reconStatus?: ReconStatus
   hasReconData?: boolean
+  /** Set when the data check itself failed, so the disabled download does not claim "no data". */
+  reconDataError?: string | null
   isLogsOpen?: boolean
   // GVM props
   gvmAvailable?: boolean
+  /** The GVM button's tooltip while unavailable: not installed, or the check itself failed. */
+  gvmUnavailableReason?: string
   onStartGvm?: () => void
   onPauseGvm?: () => void
   onResumeGvm?: () => void
@@ -42,7 +50,10 @@ interface GraphToolbarProps {
   onToggleGvmLogs?: () => void
   gvmStatus?: GvmStatus
   hasGvmData?: boolean
+  gvmDataError?: string | null
   isGvmLogsOpen?: boolean
+  /** One entry per scan whose status could not be read; the buttons then show the last known state. */
+  scanStatusErrors?: Array<string | null | undefined>
   // GitHub Hunt props
   onStartGithubHunt?: () => void
   onPauseGithubHunt?: () => void
@@ -108,8 +119,8 @@ export function GraphToolbar({
   onOpenFileSystem,
   isFileSystemOpen = false,
   // Target info
-  targetDomain,
-  subdomainList = [],
+  targetLabel,
+  scopeLines = [],
   // Recon props
   onStartRecon,
   onPauseRecon,
@@ -119,9 +130,11 @@ export function GraphToolbar({
   onToggleLogs,
   reconStatus = 'idle',
   hasReconData = false,
+  reconDataError = null,
   isLogsOpen = false,
   // GVM props
   gvmAvailable = true,
+  gvmUnavailableReason = '',
   onStartGvm,
   onPauseGvm,
   onResumeGvm,
@@ -130,7 +143,9 @@ export function GraphToolbar({
   onToggleGvmLogs,
   gvmStatus = 'idle',
   hasGvmData = false,
+  gvmDataError = null,
   isGvmLogsOpen = false,
+  scanStatusErrors = [],
   // GitHub Hunt props
   onStartGithubHunt,
   onPauseGithubHunt,
@@ -206,21 +221,20 @@ export function GraphToolbar({
     <div className={styles.toolbar}>
       <WikiInfoButton target="graph" title="Open Red Zone wiki page" />
 
-      {targetDomain && (
+      {targetLabel && (
         <>
           <div className={styles.divider} />
           <div className={styles.targetSection}>
-            {subdomainList.length > 0 && (
+            {scopeLines.length > 0 ? (
               <div className={styles.subdomainWrapper}>
-                <span className={styles.subdomainList}>
-                  {subdomainList.join(', ')}
-                </span>
+                <span className={styles.targetDomain}>{targetLabel}</span>
                 <div className={styles.subdomainTooltip}>
-                  {subdomainList.join(', ')}
+                  {scopeLines.map(line => <div key={line}>{line}</div>)}
                 </div>
               </div>
+            ) : (
+              <span className={styles.targetDomain}>{targetLabel}</span>
             )}
-            <span className={styles.targetDomain}>{targetDomain}</span>
           </div>
         </>
       )}
@@ -350,7 +364,7 @@ export function GraphToolbar({
                 className={styles.downloadButton}
                 onClick={onDownloadJSON}
                 disabled={!hasReconData || isReconActive || viewingPastVersion}
-                title={viewingPastVersion ? 'Download reflects the active version, not this saved view' : hasReconData ? 'Download Recon JSON' : 'No data available'}
+                title={viewingPastVersion ? 'Download reflects the active version, not this saved view' : hasReconData ? 'Download Recon JSON' : reconDataError || 'No data available'}
               >
                 <Download size={14} />
               </button>
@@ -378,7 +392,7 @@ export function GraphToolbar({
                     : isActivatingVersion
                     ? 'A version activation is in progress'
                     : !gvmAvailable
-                    ? 'GVM is not installed. Run ./redamon.sh install --gvm to enable vulnerability scanning'
+                    ? gvmUnavailableReason || GVM_NOT_INSTALLED
                     : stealthMode && !isGvmPaused
                     ? 'GVM scanning is disabled in Stealth Mode (generates ~50,000 active probes per target)'
                     : !hasReconData && !isGvmPaused
@@ -436,7 +450,7 @@ export function GraphToolbar({
                 className={styles.downloadButton}
                 onClick={onDownloadGvmJSON}
                 disabled={!hasGvmData || isGvmActive || viewingPastVersion}
-                title={viewingPastVersion ? 'Download reflects the active version, not this saved view' : hasGvmData ? 'Download GVM JSON' : 'No GVM data available'}
+                title={viewingPastVersion ? 'Download reflects the active version, not this saved view' : hasGvmData ? 'Download GVM JSON' : gvmDataError || 'No GVM data available'}
               >
                 <Download size={14} />
               </button>
@@ -457,6 +471,8 @@ export function GraphToolbar({
                 <span>{(isGithubHuntBusy || isTrufflehogBusy) ? 'Scanning...' : 'Other Scans'}</span>
               </button>
             </div>
+
+            <ScanStatusWarning errors={scanStatusErrors} />
           </>
         )}
 

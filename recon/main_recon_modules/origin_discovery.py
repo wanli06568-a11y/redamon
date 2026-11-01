@@ -44,7 +44,13 @@ except Exception:  # pragma: no cover - dependency guaranteed by the image
 
 from recon.main_recon_modules.ip_filter import is_non_routable_ip, is_url_safe_to_probe
 from recon.helpers.roe_scope import _is_roe_excluded
-from recon.helpers.cdn_ranges import is_reliable_edge_cdn_name
+from recon.helpers.cdn_ranges import edge_cdn_for_ip, edge_from_headers, is_reliable_edge_cdn_name
+from recon.helpers.peer_cert import (
+    cert_covers as _cert_covers,
+    tls_failure_reason as _tls_failure_reason,
+    tls_handshake_cert as _tls_handshake_cert,
+)
+from recon.helpers.public_suffix import org_domain
 
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -77,51 +83,8 @@ _TLS_PORTS = {443, 8443, 9443}
 # MX hosts belonging to managed mail providers never point at the origin.
 _MX_SKIP_VENDORS = ("google", "outlook", "microsoft", "mimecast", "proofpoint", "barracuda", "pphosted")
 
-# Known CDN/WAF IP ranges — a candidate inside one is the edge, not the origin
-# (ported from unwaf waf.go wafCIDRs; broader than RedAmon's Cloudflare-only
-# prefix layer, so used in addition to the combined_result is_cdn flags).
-_WAF_CDN_CIDRS = [
-    # Cloudflare
-    "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
-    "104.16.0.0/13", "104.24.0.0/14", "108.162.192.0/18",
-    "131.0.72.0/22", "141.101.64.0/18", "162.158.0.0/15",
-    "172.64.0.0/13", "173.245.48.0/20", "188.114.96.0/20",
-    "190.93.240.0/20", "197.234.240.0/22", "198.41.128.0/17",
-    "2400:cb00::/32", "2606:4700::/32", "2803:f800::/32",
-    "2405:b500::/32", "2405:8100::/32", "2a06:98c0::/29", "2c0f:f248::/32",
-    # Akamai
-    "23.0.0.0/12", "104.64.0.0/10", "2600:1400::/24", "2600:1480::/24",
-    # Fastly
-    "151.101.0.0/16", "2a04:4e40::/32", "2a04:4e42::/32",
-    # Imperva / Incapsula
-    "199.83.128.0/21", "198.143.32.0/19",
-    # Sucuri
-    "192.88.134.0/23", "185.93.228.0/22",
-    # AWS CloudFront
-    "13.32.0.0/15", "13.35.0.0/16", "13.224.0.0/14",
-    "18.64.0.0/14", "18.154.0.0/15", "18.160.0.0/12",
-    "52.84.0.0/15", "54.182.0.0/16", "54.192.0.0/16",
-    "54.230.0.0/17", "54.239.128.0/18", "99.84.0.0/16",
-    "143.204.0.0/16", "205.251.192.0/19", "204.246.164.0/22", "2600:9000::/28",
-]
-
-# WAF/CDN response-header signatures (unwaf waf.go): a candidate whose response
-# carries one of these is still routed through the edge, so it is not a bypass.
-_WAF_HEADER_SIGNATURES = [
-    "cf-ray", "cf-cache-status", "cf-request-id",
-    "x-akamai-transformed", "akamai-origin-hop",
-    "x-amz-cf-id", "x-amz-cf-pop",
-    "x-fastly-request-id", "fastly-io-info",
-    "x-sucuri-id", "x-sucuri-cache",
-    "x-iinfo", "x-cdn",
-    "x-varnish", "x-sp-url", "x-sp-waf",
-    "barra_counter_session", "x-wa-info", "x-cnection",
-    "ddos-guard", "ar-asg", "ar-poweredby", "fortiwafsid", "x-rdwr",
-    "x-azure-ref", "x-fd-healthprobe", "x-goog-bot-verification",
-    "x-vercel-id", "x-vercel-cache", "x-nf-request-id",
-]
-_WAF_SERVER_TOKENS = ("cloudflare", "akamaighost", "akamai", "sucuri", "incapsula",
-                      "imperva", "ddos-guard", "fortiweb", "netlify")
+# CDN / WAF edge ranges, ASNs and response-header signatures live in
+# recon/helpers/cdn_ranges.py, the list every module shares.
 
 # Weighted-similarity model (unwaf verify.go calculateOverallScore).
 _W_HTML = 0.60
@@ -260,6 +223,19 @@ class _RunCtx:
         return None
 
 
+def _run_ctx(settings: dict) -> _RunCtx:
+    """The run's one context: a Domain batch's groups share its per-key cache
+    and its search budget (a key every group of an org shares is asked once).
+    Held in a circuit_breaker run cache, so reset_registry() drops it."""
+    from recon.helpers import circuit_breaker
+    cache = circuit_breaker.run_cache("origin_discovery_ctx")
+    hit, ctx = cache.get("ctx")
+    if not hit:
+        ctx = _RunCtx(settings)
+        cache.put("ctx", ctx)
+    return ctx
+
+
 # ---------------------------------------------------------------------------
 # Favicon mmh3 (unwaf favicon.go computeMMH3) — matches httpx favicon_hash
 # ---------------------------------------------------------------------------
@@ -310,57 +286,6 @@ def _favicon_hash_for_host(host: str, existing: Any, ctx: _RunCtx) -> Optional[i
 # ---------------------------------------------------------------------------
 # Fronted-host selection
 # ---------------------------------------------------------------------------
-
-# Common multi-label public suffixes. A naive last-two-labels registrable domain
-# turns `www.acme.co.uk` into `co.uk`, so SPF/crt.sh/passive-DNS get queried for
-# the public suffix and the real origin is silently never a candidate — a whole
-# class of ccTLD targets. This is a curated subset of the Public Suffix List
-# (the image ships no PSL library); it covers the common cases, not every entry.
-_MULTI_LABEL_SUFFIXES = frozenset({
-    "co.uk", "org.uk", "me.uk", "ltd.uk", "plc.uk", "net.uk", "sch.uk", "ac.uk", "gov.uk", "nhs.uk",
-    "com.au", "net.au", "org.au", "edu.au", "gov.au", "asn.au", "id.au",
-    "co.nz", "net.nz", "org.nz", "govt.nz", "ac.nz", "school.nz", "geek.nz",
-    "co.za", "org.za", "net.za", "gov.za", "ac.za", "web.za",
-    "co.jp", "or.jp", "ne.jp", "ac.jp", "go.jp", "ad.jp", "ed.jp", "gr.jp", "lg.jp",
-    "com.br", "net.br", "org.br", "gov.br", "edu.br",
-    "co.in", "net.in", "org.in", "gen.in", "firm.in", "ind.in", "gov.in", "ac.in", "edu.in", "res.in",
-    "com.cn", "net.cn", "org.cn", "gov.cn", "edu.cn", "ac.cn",
-    "co.kr", "or.kr", "ne.kr", "re.kr", "pe.kr", "go.kr", "ac.kr",
-    "com.ru", "net.ru", "org.ru", "msk.ru", "spb.ru",
-    "com.tr", "net.tr", "org.tr", "gov.tr", "edu.tr", "bel.tr",
-    "com.mx", "net.mx", "org.mx", "gob.mx", "edu.mx",
-    "com.ar", "net.ar", "org.ar", "gob.ar", "edu.ar",
-    "com.sg", "net.sg", "org.sg", "gov.sg", "edu.sg",
-    "com.hk", "net.hk", "org.hk", "gov.hk", "edu.hk", "idv.hk",
-    "co.il", "org.il", "net.il", "ac.il", "gov.il", "muni.il", "k12.il",
-    "co.id", "or.id", "net.id", "web.id", "ac.id", "go.id", "sch.id", "my.id",
-    "co.th", "or.th", "net.th", "in.th", "ac.th", "go.th",
-    "com.tw", "net.tw", "org.tw", "gov.tw", "edu.tw", "idv.tw",
-    "com.ua", "net.ua", "org.ua", "in.ua", "kiev.ua",
-    "com.pl", "net.pl", "org.pl", "edu.pl", "gov.pl",
-    "com.gr", "net.gr", "org.gr", "edu.gr", "gov.gr",
-    "com.pk", "net.pk", "org.pk", "gov.pk", "edu.pk",
-    "com.eg", "net.eg", "org.eg", "gov.eg", "edu.eg",
-    "com.sa", "net.sa", "org.sa", "gov.sa", "edu.sa",
-    "com.ph", "net.ph", "org.ph", "gov.ph", "edu.ph",
-    "com.my", "net.my", "org.my", "gov.my", "edu.my",
-    "com.ng", "net.ng", "org.ng", "gov.ng", "edu.ng",
-})
-
-
-def _registrable_domain(host: str) -> str:
-    """Registrable domain (unwaf extractMainDomain, PSL-aware for common ccTLDs).
-
-    `www.acme.co.uk` -> `acme.co.uk` (not `co.uk`); `a.b.acme.com` -> `acme.com`.
-    """
-    parts = (host or "").strip(".").split(".")
-    if len(parts) <= 2:
-        return ".".join(parts) if parts != [""] else host
-    last2 = ".".join(parts[-2:])
-    if last2 in _MULTI_LABEL_SUFFIXES:
-        return ".".join(parts[-3:])
-    return last2
-
 
 def _resolve_ips(host: str) -> Set[str]:
     try:
@@ -445,20 +370,30 @@ def _select_fronted_hosts(combined_result: dict, ctx: _RunCtx) -> Dict[str, dict
 
 import ipaddress as _ipaddress
 
-_PARSED_CDN_NETS = []
-for _c in _WAF_CDN_CIDRS:
-    try:
-        _PARSED_CDN_NETS.append(_ipaddress.ip_network(_c, strict=False))
-    except ValueError:
-        pass
-
 
 def _ip_in_cdn_ranges(ip: str) -> bool:
-    try:
-        addr = _ipaddress.ip_address(ip)
-    except ValueError:
-        return False
-    return any(addr in net for net in _PARSED_CDN_NETS)
+    """Inside a published CDN / WAF edge prefix: the edge, never the origin."""
+    return edge_cdn_for_ip(ip) is not None
+
+
+def _cdn_flagged_ips(combined_result: dict) -> Set[str]:
+    """IPs naabu, httpx or tlsx flagged with an edge CDN this run, and those IP
+    attribution tagged shared_edge: a shared edge is never anyone's origin.
+
+    A label for plain cloud hosting (aws, azure, gcp) does not count: those IPs
+    serve the application themselves and are exactly where origins are found.
+    """
+    by_ip = ((combined_result.get("ip_attribution") or {}).get("by_ip")) or {}
+    flagged: Set[str] = {ip for ip, entry in by_ip.items()
+                         if isinstance(entry, dict) and entry.get("ownership") == "shared_edge"}
+    for ip, info in (((combined_result.get("port_scan") or {}).get("by_ip")) or {}).items():
+        if isinstance(info, dict) and info.get("is_cdn") and _is_edge_cdn_label(info.get("cdn")):
+            flagged.add(ip)
+    for info in (((combined_result.get("http_probe") or {}).get("by_url")) or {}).values():
+        if (isinstance(info, dict) and info.get("ip") and info.get("is_cdn")
+                and _is_edge_cdn_label(info.get("cdn"))):
+            flagged.add(info["ip"])
+    return flagged
 
 
 # ---------------------------------------------------------------------------
@@ -892,12 +827,13 @@ def _url_host(ip: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _dedup_and_filter(candidates: Dict[str, str], entry: dict, ctx: _RunCtx,
-                      meta: dict) -> List[Tuple[str, str]]:
+                      meta: dict, flagged: Set[str] = frozenset()) -> List[Tuple[str, str]]:
     """Fail-closed filter. `candidates` maps ip -> source. Returns [(ip, source)].
 
     Drops (and counts): non-routable/metadata/reserved IPs (SSRF, G11), known CDN
-    edge IPs, IPs equal to the host's current DNS resolution, and RoE-excluded
-    IPs (G2). Caps at ORIGIN_DISCOVERY_MAX_CANDIDATES.
+    edge IPs (a published edge prefix, or ``flagged`` by this run's scanners),
+    IPs equal to the host's current DNS resolution, and RoE-excluded IPs (G2).
+    Caps at ORIGIN_DISCOVERY_MAX_CANDIDATES.
     """
     resolved = entry.get("resolved_ips") or set()
     kept: List[Tuple[str, str]] = []
@@ -910,7 +846,7 @@ def _dedup_and_filter(candidates: Dict[str, str], entry: dict, ctx: _RunCtx,
         if is_non_routable_ip(ip):          # G11 — the safety-critical drop
             dropped["ssrf"] += 1
             continue
-        if _ip_in_cdn_ranges(ip):
+        if ip in flagged or _ip_in_cdn_ranges(ip):
             dropped["cdn"] += 1
             continue
         if ip in resolved:
@@ -1030,60 +966,15 @@ def _overall_score(html_sim: float, cert: float, hdr: float, ref_status: int, ca
 
 
 def _response_has_waf_headers(resp: dict) -> bool:
-    hdrs = resp.get("headers", {})
-    for sig in _WAF_HEADER_SIGNATURES:
-        if hdrs.get(sig):
-            return True
-    server = (hdrs.get("server") or "").lower()
-    return any(tok in server for tok in _WAF_SERVER_TOKENS)
+    return edge_from_headers(resp.get("headers")) is not None
 
 
 def _fetch_peer_cert(host_or_ip: str, sni: str, port: int, timeout: int) -> Optional[dict]:
-    """TLS-dial host_or_ip:port with SNI=sni, return {serial, cn, sans}."""
-    ctx_ssl = ssl.create_default_context()
-    ctx_ssl.check_hostname = False
-    ctx_ssl.verify_mode = ssl.CERT_NONE
+    """TLS-dial host_or_ip:port with SNI=sni, return {serial, cn, sans} or None."""
     try:
-        with socket.create_connection((host_or_ip, port), timeout=timeout) as sock:
-            with ctx_ssl.wrap_socket(sock, server_hostname=sni) as ssock:
-                der = ssock.getpeercert(binary_form=True)
-                cert = ssock.getpeercert()  # decoded (verify off still returns fields on 3.11+? no)
+        return _tls_handshake_cert(host_or_ip, sni, port, timeout)
     except (OSError, ssl.SSLError, ValueError):
         return None
-    # getpeercert() returns {} with CERT_NONE, so parse the DER for the fields.
-    return _parse_cert_der(der, cert)
-
-
-def _parse_cert_der(der: bytes, decoded: dict) -> Optional[dict]:
-    serial = None
-    cn = None
-    sans: Set[str] = set()
-    # decoded is usually {} under CERT_NONE; fall back to a DER parse via cryptography
-    try:
-        from cryptography import x509
-        from cryptography.hazmat.backends import default_backend
-        c = x509.load_der_x509_certificate(der, default_backend())
-        serial = str(c.serial_number)
-        try:
-            cn = c.subject.get_attributes_for_oid(x509.NameOID.COMMON_NAME)[0].value
-        except Exception:
-            cn = None
-        try:
-            ext = c.extensions.get_extension_for_class(x509.SubjectAlternativeName)
-            sans = {n.lower() for n in ext.value.get_values_for_type(x509.DNSName)}
-        except Exception:
-            sans = set()
-    except Exception:
-        if decoded:
-            serial = decoded.get("serialNumber")
-            for tup in decoded.get("subject", ()):
-                for k, v in tup:
-                    if k == "commonName":
-                        cn = v
-            sans = {v.lower() for (k, v) in decoded.get("subjectAltName", ()) if k == "DNS"}
-    if serial is None and cn is None and not sans:
-        return None
-    return {"serial": serial, "cn": cn, "sans": sans}
 
 
 def _compare_certs(host: str, ip: str, port: int, ctx: _RunCtx) -> float:
@@ -1101,6 +992,62 @@ def _compare_certs(host: str, ip: str, port: int, ctx: _RunCtx) -> float:
         if overlap:
             score += 0.25 * overlap / len(ref["sans"])
     return score
+
+
+# A candidate whose default certificate is not the target's is likely a shared
+# edge serving the brand by name: never above Medium (severity is High at 80).
+_SHARED_EDGE_MAX_CONFIDENCE = 79.0
+
+
+def _default_cert_check(host: str, ip: str, port: int, ctx: _RunCtx) -> Tuple[str, str]:
+    """The certificate ``ip`` presents to a client that sends no SNI.
+
+    A dedicated origin answers with its own certificate; a shared edge answers
+    with a generic or another tenant's one, even though it serves the brand's
+    page and certificate when asked by name. Returns (status, detail), status
+    one of "target", "foreign" or "not_checked". A check that could not run is
+    never evidence either way.
+
+    The candidate came from passive sources and is untrusted: the routability
+    guard is applied again right before the dial, nothing it returns is
+    followed, and the dial obeys the RoE, the module's rate limit and host health.
+    """
+    from recon.helpers import circuit_breaker as cb
+    if is_non_routable_ip(ip):
+        return "not_checked", "non-routable address"
+    if ctx.roe_enabled and _is_roe_excluded(ip, ctx.roe_excluded):
+        return "not_checked", "excluded by the rules of engagement"
+    target = f"https://{_url_host(ip)}:{port}"
+    if not cb.host_health.allow(target):
+        return "not_checked", "host marked unreachable"
+    ctx.rate.wait()
+    try:
+        cert = _tls_handshake_cert(ip, None, port, min(ctx.timeout, 5))
+    except (OSError, ssl.SSLError, ValueError) as e:
+        cb.host_health.record_failure(target, e)
+        return "not_checked", _tls_failure_reason(e, port)
+    cb.host_health.record_alive(target)
+    if not cert:
+        return "not_checked", "no certificate presented"
+    domain = (org_domain(host) or host or "").lower()
+    return ("target", "") if domain and _cert_covers(cert, domain) else ("foreign", "")
+
+
+def _confirm_candidate(host: str, reference: dict, ip: str, ctx: _RunCtx) -> Optional[dict]:
+    """Score the candidate; if it passes, weigh its default certificate in."""
+    match = _score_candidate(host, reference, ip, ctx)
+    if not match:
+        return None
+    port = match["port"] if match["port"] in _TLS_PORTS else 443
+    status, detail = _default_cert_check(host, ip, port, ctx)
+    if status == "foreign":
+        match["confidence_score"] = min(match["confidence_score"], _SHARED_EDGE_MAX_CONFIDENCE)
+        match["default_cert_note"] = "default certificate does not belong to the target"
+    elif status == "target":
+        match["default_cert_note"] = "default certificate belongs to the target"
+    else:
+        match["default_cert_note"] = f"default certificate: not checked ({detail})"
+    return match
 
 
 def _score_candidate(host: str, reference: dict, ip: str, ctx: _RunCtx) -> Optional[dict]:
@@ -1153,9 +1100,19 @@ def _score_candidate(host: str, reference: dict, ip: str, ctx: _RunCtx) -> Optio
 # Per-host orchestration
 # ---------------------------------------------------------------------------
 
-def _gather_candidates(host: str, entry: dict, ctx: _RunCtx, meta: dict) -> Dict[str, str]:
-    """Run every enabled source for one host; map ip -> first source. Never raises."""
-    domain = _registrable_domain(host)
+_KEY_FROM_HOST = object()
+
+
+def _gather_candidates(host: str, entry: dict, ctx: _RunCtx, meta: dict,
+                       key=_KEY_FROM_HOST) -> Dict[str, str]:
+    """Run every enabled source for one host; map ip -> first source. Never raises.
+
+    ``key`` is the name the domain-keyed sources (SPF/MX, crt.sh, the
+    ``<word>.<key>`` wordlist, passive DNS) query: from ``_candidate_key_rule``,
+    else the host's registrable domain. An IP literal, a name on a public
+    suffix, or a None key gets none of them, so only the host-keyed scanners run.
+    """
+    domain = org_domain(host) if key is _KEY_FROM_HOST else key
     favicon = _favicon_hash_for_host(host, entry.get("favicon_hash"), ctx)
     if favicon is not None:
         entry["favicon_hash"] = favicon
@@ -1172,7 +1129,7 @@ def _gather_candidates(host: str, entry: dict, ctx: _RunCtx, meta: dict) -> Dict
             # surface it (e.g. an invalid API key) instead of a silent empty result
             _log("-", f"{host}: source '{name}' failed: {str(e)[:120]}")
 
-    if ctx.settings.get("ORIGIN_DISCOVERY_KEYLESS", True):
+    if domain and ctx.settings.get("ORIGIN_DISCOVERY_KEYLESS", True):
         # Keyed by the registrable domain so N fronted subdomains of one domain
         # don't each re-resolve the same ~30 subdomains / SPF+MX / up-to-500 crt.sh
         # SANs (F2). Cache stores only non-empty results (transient failures retry).
@@ -1184,9 +1141,10 @@ def _gather_candidates(host: str, entry: dict, ctx: _RunCtx, meta: dict) -> Dict
         _run("censys", "cert_san", lambda: _discover_via_censys(host, ctx))
         _run("fofa", "cert_san", lambda: _discover_via_fofa(host, favicon, ctx))
         _run("zoomeye", "cert_san", lambda: _discover_via_zoomeye(host, favicon, ctx))
-        _run("otx", "passive_dns", lambda: _discover_via_otx(domain, ctx))
-        _run("virustotal", "passive_dns", lambda: _discover_via_virustotal(domain, ctx))
-    if ctx.settings.get("ORIGIN_DISCOVERY_PASSIVE_DNS", True):
+        if domain:
+            _run("otx", "passive_dns", lambda: _discover_via_otx(domain, ctx))
+            _run("virustotal", "passive_dns", lambda: _discover_via_virustotal(domain, ctx))
+    if domain and ctx.settings.get("ORIGIN_DISCOVERY_PASSIVE_DNS", True):
         _run("securitytrails", "passive_dns", lambda: _discover_via_securitytrails(domain, ctx))
         _run("viewdns", "passive_dns", lambda: _discover_via_viewdns(domain, ctx))
 
@@ -1206,10 +1164,38 @@ _METHOD_LABEL = {
 }
 
 
-def _process_host(host: str, entry: dict, ctx: _RunCtx) -> Tuple[List[dict], dict]:
+def _candidate_key_rule(combined_result: dict):
+    """host -> the candidate key (§4.9, REC-30).
+
+    The org when the org is in scope (a group has it as its scan root, or
+    ownership was proven at <prefix>.<org>), else the group's own scan root:
+    the active probes then never reach an org-derived candidate the operator
+    did not put in scope. A file without scope groups (a legacy file, partial
+    recon, IP mode) keeps the host's registrable domain.
+    """
+    from recon.helpers.org_work import org_in_scope
+    metadata = combined_result.get("metadata") or {}
+    groups = combined_result.get("scope_groups") or []
+    scan_root = str(metadata.get("root_domain") or combined_result.get("domain") or "").lower()
+    org = str(metadata.get("org_domain") or "").lower()
+    if not groups or not org or not scan_root or metadata.get("ip_mode"):
+        return org_domain
+    if org == scan_root or org_in_scope(org, groups):
+        return lambda host: org if org_domain(host) else None
+    _log("*", f"candidate key: {scan_root} (org not in scope)")
+
+    def _scan_root_key(host):
+        h = str(host or "").lower()
+        under = h == scan_root or h.endswith("." + scan_root)
+        return scan_root if under and org_domain(h) else None
+    return _scan_root_key
+
+
+def _process_host(host: str, entry: dict, ctx: _RunCtx, key=_KEY_FROM_HOST,
+                  flagged: Set[str] = frozenset()) -> Tuple[List[dict], dict]:
     meta: dict = {"candidates": [], "methods": [], "errors": {}}
-    candidates = _gather_candidates(host, entry, ctx, meta)
-    kept = _dedup_and_filter(candidates, entry, ctx, meta)
+    candidates = _gather_candidates(host, entry, ctx, meta, key=key)
+    kept = _dedup_and_filter(candidates, entry, ctx, meta, flagged=flagged)
     meta["candidates"] = [ip for ip, _ in kept]
     if not kept:
         return [], meta
@@ -1224,7 +1210,7 @@ def _process_host(host: str, entry: dict, ctx: _RunCtx) -> Tuple[List[dict], dic
 
     confirmed: List[dict] = []
     with ThreadPoolExecutor(max_workers=ctx.workers) as ex:
-        futs = {ex.submit(_score_candidate, host, reference, ip, ctx): (ip, source)
+        futs = {ex.submit(_confirm_candidate, host, reference, ip, ctx): (ip, source)
                 for ip, source in kept}
         for fut in as_completed(futs):
             ip, source = futs[fut]
@@ -1252,7 +1238,8 @@ def _process_host(host: str, entry: dict, ctx: _RunCtx) -> Tuple[List[dict], dic
                 "header_match": match["header_match"],
                 "status_code": match["status_code"],
                 "evidence": (f"{host} → {match['matched_ip']}:{match['port']} "
-                             f"({source}, {match['method']}, score {match['confidence_score']}%)"),
+                             f"({source}, {match['method']}, score {match['confidence_score']}%)"
+                             + (f"; {match['default_cert_note']}" if match.get("default_cert_note") else "")),
                 "source": "origin_discovery",
             })
             _log("+", f"{host} -> {match['matched_ip']}:{match['port']} "
@@ -1273,7 +1260,8 @@ def run_origin_discovery_enrichment(combined_result: dict, settings: dict) -> di
     if not settings.get("ORIGIN_DISCOVERY_ENABLED", False):
         return combined_result
 
-    ctx = _RunCtx(settings)
+    ctx = _run_ctx(settings)
+    key_for = _candidate_key_rule(combined_result)
     fronted = _select_fronted_hosts(combined_result, ctx)
     if not fronted:
         _log("-", "no CDN-fronted hosts in http_probe — nothing to unmask")
@@ -1284,10 +1272,11 @@ def run_origin_discovery_enrichment(combined_result: dict, settings: dict) -> di
     _log("*", f"selecting {len(fronted)} CDN-fronted host(s); "
               f"threshold={ctx.threshold:.0f}% budget={ctx.budget.remaining} search calls")
 
+    flagged = _cdn_flagged_ips(combined_result)
     all_confirmed: List[dict] = []
     for host, entry in fronted.items():
         try:
-            confirmed, meta = _process_host(host, entry, ctx)
+            confirmed, meta = _process_host(host, entry, ctx, key=key_for(host), flagged=flagged)
         except Exception as e:  # a host never sinks the whole module
             payload["candidates_meta"][host] = {"errors": {"fatal": str(e)[:200]}}
             _log("!", f"{host}: {e}")

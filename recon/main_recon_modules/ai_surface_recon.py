@@ -105,7 +105,7 @@ def _host_has_ai_signal(base_url: str, combined_result: dict) -> bool:
 
 
 def _gather_candidates(combined_result: dict, settings: dict) -> dict:
-    """Return {base_url: {host_is_ai, endpoints:[{path,method,iface}]}}."""
+    """Return {base_url: {host_is_ai, endpoints:[{path,method,iface,declared_only}]}}."""
     out: dict = {}
     re_data = combined_result.get("resource_enum", {}).get("by_base_url", {}) or {}
     for base_url, base_data in re_data.items():
@@ -119,8 +119,12 @@ def _gather_candidates(combined_result: dict, settings: dict) -> dict:
             iface = ep.get("ai_interface_type")
             methods = ep.get("methods") or ["GET"]
             if iface in _CHAT_IFACES or iface == "mcp" or host_ai:
-                endpoints.append({"path": path, "method": methods[0], "iface": iface})
-        if endpoints or host_ai:
+                endpoints.append({"path": path, "method": methods[0], "iface": iface,
+                                  "declared_only": ep.get("declared_only") is True})
+        # A path known only from an API specification never makes a host a
+        # candidate: the MCP handshake and the model fingerprint POST their own
+        # paths, and the declared one can be among them (D15).
+        if any(not e["declared_only"] for e in endpoints) or host_ai:
             out[base_url] = {"host_is_ai": host_ai, "endpoints": endpoints}
     # Hosts with AI signal but no crawled endpoints: still probe with static paths
     http = combined_result.get("http_probe", {}).get("by_url", {}) or {}
@@ -141,9 +145,13 @@ def _gather_candidates(combined_result: dict, settings: dict) -> dict:
 # --------------------------------------------------------------------------- #
 def _probe_chat(base_url: str, cand: dict, session: requests.Session,
                 timeout: float, latency_on: bool) -> dict:
-    paths = [e["path"] for e in cand["endpoints"] if e.get("iface") in _CHAT_IFACES]
+    # The chat-shape probe POSTs. A path known only from an API specification
+    # gets GET requests only (D15), whichever list it would come from.
+    declared_only = {e["path"] for e in cand["endpoints"] if e.get("declared_only")}
+    paths = [e["path"] for e in cand["endpoints"]
+             if e.get("iface") in _CHAT_IFACES and e["path"] not in declared_only]
     if not paths and cand["host_is_ai"]:
-        paths = list(cat.AI_CHAT_PROBE_PATHS)
+        paths = [p for p in cat.AI_CHAT_PROBE_PATHS if p not in declared_only]
     body = json.dumps({"model": "probe",
                        "messages": [{"role": "user", "content": "ping"}],
                        "max_tokens": 1})
@@ -642,15 +650,19 @@ def run_ai_surface_recon(combined_result: dict, output_file: Path = None,
         _log("disabled — skipping", "-")
         return combined_result
 
-    # RoE time window (lazy import to avoid circular import with main.py)
+    # RoE time window. Fail closed: a window that cannot be checked sends no
+    # probe. Either way nothing was re-checked, so the prune keeps the source.
     try:
-        from recon.main import _check_roe_time_window
-        allowed, reason = _check_roe_time_window(settings)
-        if not allowed:
-            _log(f"blocked by RoE time window: {reason}", "!")
-            return combined_result
-    except Exception:
-        pass
+        from recon.helpers import roe_scope
+        allowed, reason = roe_scope._check_roe_time_window(settings)
+    except Exception as e:  # noqa: BLE001
+        allowed, reason = False, f"the window could not be checked ({type(e).__name__})"
+    if not allowed:
+        _log(f"blocked by RoE time window: {reason}", "!")
+        from recon.helpers import circuit_breaker as _cb_window
+        _cb_window.note_degraded("ai_surface_recon", sources=["ai_surface_recon"],
+                                 reason="RoE time window")
+        return combined_result
 
     t0 = time.monotonic()
     timeout = float(settings.get("AI_SURFACE_RECON_TIMEOUT", 10))
@@ -667,14 +679,23 @@ def run_ai_surface_recon(combined_result: dict, output_file: Path = None,
     latency_on = settings.get("AI_SURFACE_RECON_LATENCY_BASELINE_ENABLED", True)
 
     candidates = _gather_candidates(combined_result, settings)
-    # RoE host exclusion
+    # RoE host exclusion. A filter that cannot run cannot tell an excluded host
+    # from an allowed one, so nothing is probed; the source is reported
+    # degraded so the end-of-run prune keeps its previous findings.
+    roe_filter_failed = False
     try:
         from recon.helpers.roe_scope import _filter_roe_excluded
         hosts = list(candidates.keys())
         kept = set(_filter_roe_excluded(hosts, settings, label="ai-surface url"))
         candidates = {k: v for k, v in candidates.items() if k in kept}
-    except Exception:
-        pass
+    except Exception as exc:
+        roe_filter_failed = True
+        candidates = {}
+        # The class only: the message could carry a host or a URL.
+        _log(f"RoE filter failed; skipping AI surface probes: {type(exc).__name__}", "!")
+        from recon.helpers import circuit_breaker as _cb_roe
+        _cb_roe.note_degraded("ai_surface_recon", sources=("ai_surface_recon",),
+                              reason="RoE filter failed")
 
     _log(f"analyzing {len(candidates)} AI-surface host(s)")
     project_id = combined_result.get("metadata", {}).get("project_id", "unknown")
@@ -743,7 +764,7 @@ def run_ai_surface_recon(combined_result: dict, output_file: Path = None,
                 findings.extend(lf)
 
     vector_db = []
-    if vectordb_on:
+    if vectordb_on and not roe_filter_failed:
         vsession = requests.Session()
         vsession.headers.update({"User-Agent": ua})
         vector_db = _confirm_vector_dbs(combined_result, vsession, timeout)

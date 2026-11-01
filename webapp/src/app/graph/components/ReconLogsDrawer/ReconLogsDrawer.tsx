@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react'
 import { X, Terminal, CheckCircle, AlertCircle, Pause, Play, Trash2, Square, Loader2, Download } from 'lucide-react'
-import type { ReconLogEvent, ReconStatus } from '@/lib/recon-types'
+import { RECON_TOTAL_PHASES, type ReconLogEvent, type ReconStatus } from '@/lib/recon-types'
 import styles from './ReconLogsDrawer.module.css'
 import { nodeFilterLineKind } from './nodeFilterLog'
 
@@ -20,6 +20,14 @@ interface ReconLogsDrawerProps {
   title?: string
   totalPhases?: number
   errorMessage?: string | null
+  /** The log stream's own failure (lost, or refused with a status); shown while the run is live. */
+  streamError?: string | null
+  /**
+   * The status hook's last failure, shown as is: its text already names what
+   * failed ("GVM status unavailable (…)", "Failed to stop recon (…)"). The
+   * status shown is then the last known one.
+   */
+  statusError?: string | null
   hidePhaseProgress?: boolean
   /** Domain batch: the OUTER progress. Phases restart at 1 for every group, so
    *  "Phase 3/6" alone reads as the scan going backwards when group 2 starts. */
@@ -40,18 +48,28 @@ export function ReconLogsDrawer({
   onResume,
   onStop,
   title = 'Reconnaissance Logs',
-  totalPhases = 7,
+  totalPhases = RECON_TOTAL_PHASES,
   errorMessage,
+  streamError = null,
+  statusError = null,
   hidePhaseProgress = false,
   currentGroup = null,
   groupNumber = null,
   totalGroups = null,
 }: ReconLogsDrawerProps) {
-  // Prefix every status line with the batch group, so a phase counter restarting
-  // reads as "next domain" rather than "the scan went backwards".
+  // Prefix every status line with the batch's scope group, so a phase counter
+  // restarting reads as "next scan root" rather than "the scan went backwards".
+  // The orchestrator's marker carries the group's scan root (one token).
   const groupPrefix = groupNumber && totalGroups
-    ? `Group ${groupNumber}/${totalGroups}${currentGroup ? ` (${currentGroup})` : ''} - `
+    ? `Scope group ${groupNumber}/${totalGroups}${currentGroup ? ` (scan root ${currentGroup})` : ''} - `
     : ''
+  const isLive = status === 'running' || status === 'starting' || status === 'paused'
+    || status === 'pausing' || status === 'stopping'
+  // A finished run closes its stream on purpose; only a live one has lost something.
+  const notices = [
+    statusError || null,
+    streamError && isLive ? `Log stream: ${streamError}` : null,
+  ].filter((n): n is string => !!n)
   const logsEndRef = useRef<HTMLDivElement>(null)
   const logsContainerRef = useRef<HTMLDivElement>(null)
   const [autoScroll, setAutoScroll] = useState(true)
@@ -250,6 +268,13 @@ export function ReconLogsDrawer({
           </button>
         </div>
       </div>
+
+      {notices.map(notice => (
+        <div key={notice} className={styles.streamNotice} role="alert">
+          <AlertCircle size={12} />
+          <span>{notice}</span>
+        </div>
+      ))}
 
       {/* Logs container */}
       <div

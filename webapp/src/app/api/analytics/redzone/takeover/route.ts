@@ -3,6 +3,8 @@ import { rowCap } from '../rowCap'
 import { guardProject } from '@/lib/access'
 import { getGraphSession } from '@/app/api/graph/neo4j'
 import { notMuted } from '@/lib/graphMute'
+import { reportCountable } from '@/lib/triage/reportable'
+import { internalError } from '@/lib/routeErrors'
 
 function toNum(val: unknown): number {
   if (val && typeof val === 'object' && 'low' in val) return (val as { low: number }).low
@@ -22,7 +24,7 @@ export async function GET(request: NextRequest) {
     // Vulnerabilities with source = takeover_scan (subjack + nuclei + baddns dedup output)
     const result = await session.run(
       `MATCH (v:Vulnerability {project_id: $pid, source: 'takeover_scan'})
-       WHERE ${notMuted('v')}
+       WHERE ${notMuted('v')} AND ${reportCountable('v')}
        OPTIONAL MATCH (parent)-[:HAS_VULNERABILITY]->(v)
        RETURN toString(id(v))       AS nodeId,
               v.id                   AS id,
@@ -76,11 +78,7 @@ export async function GET(request: NextRequest) {
 
     return NextResponse.json({ rows, meta: { totalRows: rows.length, ...summary } })
   } catch (error) {
-    console.error('Red-zone takeover error:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Query failed' },
-      { status: 500 }
-    )
+    return internalError(error, 'Query failed', { log: 'Red-zone takeover error' })
   } finally {
     await session.close()
   }

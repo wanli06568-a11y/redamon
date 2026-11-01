@@ -22,7 +22,10 @@ from datetime import datetime, timezone
 
 from graph_db.cert_key import build_cert_key
 from graph_db.cpe_resolver import _is_ip_address
-from graph_db.mixins.recon.scope import attach_roots, root_for_host
+from graph_db.mixins.recon.scope import (
+    IN_SCOPE, OUT_OF_SCOPE, attach_for_host, attach_roots, classify_host, home_domain,
+    org_for_scan_root, scope_groups_by_root,
+)
 from urllib.parse import urlparse as _urlparse
 
 
@@ -70,6 +73,32 @@ def _shodan_cve_props(cve_entry: dict) -> dict:
         "severity": _cvss_severity(cvss),
     }
     return {k: v for k, v in props.items() if v is not None}
+
+
+#: The passive CVE sources whose id ends in the IP (`shodan-<cve>-<ip>`,
+#: `criminalip-<cve>-<ip>`). Kept in step with PASSIVE_CVE_SOURCES in
+#: recon/helpers/finding_sources.py, which this package cannot import.
+_IP_KEYED_PASSIVE_SOURCES = ("shodan_api", "internetdb", "shodan", "shodan_host_lookup",
+                             "criminalip")
+
+_PASSIVE_CVE_ID = re.compile(r"^(?:shodan|criminalip)-CVE-\d{4}-\d+-(.+)$", re.IGNORECASE)
+
+
+def _ip_from_passive_cve_id(vid) -> str | None:
+    """The IP a Shodan or CriminalIP CVE's id names, or None."""
+    match = _PASSIVE_CVE_ID.match(str(vid or ""))
+    if not match:
+        return None
+    candidate = match.group(1)
+    return candidate if _is_ip_address(candidate) else None
+
+
+_CVE_ID = re.compile(r"^CVE-\d{4}-\d{4,}$")
+
+
+def netlas_vuln_id(cve_id: str, ip: str, port) -> str:
+    """A Netlas finding's id: one per CVE, IP and port."""
+    return f"netlas-{cve_id}-{ip}-{port}"
 
 
 def _split_url(url: str) -> tuple[str, str]:
@@ -123,10 +152,11 @@ class OsintMixin:
             stats["errors"].append("No shodan data found in recon_data")
             return stats
 
-        # `domain` is the root this scan looked up; a host under any of the
-        # project's roots is in scope and joins its own root.
+        # `domain` is the scan root this group looked up. A host under any of
+        # the project's scan roots is in scope and joins its root's org Domain
+        # (attach_for_host); anything else is an ExternalDomain found by `home`.
         domain = recon_data.get("domain", "")
-        roots = attach_roots(recon_data)
+        home = home_domain(recon_data)
 
         with self.driver.session() as session:
 
@@ -166,7 +196,8 @@ class OsintMixin:
                             """
                             MERGE (p:Port {number: $port, protocol: $protocol, ip_address: $ip,
                                            user_id: $user_id, project_id: $project_id})
-                            ON CREATE SET p.state = 'open', p.source = 'shodan', p.updated_at = datetime()
+                            ON CREATE SET p.state = 'open', p.source = 'shodan', p.passive_only = true,
+                                          p.updated_at = datetime()
                             ON MATCH SET p.updated_at = datetime()
                             MERGE (i:IP {address: $ip, user_id: $user_id, project_id: $project_id})
                             SET i.updated_at = datetime()
@@ -263,7 +294,8 @@ class OsintMixin:
                                 """
                                 MERGE (p:Port {number: $port, protocol: $protocol, ip_address: $ip,
                                                user_id: $user_id, project_id: $project_id})
-                                ON CREATE SET p.state = 'open', p.source = 'shodan', p.updated_at = datetime()
+                                ON CREATE SET p.state = 'open', p.source = 'shodan', p.passive_only = true,
+                                          p.updated_at = datetime()
                                 ON MATCH SET p.updated_at = datetime()
                                 MERGE (i:IP {address: $ip, user_id: $user_id, project_id: $project_id})
                                 SET i.updated_at = datetime()
@@ -281,12 +313,16 @@ class OsintMixin:
                     stats["errors"].append(f"Failed to enrich IP {ip}: {e}")
 
             # ── 2. Reverse DNS → Subdomain or ExternalDomain nodes ──
+            # A PTR answer is not forward DNS: the edge it creates carries
+            # source 'shodan_rdns' (and a domain-DNS record's 'shodan_dns'), so
+            # readers that mean "resolves now" skip it. ON CREATE only: an edge
+            # DNS wrote first stays forward DNS.
             for ip, hostnames in shodan_data.get("reverse_dns", {}).items():
                 for hostname in hostnames:
                     if not hostname:
                         continue
                     try:
-                        root = root_for_host(hostname, roots)
+                        kind, root = attach_for_host(hostname, recon_data)
 
                         if root:
                             session.run(
@@ -297,7 +333,7 @@ class OsintMixin:
                                 MERGE (i:IP {address: $ip, user_id: $user_id, project_id: $project_id})
                                 SET i.updated_at = datetime()
                                 MERGE (s)-[r:RESOLVES_TO]->(i)
-                                ON CREATE SET r.timestamp = datetime()
+                                ON CREATE SET r.timestamp = datetime(), r.source = 'shodan_rdns'
                                 SET r.last_seen_at = datetime(),
                                     r.record_type = coalesce(r.record_type,
                                         CASE WHEN $ip CONTAINS ':' THEN 'AAAA' ELSE 'A' END)
@@ -318,7 +354,7 @@ class OsintMixin:
                                 user_id=user_id, project_id=project_id
                             )
                             stats["relationships_created"] += 1
-                        else:
+                        elif kind == OUT_OF_SCOPE:
                             # Out-of-scope hostname → ExternalDomain
                             session.run(
                                 """
@@ -331,7 +367,7 @@ class OsintMixin:
                                 MATCH (d:Domain {name: $domain, user_id: $user_id, project_id: $project_id})
                                 MERGE (ed)-[:DISCOVERED_BY]->(d)
                                 """,
-                                ed_domain=hostname, ip=ip, domain=domain,
+                                ed_domain=hostname, ip=ip, domain=home,
                                 user_id=user_id, project_id=project_id
                             )
                             stats["relationships_created"] += 1
@@ -340,12 +376,16 @@ class OsintMixin:
                         stats["errors"].append(f"Failed to create subdomain {hostname}: {e}")
 
             # ── 3. Domain DNS → Subdomain + DNSRecord nodes ──
+            # Shodan answers for the name recon queried (the org); its labels
+            # are relative to THAT name, never to this group's scan root, or an
+            # org record would be written as mail.<scan root> (§4.9).
             domain_dns = shodan_data.get("domain_dns", {})
+            dns_base = domain_dns.get("domain") or domain
             for sub_name in domain_dns.get("subdomains", []):
                 if not sub_name:
                     continue
-                fqdn = f"{sub_name}.{domain}" if domain and not sub_name.endswith(domain) else sub_name
-                root = root_for_host(fqdn, roots)
+                fqdn = f"{sub_name}.{dns_base}" if dns_base and not sub_name.endswith(dns_base) else sub_name
+                kind, root = attach_for_host(fqdn, recon_data)
 
                 try:
                     if root:
@@ -370,7 +410,7 @@ class OsintMixin:
                             user_id=user_id, project_id=project_id
                         )
                         stats["relationships_created"] += 1
-                    else:
+                    elif kind == OUT_OF_SCOPE:
                         # Out-of-scope → ExternalDomain
                         session.run(
                             """
@@ -382,7 +422,7 @@ class OsintMixin:
                             MATCH (d:Domain {name: $domain, user_id: $user_id, project_id: $project_id})
                             MERGE (ed)-[:DISCOVERED_BY]->(d)
                             """,
-                            ed_domain=fqdn, domain=domain,
+                            ed_domain=fqdn, domain=home,
                             user_id=user_id, project_id=project_id
                         )
 
@@ -395,7 +435,9 @@ class OsintMixin:
                 rec_sub = record.get("subdomain", "")
                 if not rec_type or not rec_value:
                     continue
-                fqdn = f"{rec_sub}.{domain}" if rec_sub and domain else domain
+                fqdn = f"{rec_sub}.{dns_base}" if rec_sub and dns_base else dns_base
+                if attach_for_host(fqdn, recon_data)[0] != IN_SCOPE:
+                    continue
                 try:
                     session.run(
                         """
@@ -416,7 +458,7 @@ class OsintMixin:
                             MERGE (i:IP {address: $ip, user_id: $user_id, project_id: $project_id})
                             SET i.updated_at = datetime()
                             MERGE (s)-[r:RESOLVES_TO]->(i)
-                            ON CREATE SET r.timestamp = datetime()
+                            ON CREATE SET r.timestamp = datetime(), r.source = 'shodan_dns'
                             SET r.last_seen_at = datetime(),
                                 r.record_type = coalesce(r.record_type, $type)
                             """,
@@ -447,6 +489,9 @@ class OsintMixin:
                     props = _shodan_cve_props(cve_entry)
                     method = props.pop("detection_method")
                     verified = props.pop("verified")
+                    # A full run's port scan decides port_confirmed, an unknown
+                    # (None) included; an entry with no verdict at all (partial
+                    # recon could not say) leaves the stored one alone.
                     session.run(
                         """
                         MERGE (v:Vulnerability {id: $vuln_id, user_id: $user_id,
@@ -454,13 +499,17 @@ class OsintMixin:
                         ON CREATE SET v.source = $source
                         SET v += $props, v.updated_at = datetime(),
                             v.verified = coalesce(v.verified, false) OR $verified
+                        FOREACH (_ IN CASE WHEN $set_port_confirmed THEN [1] ELSE [] END |
+                          SET v.port_confirmed = $port_confirmed)
                         WITH v, {passive_catalog: 0, passive_version_match: 1, passive_verified: 2} AS rank
                         SET v.detection_method = CASE
                             WHEN coalesce(rank[v.detection_method], -1) > rank[$method]
                             THEN v.detection_method ELSE $method END
                         """,
                         vuln_id=vuln_id, source=cve_source, props=props, method=method,
-                        verified=verified, user_id=user_id, project_id=project_id
+                        verified=verified, user_id=user_id, project_id=project_id,
+                        set_port_confirmed="port_confirmed" in cve_entry,
+                        port_confirmed=cve_entry.get("port_confirmed"),
                     )
                     stats["vulnerabilities_created"] += 1
 
@@ -518,6 +567,43 @@ class OsintMixin:
 
         return stats
 
+    def backfill_passive_cve_hosts(self, user_id: str, project_id: str) -> int:
+        """Give older Shodan and CriminalIP CVEs the `target_ip` their id names.
+
+        The recon prune keeps an IP the run could not look up by matching a
+        finding's host fields, and `target_ip` is the only one these carry.
+        Shodan stores it since its evidence grading, CriminalIP since its CVEs
+        are pruned at all; a row written before would otherwise be deleted
+        when its IP was the one not re-checked. Run before the prune. Never
+        writes `updated_at`; idempotent.
+        """
+        with self.driver.session() as session:
+            rows = []
+            for record in session.run(
+                """
+                MATCH (v:Vulnerability {user_id: $uid, project_id: $pid})
+                WHERE v.target_ip IS NULL AND v.source IN $sources
+                RETURN v.id AS id
+                """,
+                uid=user_id, pid=project_id, sources=list(_IP_KEYED_PASSIVE_SOURCES),
+            ):
+                ip = _ip_from_passive_cve_id(record["id"])
+                if ip:
+                    rows.append({"id": record["id"], "ip": ip})
+            if not rows:
+                return 0
+            session.run(
+                """
+                UNWIND $rows AS r
+                MATCH (v:Vulnerability {id: r.id, user_id: $uid, project_id: $pid})
+                WHERE v.target_ip IS NULL
+                SET v.target_ip = r.ip
+                """,
+                rows=rows, uid=user_id, pid=project_id,
+            )
+        print(f"[*][graph-db] Backfilled target_ip on {len(rows)} older passive CVE(s)")
+        return len(rows)
+
 
     def update_graph_from_urlscan_discovery(self, recon_data: dict, user_id: str, project_id: str) -> dict:
         """
@@ -541,10 +627,14 @@ class OsintMixin:
             return stats
 
         domain = recon_data.get("domain", "")
-        # `domain` is the root this pass looked up; a host under any of the run's
-        # roots is in scope and joins its own root, and no root's apex is a Subdomain.
+        # `domain` is the scan root this pass looked up; a host under any of the
+        # run's scan roots is in scope and joins its root's org Domain. A scan
+        # root itself is a Subdomain only when its group made it a target
+        # (attach_for_host); a legacy file, with no scope groups, never makes
+        # an apex a Subdomain, as before.
+        home = home_domain(recon_data)
         roots = attach_roots(recon_data)
-        apexes = {r.lower() for r in roots}
+        apexes = set() if scope_groups_by_root(recon_data) else {r.lower() for r in roots}
 
         with self.driver.session() as session:
 
@@ -562,25 +652,31 @@ class OsintMixin:
                 # Create/update subdomain or external domain node
                 if subdomain and subdomain.lower() not in apexes and subdomain not in seen_subs:
                     seen_subs.add(subdomain)
-                    root = root_for_host(subdomain, roots)
+                    kind, root = attach_for_host(subdomain, recon_data)
                     try:
                         if root:
-                            session.run(
+                            # MATCH, never MERGE: the run's domain write (or
+                            # ensure_root_domains, in a batch) made the root's
+                            # Domain, and creating one here could leave a Domain
+                            # the scope no longer names.
+                            rec = session.run(
                                 """
-                                MERGE (d:Domain {name: $domain, user_id: $uid, project_id: $pid})
+                                MATCH (d:Domain {name: $domain, user_id: $uid, project_id: $pid})
                                 SET d.updated_at = datetime()
                                 MERGE (s:Subdomain {name: $subdomain, user_id: $uid, project_id: $pid})
                                 ON CREATE SET s.discovered_by = 'urlscan', s.status = 'resolved',
                                               s.updated_at = datetime()
                                 MERGE (d)-[:HAS_SUBDOMAIN]->(s)
                                 MERGE (s)-[:BELONGS_TO]->(d)
+                                RETURN count(s) AS n
                                 """,
                                 domain=root, subdomain=subdomain,
                                 uid=user_id, pid=project_id
-                            )
-                            stats["subdomains_created"] += 1
-                            stats["relationships_created"] += 1
-                        else:
+                            ).single()
+                            if rec and rec["n"]:
+                                stats["subdomains_created"] += 1
+                                stats["relationships_created"] += 1
+                        elif kind == OUT_OF_SCOPE:
                             session.run(
                                 """
                                 MERGE (ed:ExternalDomain {domain: $ed_domain, user_id: $uid, project_id: $pid})
@@ -591,7 +687,7 @@ class OsintMixin:
                                 MATCH (d:Domain {name: $domain, user_id: $uid, project_id: $pid})
                                 MERGE (ed)-[:DISCOVERED_BY]->(d)
                                 """,
-                                ed_domain=subdomain, domain=domain,
+                                ed_domain=subdomain, domain=home,
                                 uid=user_id, pid=project_id
                             )
                     except Exception as e:
@@ -655,7 +751,7 @@ class OsintMixin:
                         MATCH (d:Domain {name: $domain, user_id: $uid, project_id: $pid})
                         SET d += $props, d.updated_at = datetime()
                         """,
-                        domain=domain, uid=user_id, pid=project_id, props=props
+                        domain=home, uid=user_id, pid=project_id, props=props
                     )
                     stats["domain_enriched"] = True
                 except Exception as e:
@@ -763,6 +859,7 @@ class OsintMixin:
                                            user_id: $uid, project_id: $pid})
                         ON CREATE SET e.source = 'urlscan', e.full_url = $full_url,
                                       e.has_parameters = $has_params, e.updated_at = datetime()
+                        SET e.openapi_declared_only = CASE WHEN coalesce(e.openapi_declared_only, e.openapi_declared, false) THEN false ELSE e.openapi_declared_only END
                         MERGE (bu)-[:HAS_ENDPOINT]->(e)
                         RETURN e.path AS path
                         """,
@@ -823,14 +920,15 @@ class OsintMixin:
         they are never scanned or attacked.
         """
         external_domains = recon_data.get("external_domains_aggregated", [])
-        domain = recon_data.get("domain", "")
+        # The org Domain of this group's scan root: its ExternalDomains hang off it.
+        domain = home_domain(recon_data)
         if not external_domains:
             return
-        # Each module judged "external" against the one root it scanned, so in a
-        # Domain batch a host under a SIBLING root lands here too. It is not
-        # foreign: it joins that root as a Subdomain (a sibling's apex is its
-        # Domain node already).
-        roots = attach_roots(recon_data)
+        # Each module judged "external" against the one scan root it scanned, so
+        # in a Domain batch a host under a SIBLING scan root lands here too. It
+        # is not foreign: it joins that root's org as a Subdomain. A scan root
+        # itself is left to the domain writer, which makes it a node only when
+        # it is a target.
 
         print(f"\n[GRAPH] External Domains: {len(external_domains)} foreign domains")
 
@@ -840,9 +938,9 @@ class OsintMixin:
                 ed_domain = ed.get("domain", "")
                 if not ed_domain:
                     continue
-                root = root_for_host(ed_domain, roots)
-                if root:
-                    if ed_domain.strip().lower() != root.strip().lower():
+                kind, root = classify_host(ed_domain, recon_data)
+                if kind != OUT_OF_SCOPE:
+                    if kind == IN_SCOPE and ed_domain.strip().lower() != root.strip().lower():
                         try:
                             session.run("""
                                 MATCH (d:Domain {name: $domain, user_id: $uid, project_id: $pid})
@@ -851,7 +949,8 @@ class OsintMixin:
                                               s.updated_at = datetime()
                                 MERGE (d)-[:HAS_SUBDOMAIN]->(s)
                                 MERGE (s)-[:BELONGS_TO]->(d)
-                            """, domain=root, name=ed_domain.strip().lower(), uid=user_id, pid=project_id,
+                            """, domain=org_for_scan_root(root, recon_data), name=ed_domain.strip().lower(),
+                                uid=user_id, pid=project_id,
                                 source=(ed.get("sources") or ["external_reference"])[0])
                         except Exception as e:
                             logger.warning(f"Cross-root Subdomain graph error for {ed_domain}: {e}")
@@ -904,7 +1003,6 @@ class OsintMixin:
             "certificates_merged": 0, "subdomains_merged": 0,
             "relationships_created": 0, "errors": [],
         }
-        roots = attach_roots(recon_data)
         try:
             hosts = (recon_data.get("censys") or {}).get("hosts") or []
             if not hosts:
@@ -983,8 +1081,8 @@ class OsintMixin:
                                     """
                                     MERGE (p:Port {number: $port, protocol: $protocol, ip_address: $ip,
                                                    user_id: $user_id, project_id: $project_id})
-                                    ON CREATE SET p.state = 'open', p.updated_at = datetime()
-                                    SET p.source = 'censys', p.updated_at = datetime()
+                                    ON CREATE SET p.state = 'open', p.source = 'censys'
+                                    SET p.updated_at = datetime()
                                     MERGE (i:IP {address: $ip, user_id: $user_id, project_id: $project_id})
                                     SET i.updated_at = datetime()
                                     MERGE (i)-[:HAS_PORT]->(p)
@@ -1089,7 +1187,7 @@ class OsintMixin:
 
                             # Reverse DNS → Subdomain nodes
                             for hostname in host.get("reverse_dns_names") or []:
-                                root = root_for_host(hostname, roots) if hostname else None
+                                root = attach_for_host(hostname, recon_data)[1] if hostname else None
                                 if not root:
                                     continue
                                 try:
@@ -1139,7 +1237,6 @@ class OsintMixin:
         }
         try:
             rows = (recon_data.get("fofa") or {}).get("results") or []
-            roots = attach_roots(recon_data)
             if not rows:
                 stats["errors"].append("No fofa results in recon_data")
             else:
@@ -1193,8 +1290,8 @@ class OsintMixin:
                                 """
                                 MERGE (p:Port {number: $port, protocol: 'tcp', ip_address: $ip,
                                                user_id: $user_id, project_id: $project_id})
-                                ON CREATE SET p.state = 'open', p.updated_at = datetime()
-                                SET p.source = 'fofa', p.updated_at = datetime()
+                                ON CREATE SET p.state = 'open', p.source = 'fofa'
+                                SET p.updated_at = datetime()
                                 MERGE (i:IP {address: $ip, user_id: $user_id, project_id: $project_id})
                                 SET i.updated_at = datetime()
                                 MERGE (i)-[:HAS_PORT]->(p)
@@ -1276,7 +1373,7 @@ class OsintMixin:
                             # FOFA host may carry port suffix (e.g. "sub.example.com:8080") — strip it
                             host_raw = (row.get("host") or "").strip()
                             host = host_raw.split(":")[0] if ":" in host_raw else host_raw
-                            root = root_for_host(host, roots) if host and host != ip else None
+                            root = attach_for_host(host, recon_data)[1] if host and host != ip else None
                             if root:
                                 session.run(
                                     """
@@ -1326,10 +1423,10 @@ class OsintMixin:
         try:
             otx = recon_data.get("otx") or {}
             reports = otx.get("ip_reports") or []
-            # `domain` is the root this scan looked up (external names hang off
-            # it); a name under any of the project's roots joins its own root.
-            domain = recon_data.get("domain", "") or ""
-            roots = attach_roots(recon_data)
+            # `domain` is the org Domain of the scan root this group looked up
+            # (external names and the org-level report hang off it); a name
+            # under any of the project's scan roots joins its root's org.
+            domain = home_domain(recon_data) or ""
             dr = otx.get("domain_report")
             if not reports and not (dr and isinstance(dr, dict) and dr.get("domain")):
                 stats["errors"].append("No otx ip_reports or domain_report in recon_data")
@@ -1396,7 +1493,7 @@ class OsintMixin:
                             first_seen = rec.get("first") or ""
                             last_seen = rec.get("last") or ""
 
-                            root = root_for_host(hostname, roots)
+                            kind, root = attach_for_host(hostname, recon_data)
                             if root:
                                 # In-scope → Subdomain node
                                 try:
@@ -1442,7 +1539,7 @@ class OsintMixin:
                                     stats["relationships_created"] += 1
                                 except Exception as e2:
                                     stats["errors"].append(f"OTX pdns in-scope {hostname}: {e2}")
-                            elif hostname and "@" not in hostname:
+                            elif kind == OUT_OF_SCOPE and "@" not in hostname:
                                 # Out-of-scope → ExternalDomain node
                                 try:
                                     session.run(
@@ -1547,7 +1644,9 @@ class OsintMixin:
                 # ── Domain report ────────────────────────────────────────
                 if dr and isinstance(dr, dict) and dr.get("domain"):
                     try:
-                        dom_name = dr["domain"]
+                        # An org-level report: it lands on the org Domain of
+                        # this group's scan root (the report names the org).
+                        dom_name = domain or dr["domain"]
                         dom_pulse_details = dr.get("pulse_details") or {}
                         whois = dr.get("whois") or {}
 
@@ -1696,7 +1795,8 @@ class OsintMixin:
     def update_graph_from_netlas(self, recon_data: dict, user_id: str, project_id: str) -> dict:
         stats = {
             "ips_enriched": 0, "ports_merged": 0, "services_merged": 0,
-            "vulnerabilities_merged": 0, "relationships_created": 0, "errors": [],
+            "vulnerabilities_merged": 0, "relationships_created": 0,
+            "historical_skipped": 0, "errors": [],
         }
         try:
             rows = (recon_data.get("netlas") or {}).get("results") or []
@@ -1709,6 +1809,10 @@ class OsintMixin:
                             continue
                         ip = row.get("ip")
                         if not ip:
+                            continue
+                        attribution = row.get("attribution")
+                        if attribution == "historical":
+                            stats["historical_skipped"] += 1
                             continue
                         try:
                             # --- IP node enrichment ---
@@ -1755,8 +1859,8 @@ class OsintMixin:
                                 """
                                 MERGE (p:Port {number: $port, protocol: $protocol, ip_address: $ip,
                                                user_id: $user_id, project_id: $project_id})
-                                ON CREATE SET p.state = 'open', p.updated_at = datetime()
-                                SET p.source = 'netlas', p.updated_at = datetime()
+                                ON CREATE SET p.state = 'open', p.source = 'netlas'
+                                SET p.updated_at = datetime()
                                 MERGE (i:IP {address: $ip, user_id: $user_id, project_id: $project_id})
                                 SET i.updated_at = datetime()
                                 MERGE (i)-[:HAS_PORT]->(p)
@@ -1799,49 +1903,24 @@ class OsintMixin:
                                 stats["services_merged"] += 1
                                 stats["relationships_created"] += 1
 
-                                # --- CVE Vulnerability nodes ---
-                                for cve in (row.get("cve_list") or []):
-                                    if not isinstance(cve, dict):
-                                        continue
-                                    cve_id = cve.get("id") or ""
-                                    if not cve_id:
-                                        continue
-                                    try:
-                                        vuln_props: dict = {
-                                            "source": "netlas",
-                                            "name": cve_id,
-                                        }
-                                        severity = cve.get("severity") or ""
-                                        if severity:
-                                            vuln_props["severity"] = severity
-                                        base_score = cve.get("base_score")
-                                        if base_score is not None:
-                                            try:
-                                                vuln_props["cvss_score"] = float(base_score)
-                                            except (TypeError, ValueError):
-                                                pass
-                                        vuln_props["has_exploit"] = bool(cve.get("has_exploit", False))
-                                        session.run(
-                                            """
-                                            MERGE (v:Vulnerability {id: $cve_id,
-                                                                     user_id: $user_id,
-                                                                     project_id: $project_id})
-                                            ON CREATE SET v.created_at = datetime()
-                                            SET v += $props, v.updated_at = datetime()
-                                            WITH v
-                                            MATCH (svc:Service {name: $svc_name, port_number: $port,
-                                                                ip_address: $ip,
-                                                                user_id: $user_id,
-                                                                project_id: $project_id})
-                                            MERGE (svc)-[:HAS_VULNERABILITY]->(v)
-                                            """,
-                                            cve_id=cve_id, user_id=user_id, project_id=project_id,
-                                            props=vuln_props, svc_name=prot_name, port=pnum, ip=ip,
-                                        )
-                                        stats["vulnerabilities_merged"] += 1
-                                        stats["relationships_created"] += 1
-                                    except Exception as e:
-                                        stats["errors"].append(f"Netlas CVE {cve_id} on {ip}:{pnum}: {e}")
+                            # --- CVE Vulnerability nodes ---
+                            # A shared edge's CVEs describe the provider and its
+                            # other tenants, not the target.
+                            if attribution == "shared_edge":
+                                continue
+                            for cve in (row.get("cve_list") or []):
+                                if not isinstance(cve, dict):
+                                    continue
+                                cve_id = str(cve.get("id") or "").strip().upper()
+                                if not _CVE_ID.match(cve_id):
+                                    continue
+                                try:
+                                    self._write_netlas_cve(session, cve, cve_id, ip, pnum,
+                                                           user_id, project_id)
+                                    stats["vulnerabilities_merged"] += 1
+                                    stats["relationships_created"] += 2
+                                except Exception as e:
+                                    stats["errors"].append(f"Netlas CVE {cve_id} on {ip}:{pnum}: {e}")
 
                         except Exception as e:
                             stats["errors"].append(f"Netlas row {ip}: {e}")
@@ -1849,6 +1928,59 @@ class OsintMixin:
             stats["errors"].append(f"update_graph_from_netlas: {e}")
         print(f"[graph-db] update_graph_from_netlas complete: {stats}")
         return stats
+
+    @staticmethod
+    def _write_netlas_cve(session, cve: dict, cve_id: str, ip: str, port: int,
+                          user_id: str, project_id: str) -> None:
+        """One Netlas CVE on one IP and port, the IP its only parent.
+
+        Shodan's shape: the board reads a finding's host from its parent, and a
+        Service parent read the protocol ("ssh") as the host. `cve_ids` and the
+        CVE reference edge carry the KEV and EPSS intel to it. The id was the
+        bare CVE once, one node per CVE per project however many IPs carried
+        it; tooling/scripts/netlas_finding_rekey.py moves those.
+        """
+        props: dict = {
+            "name": cve_id, "cves": [cve_id], "cve_ids": [cve_id],
+            "target_ip": ip, "target_port": port,
+            "has_exploit": bool(cve.get("has_exploit", False)),
+        }
+        severity = str(cve.get("severity") or "").lower()
+        if severity:
+            props["severity"] = severity
+        try:
+            if cve.get("base_score") is not None:
+                props["cvss_score"] = float(cve["base_score"])
+        except (TypeError, ValueError):
+            pass
+        session.run(
+            """
+            MERGE (v:Vulnerability {id: $vuln_id, user_id: $user_id, project_id: $project_id})
+            ON CREATE SET v.source = 'netlas', v.created_at = datetime()
+            SET v += $props, v.updated_at = datetime()
+            WITH v
+            OPTIONAL MATCH (:Service)-[stale:HAS_VULNERABILITY]->(v)
+            DELETE stale
+            WITH DISTINCT v
+            MATCH (i:IP {address: $ip, user_id: $user_id, project_id: $project_id})
+            MERGE (i)-[:HAS_VULNERABILITY]->(v)
+            """,
+            vuln_id=netlas_vuln_id(cve_id, ip, port), props=props, ip=ip,
+            user_id=user_id, project_id=project_id,
+        )
+        session.run(
+            """
+            // Global reference node: no tenant stamp.
+            MERGE (c:CVE {id: $cve_id})
+            ON CREATE SET c.source = 'netlas'
+            SET c.updated_at = datetime()
+            WITH c
+            MATCH (v:Vulnerability {id: $vuln_id, user_id: $user_id, project_id: $project_id})
+            MERGE (v)-[:INCLUDES_CVE]->(c)
+            """,
+            cve_id=cve_id, vuln_id=netlas_vuln_id(cve_id, ip, port),
+            user_id=user_id, project_id=project_id,
+        )
 
     def update_graph_from_virustotal(self, recon_data: dict, user_id: str, project_id: str) -> dict:
         stats = {"domains_updated": 0, "ips_enriched": 0, "errors": []}
@@ -1886,7 +2018,9 @@ class OsintMixin:
                                     d.vt_popularity_umbrella = $popularity_umbrella,
                                     d.updated_at = datetime()
                                 """,
-                                name=dr["domain"], user_id=user_id, project_id=project_id,
+                                # An org-level report: the org Domain of this group.
+                                name=home_domain(recon_data) or dr["domain"],
+                                user_id=user_id, project_id=project_id,
                                 reputation=dr.get("reputation"),
                                 malicious=_ast.get("malicious"),
                                 suspicious=_ast.get("suspicious"),
@@ -1967,7 +2101,6 @@ class OsintMixin:
                  "subdomains_merged": 0, "relationships_created": 0, "errors": []}
         try:
             rows = (recon_data.get("zoomeye") or {}).get("results") or []
-            roots = attach_roots(recon_data)
             if not rows:
                 stats["errors"].append("No zoomeye results in recon_data")
             else:
@@ -2028,8 +2161,8 @@ class OsintMixin:
                                     """
                                     MERGE (p:Port {number: $port, protocol: $protocol, ip_address: $ip,
                                                    user_id: $user_id, project_id: $project_id})
-                                    ON CREATE SET p.state = 'open', p.updated_at = datetime()
-                                    SET p.source = 'zoomeye', p.updated_at = datetime()
+                                    ON CREATE SET p.state = 'open', p.source = 'zoomeye'
+                                    SET p.updated_at = datetime()
                                     MERGE (i:IP {address: $ip, user_id: $user_id, project_id: $project_id})
                                     SET i.updated_at = datetime()
                                     MERGE (i)-[:HAS_PORT]->(p)
@@ -2082,7 +2215,7 @@ class OsintMixin:
                                 hostname_val = hostname_val.strip().lower()
                                 if not hostname_val:
                                     continue
-                                if root_for_host(hostname_val, roots):
+                                if attach_for_host(hostname_val, recon_data)[1]:
                                     session.run(
                                         """
                                         MERGE (s:Subdomain {name: $name, user_id: $user_id,
@@ -2130,7 +2263,9 @@ class OsintMixin:
                 with self.driver.session() as session:
                     # ── 1. Domain report → Domain node enrichment ──
                     if domain_report and isinstance(domain_report, dict):
-                        domain_name = domain_report.get("domain")
+                        # An org-level report: the org Domain of this group.
+                        domain_name = (home_domain(recon_data) or domain_report.get("domain")
+                                       if domain_report.get("domain") else None)
                         risk = domain_report.get("risk") or {}
                         if domain_name and isinstance(risk, dict):
                             try:
@@ -2245,8 +2380,8 @@ class OsintMixin:
                                     """
                                     MERGE (p:Port {number: $port, protocol: $protocol, ip_address: $ip,
                                                    user_id: $user_id, project_id: $project_id})
-                                    ON CREATE SET p.state = 'open', p.updated_at = datetime()
-                                    SET p.source = 'criminalip', p.updated_at = datetime()
+                                    ON CREATE SET p.state = 'open', p.source = 'criminalip'
+                                    SET p.updated_at = datetime()
                                     MERGE (i:IP {address: $ip, user_id: $user_id, project_id: $project_id})
                                     SET i.updated_at = datetime()
                                     MERGE (i)-[:HAS_PORT]->(p)
@@ -2297,12 +2432,18 @@ class OsintMixin:
                                         MERGE (v:Vulnerability {id: $vuln_id,
                                                                 user_id: $user_id,
                                                                 project_id: $project_id})
-                                        ON CREATE SET v.source = 'criminalip', v.name = $cve_id,
-                                                      v.cves = [$cve_id], v.cvss = $cvss,
-                                                      v.user_id = $user_id, v.project_id = $project_id,
-                                                      v.updated_at = datetime()
+                                        ON CREATE SET v.source = 'criminalip'
+                                        // Every run: the prune deletes what a run did
+                                        // not touch, and keeps an IP it could not look
+                                        // up by target_ip. The board reads the score
+                                        // as cvss_score; rows that hold it as `cvss`
+                                        // converge here.
+                                        SET v.name = $cve_id, v.cves = [$cve_id],
+                                            v.cvss_score = $cvss,
+                                            v.updated_at = datetime(), v.target_ip = $ip
+                                        REMOVE v.cvss
                                         """,
-                                        vuln_id=vuln_id, cve_id=cve_id, cvss=cvss,
+                                        vuln_id=vuln_id, cve_id=cve_id, cvss=cvss, ip=ip,
                                         user_id=user_id, project_id=project_id,
                                     )
                                     stats["vulnerabilities_created"] += 1
@@ -2372,8 +2513,9 @@ class OsintMixin:
             "relationships_created": 0, "errors": [],
         }
         roots = attach_roots(recon_data)
-        # An IP, or a URL under no root, belongs to the root this pass queried.
-        domain = recon_data.get("domain") or (roots[0] if roots else "")
+        # An IP, or a URL under no scan root, belongs to the org Domain of the
+        # scan root this pass queried.
+        domain = home_domain(recon_data) or (org_for_scan_root(roots[0], recon_data) if roots else "")
         try:
             uncover = recon_data.get("uncover") or {}
             hosts = uncover.get("hosts") or []
@@ -2392,6 +2534,14 @@ class OsintMixin:
                 for hostname in hosts:
                     if not hostname:
                         continue
+                    # A host under no scan root (or a scan root that is no
+                    # target) gets no node: uncover searches by org and
+                    # certificate, so its hosts are not scope by themselves.
+                    host_org = attach_for_host(hostname, recon_data)[1]
+                    if not host_org:
+                        stats.setdefault("hosts_out_of_scope", 0)
+                        stats["hosts_out_of_scope"] += 1
+                        continue
                     try:
                         session.run(
                             """
@@ -2406,7 +2556,7 @@ class OsintMixin:
                             sources=sources, total_raw=total_raw, total_deduped=total_deduped,
                         )
                         stats["subdomains_created"] += 1
-                        host_root = root_for_host(hostname, roots) or domain
+                        host_root = host_org
                         if host_root:
                             session.run(
                                 """
@@ -2500,6 +2650,7 @@ class OsintMixin:
                                                user_id: $user_id, project_id: $project_id})
                             ON CREATE SET e.discovered_at = datetime(), e.source = 'uncover'
                             SET e.url = $url, e.updated_at = datetime()
+                            SET e.openapi_declared_only = CASE WHEN coalesce(e.openapi_declared_only, e.openapi_declared, false) THEN false ELSE e.openapi_declared_only END
                             MERGE (u)-[:HAS_ENDPOINT]->(e)
                             """,
                             url=url, base_url=base_url, path=path,

@@ -265,6 +265,15 @@ def _build(finding: dict, clean: bool) -> str:
                  or finding.get("raw_secret") or finding.get("secret_value"))
         if value:
             parts.append(_line("Value (redacted)", redact_secret(value)))
+        context = finding.get("context")
+        if clean and context:
+            # The value is masked by name before the shape pass: a secret of no
+            # known shape would otherwise reach the reviewer whole. The legacy
+            # (v3.1) bundle never had this line, so it gets none.
+            text = str(context)
+            if value:
+                text = text.replace(str(value), redact_secret(value))
+            parts.append(_line("Context (redacted)", _clip(text, CAP_SHORT, clean=True)))
         if looks_like_a_fixture(path):
             parts.append("Path note: this path looks like a test or example file.\n")
 
@@ -305,7 +314,8 @@ def _build(finding: dict, clean: bool) -> str:
 #:   signature bundle, and a false_positive review could wrongly flip a candidate
 #:   the agent has not yet confirmed. The agent's proof-typed CONFIRMS edge is the
 #:   intended promotion path, not the built-in reviewer.
-SKIP_REVIEW_SOURCES = frozenset({"security_check", "osv", "retirejs", "serialized_scan"})
+SKIP_REVIEW_SOURCES = frozenset({"security_check", "osv", "retirejs", "serialized_scan",
+                                 "route_exposure"})
 
 
 def person_decided(status, source) -> bool:

@@ -1,10 +1,13 @@
+import type { JudgedFindingCounts } from '@/lib/triage/reportable'
+import type { DispositionSummary } from '@/lib/triage/disposition'
+
 export interface GraphOverviewData {
   nodeCounts: { label: string; count: number }[]
   relationshipCounts: { type: string; count: number }[]
   totalNodes: number
   totalRelationships: number
   subdomainStats: { total: number; resolved: number; uniqueIps: number }
-  endpointCoverage: { baseUrls: number; endpoints: number; parameters: number }
+  endpointCoverage: { baseUrls: number; endpoints: number; parameters: number; declaredEndpoints?: number; declaredParameters?: number }
   certificateHealth: { total: number; expired: number; expiringSoon: number }
   topConnected: { label: string; name: string; degree: number }[]
   infrastructureStats: {
@@ -62,8 +65,13 @@ export interface VulnerabilityData {
   cveSeverity: { severity: string; count: number }[]
   cveChains: CveChain[]
   exploits: Exploit[]
-  githubSecrets: { repos: number; secrets: number; sensitiveFiles: number }
+  /** `secrets` leaves out keys that are public by design, counted in `publicClientKeys`. */
+  githubSecrets: { repos: number; secrets: number; publicClientKeys?: number; sensitiveFiles: number }
   gvmRemediation: { status: string; count: number }[]
+  /** Findings the Priority Board set aside; null when they could not be read. */
+  judged?: JudgedFindingCounts | null
+  /** Every unmuted finding by disposition; null when it could not be read. */
+  disposition?: DispositionSummary | null
 }
 
 export interface AttackSurfaceData {
@@ -73,9 +81,10 @@ export interface AttackSurfaceData {
   dnsRecords: { type: string; count: number }[]
   securityHeaders: { name: string; isSecurity: boolean; count: number }[]
   headerCategories: { category: string; count: number }[]
-  endpointCategories: { category: string; count: number }[]
-  endpointTypes: { type: string; count: number }[]
-  parameterAnalysis: { position: string; total: number; injectable: number }[]
+  /** count / total: observed; declared: known only from an API specification. */
+  endpointCategories: { category: string; count: number; declared?: number }[]
+  endpointTypes: { type: string; count: number; declared?: number }[]
+  parameterAnalysis: { position: string; total: number; injectable: number; declared?: number }[]
   cdnDistribution: { segment: string; count: number }[]
   ipConcentration: { ip: string; subCount: number; isCdn: boolean }[]
 }
@@ -139,8 +148,17 @@ export interface AttackChainsData {
   attackFlowRows: { target: string; tool: string; findingType: string; severity: string }[]
 }
 
+/** A pipeline whose state is unknown: the orchestrator did not answer, or answered with an error. */
+export interface UnreachablePipeline {
+  reachable: false
+  code: string
+  upstreamStatus?: number
+  status?: undefined
+  currentPhase?: undefined
+}
+
 export interface PipelineStatusData {
-  recon: { status: string; currentPhase?: string; startedAt?: string; completedAt?: string } | null
-  gvm: { status: string; startedAt?: string; completedAt?: string } | null
-  githubHunt: { status: string; startedAt?: string; completedAt?: string } | null
+  recon: { status: string; currentPhase?: string; startedAt?: string; completedAt?: string } | UnreachablePipeline | null
+  gvm: { status: string; startedAt?: string; completedAt?: string } | UnreachablePipeline | null
+  githubHunt: { status: string; startedAt?: string; completedAt?: string } | UnreachablePipeline | null
 }

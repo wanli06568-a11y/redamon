@@ -8,6 +8,7 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from recon.partial_recon_modules.helpers import (
+    attach_org,
     STATUS_NO_RESULTS,
     STATUS_OK,
     STATUS_RATE_LIMITED,
@@ -19,7 +20,10 @@ from recon.partial_recon_modules.helpers import (
     run_per_root,
     scope_roots,
 )
-from recon.partial_recon_modules.graph_builders import _build_recon_data_from_graph
+from recon.partial_recon_modules.graph_builders import (
+    _build_recon_data_from_graph,
+    attach_graph_ownership,
+)
 
 
 def _root_recon_data(root: str, roots: list, config: dict, settings: dict,
@@ -46,6 +50,9 @@ def _root_recon_data(root: str, roots: list, config: dict, settings: dict,
             },
         }
     recon_data["domains"] = list(roots)
+    # Shodan and Netlas write no CVE on an IP the graph's IP attribution tagged
+    # shared_edge.
+    attach_graph_ownership(recon_data, user_id, project_id)
     return recon_data
 
 
@@ -144,6 +151,10 @@ def run_shodan(config: dict) -> dict:
         if not shodan_data:
             print(f"[-][Partial Recon] Shodan returned no data")
             return STATUS_NO_RESULTS
+        from recon.main_recon_modules.ip_attribution import shared_edge_ips
+        from recon.main_recon_modules.shodan_enrich import drop_shared_edge_cves
+        if drop_shared_edge_cves(shodan_data, shared_edge_ips(combined_result)):
+            print(f"[*][Partial Recon] Dropped passive CVEs on shared edge IP(s)")
 
         print(f"[+][Partial Recon] Shodan hosts enriched: {len(shodan_data.get('hosts', []))}")
         print(f"[+][Partial Recon] Reverse DNS entries: {len(shodan_data.get('reverse_dns', {}))}")
@@ -156,6 +167,20 @@ def run_shodan(config: dict) -> dict:
             from graph_db import Neo4jClient
             with Neo4jClient() as graph_client:
                 if graph_client.verify_connection():
+                    # No port scan in this run: the graph's actively found open
+                    # ports confirm a CVE's port; a missing one stays unknown.
+                    cve_ips = {c.get("ip") for c in shodan_data.get("cves") or [] if c.get("ip")}
+                    if cve_ips:
+                        from recon.main_recon_modules.shodan_enrich import reachcheck_cves
+                        try:
+                            open_ports = graph_client.active_open_ports(user_id, project_id, cve_ips)
+                            reachcheck_cves(
+                                shodan_data,
+                                lambda ip, port: True if port in open_ports.get(ip, ()) else None,
+                                clear_unknown=False)
+                        except Exception as e:  # noqa: BLE001 - an unchecked CVE keeps its value
+                            print(f"[!][Partial Recon] Could not read open ports for the CVE "
+                                  f"check: {type(e).__name__}")
                     stats = graph_client.update_graph_from_shodan(
                         recon_data=combined_result,
                         user_id=user_id,
@@ -204,7 +229,7 @@ def run_shodan(config: dict) -> dict:
                                 ui_id = user_input_id or str(uuid.uuid4())
                                 session.run(
                                     """
-                                    MATCH (d:Domain {name: $domain, user_id: $uid, project_id: $pid})
+                                    MATCH (d:Domain {user_id: $uid, project_id: $pid}) WHERE toLower(d.name) = toLower($domain)
                                     MERGE (ui:UserInput {id: $ui_id, user_id: $uid, project_id: $pid})
                                     ON CREATE SET ui.type = 'ip',
                                                   ui.values = $ips,
@@ -213,7 +238,7 @@ def run_shodan(config: dict) -> dict:
                                     SET ui.updated_at = datetime()
                                     MERGE (d)-[:HAS_USER_INPUT]->(ui)
                                     """,
-                                    domain=domain, uid=user_id, pid=project_id,
+                                    domain=attach_org(domain), uid=user_id, pid=project_id,
                                     ui_id=ui_id, ips=user_ips,
                                 )
                                 for ip_str in user_ips:
@@ -610,7 +635,7 @@ def run_osint_enrichment(config: dict) -> dict:
                                 user_input_id = str(uuid.uuid4())
                                 sess.run(
                                     """
-                                    MATCH (d:Domain {name: $domain, user_id: $uid, project_id: $pid})
+                                    MATCH (d:Domain {user_id: $uid, project_id: $pid}) WHERE toLower(d.name) = toLower($domain)
                                     MERGE (ui:UserInput {id: $ui_id, user_id: $uid, project_id: $pid})
                                     ON CREATE SET ui.source = 'OsintEnrichment',
                                                   ui.created_at = datetime(),
@@ -618,7 +643,7 @@ def run_osint_enrichment(config: dict) -> dict:
                                     SET ui.updated_at = datetime()
                                     MERGE (d)-[:HAS_USER_INPUT]->(ui)
                                     """,
-                                    domain=domain, uid=user_id, pid=project_id, ui_id=user_input_id,
+                                    domain=attach_org(domain), uid=user_id, pid=project_id, ui_id=user_input_id,
                                 )
                                 # Link each IP to UserInput
                                 for raw_ip in user_ips:

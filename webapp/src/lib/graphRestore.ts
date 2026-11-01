@@ -19,6 +19,7 @@
 import { createHash } from 'crypto'
 import type { Session } from 'neo4j-driver'
 import { functionalLabel } from '@/lib/scanSnapshot'
+import { carriedReferenceEdgesToLinks, isReferenceNode, restoreReferenceLinks } from '@/lib/graphReferenceLinks'
 
 /**
  * Derive a Certificate `cert_key` for a snapshot node that predates the re-key
@@ -59,11 +60,15 @@ export interface RestoreOptions {
   userId?: string
   nodeBatchSize?: number
   relBatchSize?: number
+  /** Link records to the global reference catalogue (graphReferenceLinks.ts); untrusted input. */
+  referenceLinks?: readonly unknown[]
 }
 
 export interface RestoreResult {
   nodes: number
   relationships: number
+  /** Present when link records were given: those re-linked, and those skipped. */
+  referenceLinks?: { restored: number; skipped: number }
 }
 
 const DEFAULT_NODE_BATCH = 500
@@ -107,12 +112,16 @@ export async function sweepOrphanReferenceNodes(session: Session): Promise<void>
  * recon version - notably the AttackChain family, which is agent-session state
  * and must survive a version swap (F1).
  *
- * Global reference nodes are always excluded, then swept if orphaned.
+ * Global reference nodes are always excluded, then swept if orphaned. A caller
+ * that restores a graph next passes `sweep: false` and sweeps after its restore:
+ * swept in between, a CVE only this project linked is gone before the restore
+ * can link it back.
  */
 export async function clearProjectGraph(
   session: Session,
   projectId: string,
-  excludeLabels: readonly string[] = []
+  excludeLabels: readonly string[] = [],
+  opts: { sweep?: boolean } = {}
 ): Promise<void> {
   const excluded = [...new Set([...excludeLabels, ...GLOBAL_REFERENCE_LABELS])]
   await session.run(
@@ -121,7 +130,7 @@ export async function clearProjectGraph(
      DETACH DELETE n`,
     { pid: projectId, excluded }
   )
-  await sweepOrphanReferenceNodes(session)
+  if (opts.sweep !== false) await sweepOrphanReferenceNodes(session)
 }
 
 /** Uniqueness-constraint keys per label, used to choose MERGE vs CREATE. */
@@ -136,6 +145,32 @@ async function loadUniqueKeys(session: Session): Promise<Map<string, string[]>> 
     map.set(record.get('label') as string, record.get('properties') as string[])
   }
   return map
+}
+
+/**
+ * Properties an earlier release wrote and nothing writes any more, per label
+ * (`*` = every label). A scan version saved before they were retired, or a
+ * project exported then, would bring them back.
+ *
+ * - every label: OpenAPI declarations stored as JSON (up to 1 MiB per
+ *   Endpoint), the Domain import summary and stamp, and a transaction-local lock;
+ * - `Domain`: the flat per-run props of the scan-root Domain (§4.11.3). The
+ *   Domain is now the org, shared by several scan roots, so one run's
+ *   `filtered_mode` or `target` would describe only one of them. Per label on
+ *   purpose: `GithubHunt.target` and `MultiscannerScan.target` are live, and an
+ *   IP-mode Domain keeps its own `scan_type` and `modules_executed`.
+ */
+export const RETIRED_NODE_PROPERTIES_BY_LABEL: Readonly<Record<string, readonly string[]>> = {
+  '*': ['openapi_declarations', 'openapi_summary', 'openapi_last_import_at', '_openapi_write_lock'],
+  Domain: ['target', 'filtered_mode', 'wildcard_mode', 'subdomain_filter', 'modules_executed',
+    'anonymous_mode', 'bruteforce_mode', 'scan_type'],
+}
+
+/** The retired properties to drop from one node. */
+export function retiredPropertiesFor(labels: readonly string[], properties: Record<string, unknown>): string[] {
+  const out = [...RETIRED_NODE_PROPERTIES_BY_LABEL['*']]
+  if (labels.includes('Domain') && properties.ip_mode !== true) out.push(...RETIRED_NODE_PROPERTIES_BY_LABEL.Domain)
+  return out
 }
 
 /**
@@ -154,13 +189,20 @@ export async function restoreGraph(
   const relBatchSize = opts.relBatchSize ?? DEFAULT_REL_BATCH
   const uniqueKeyMap = await loadUniqueKeys(session)
 
-  const prepared = nodes.map(node => {
+  // A catalogue node is keyed on its natural id alone and shared by every
+  // tenant: MERGEd from a payload it would take the payload's properties. Only
+  // links to it are restored, below, its carried edges included.
+  const carried = carriedReferenceEdgesToLinks(nodes, relationships)
+  const projectRelationships = carried.relationships
+  const links = [...(opts.referenceLinks ?? []), ...carried.referenceLinks]
+  const prepared = nodes.filter(node => !isReferenceNode(node.labels)).map(node => {
     const properties: Record<string, unknown> = {
       ...node.properties,
       ...(opts.userId ? { user_id: opts.userId } : {}),
       project_id: opts.projectId,
       _exportId: node._exportId,
     }
+    for (const retired of retiredPropertiesFor(node.labels, properties)) delete properties[retired]
     // Pre-re-key snapshots have no cert_key; the uniqueness constraint now
     // requires it. Derive it before MERGE so old certificates do not collapse.
     if (node.labels.includes('Certificate') && !properties.cert_key) {
@@ -207,9 +249,9 @@ export async function restoreGraph(
     }
   }
 
-  if (relationships.length > 0) {
-    for (let i = 0; i < relationships.length; i += relBatchSize) {
-      const batch = relationships.slice(i, i + relBatchSize)
+  if (projectRelationships.length > 0) {
+    for (let i = 0; i < projectRelationships.length; i += relBatchSize) {
+      const batch = projectRelationships.slice(i, i + relBatchSize)
       await session.run(
         `UNWIND $rels AS rel
          MATCH (a {_exportId: rel.startExportId, project_id: $pid})
@@ -221,11 +263,20 @@ export async function restoreGraph(
     }
   }
 
+  // Before the strip: links find their project end by its _exportId.
+  const referenceLinks = links.length
+    ? await restoreReferenceLinks(session, links, opts.projectId, relBatchSize)
+    : undefined
+
   // Strip the temporary correlation id so it never leaks into the graph.
   await session.run(
     'MATCH (n {project_id: $pid}) WHERE n._exportId IS NOT NULL REMOVE n._exportId',
     { pid: opts.projectId }
   )
 
-  return { nodes: nodes.length, relationships: relationships.length }
+  return {
+    nodes: prepared.length,
+    relationships: projectRelationships.length,
+    ...(referenceLinks ? { referenceLinks } : {}),
+  }
 }

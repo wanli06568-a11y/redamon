@@ -9,7 +9,9 @@ export const SECTION_INPUT_MAP: Record<string, string[]> = {
   Nmap:               ['IP', 'Port'],
   Tlsx:               ['IP', 'Port'],
   Httpx:              ['Subdomain', 'IP', 'Port'],
+  IpAttribution:      ['IP', 'Port', 'Subdomain'],
   Katana:             ['BaseURL'],
+  OpenAPI:            ['BaseURL'],
   ZapAjaxSpider:      ['BaseURL', 'Endpoint'],
   Hakrawler:          ['BaseURL'],
   Jsluice:            ['BaseURL', 'Endpoint'],
@@ -34,6 +36,7 @@ export const SECTION_INPUT_MAP: Record<string, string[]> = {
   SubdomainTakeover:  ['Subdomain', 'BaseURL', 'Domain'],
   VhostSni:           ['Subdomain', 'IP', 'Port', 'BaseURL', 'Certificate', 'DNSRecord', 'ExternalDomain'],
   WebCachePoison:     ['BaseURL', 'Endpoint'],
+  RouteExposure:      ['BaseURL', 'Endpoint', 'Technology'],
 }
 
 export const SECTION_NODE_MAP: Record<string, string[]> = {
@@ -47,7 +50,9 @@ export const SECTION_NODE_MAP: Record<string, string[]> = {
   Nmap:               ['Technology', 'Vulnerability', 'CVE'],
   Tlsx:               ['Certificate', 'Subdomain'],
   Httpx:              ['BaseURL', 'Certificate', 'Technology', 'Header'],
+  IpAttribution:      [],
   Katana:             ['Endpoint', 'Parameter', 'BaseURL', 'ExternalDomain'],
+  OpenAPI:            ['Endpoint', 'BaseURL', 'Parameter'],
   ZapAjaxSpider:      ['Endpoint', 'Parameter', 'BaseURL', 'ExternalDomain'],
   Hakrawler:          ['Endpoint', 'Parameter', 'BaseURL', 'ExternalDomain'],
   Jsluice:            ['Endpoint', 'Parameter', 'BaseURL', 'Secret', 'ExternalDomain'],
@@ -64,7 +69,7 @@ export const SECTION_NODE_MAP: Record<string, string[]> = {
   Github:             ['GithubHunt', 'GithubRepository', 'GithubPath', 'GithubSecret', 'GithubSensitiveFile'],
   SecurityChecks:     ['Vulnerability'],
   Uncover:            ['IP', 'Subdomain', 'Port', 'Endpoint'],
-  JsRecon:            ['Secret', 'Endpoint'],
+  JsRecon:            ['Secret', 'Endpoint', 'JsReconFinding'],
   SerializedScan:     ['Vulnerability'],
   SupplyChainRecon:   ['Package', 'MalPackageFinding'],
   GraphqlScan:        ['Vulnerability', 'Endpoint'],
@@ -72,6 +77,7 @@ export const SECTION_NODE_MAP: Record<string, string[]> = {
   SubdomainTakeover:  ['Vulnerability'],
   VhostSni:           ['Vulnerability', 'BaseURL', 'Subdomain'],
   WebCachePoison:     ['Vulnerability'],
+  RouteExposure:      ['Vulnerability', 'Endpoint'],
 }
 
 export const SECTION_ENRICH_MAP: Record<string, string[]> = {
@@ -86,10 +92,12 @@ export const SECTION_ENRICH_MAP: Record<string, string[]> = {
   Nmap:               ['Port', 'Service'],
   Tlsx:               ['Service'],
   Httpx:              ['Subdomain', 'Domain'],
+  IpAttribution:      ['IP'],
   EndpointAiClassifier: ['Endpoint', 'Parameter'],
   AiSurfaceRecon:     ['Endpoint', 'Parameter', 'Technology'],
   SecurityChecks:     ['IP'],
   GraphqlScan:        ['Endpoint'],
   VhostSni:           ['Subdomain', 'IP'],
   WebCachePoison:     ['Endpoint', 'BaseURL'],
+  RouteExposure:      ['Endpoint'],
 }

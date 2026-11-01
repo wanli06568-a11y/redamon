@@ -100,7 +100,8 @@ describe('ScanScheduleTable', () => {
     // Give a runaway effect plenty of turns to pile requests up.
     for (let i = 0; i < 10; i++) await new Promise(r => setTimeout(r, 5))
     expect(scheduleGets()).toHaveLength(1)
-    await waitFor(() => expect(screen.getByText(/schedules exploded/)).toBeTruthy())
+    // The embedded queue panel gets the same failing answer, so the text shows twice.
+    await waitFor(() => expect(screen.getAllByText('schedules exploded (HTTP 500)').length).toBeGreaterThan(0))
   })
 
   test('only one load happens per project on mount', async () => {
@@ -122,13 +123,81 @@ describe('ScanScheduleTable', () => {
     })
   })
 
+  // WEB-31: the paused-for-scope badge is computed live from the project's
+  // saved scope, not from run history.
+  describe('a saved scope the rules now refuse', () => {
+    const route = (project: Record<string, unknown>, schedule = SCHEDULE) =>
+      fetchMock.mockImplementation(async (url: string) =>
+        String(url) === '/api/projects/p1' ? ok(project) : ok({ schedules: [schedule], jobs: [] }))
+    const INVALID = {
+      id: 'p1', ipMode: false, domainBatchMode: true, targetDomain: '', subdomainList: [],
+      domainBatchHosts: ['*.com.vn', 'www.example.com'],
+    }
+
+    test('a paused schedule says why, names the entry, and cannot be re-enabled', async () => {
+      route(INVALID, { ...SCHEDULE, enabled: false })
+      render(<ScanScheduleTable projectId="p1" />)
+      await waitFor(() => expect(screen.getByText(/paused: the saved scope is no longer valid/)).toBeTruthy())
+      expect(screen.getByText(/\(\*\.com\.vn\)/)).toBeTruthy()
+      expect(screen.getByText(/edit the target list and re-enable/)).toBeTruthy()
+      const enable = screen.getByTitle('Fix the target list before enabling') as HTMLButtonElement
+      expect(enable.disabled).toBe(true)
+    })
+
+    test('an enabled schedule warns that its next run will be refused', async () => {
+      route(INVALID)
+      render(<ScanScheduleTable projectId="p1" />)
+      await waitFor(() => expect(screen.getByText(/next run will be refused/)).toBeTruthy())
+    })
+
+    test('a valid scope shows no badge', async () => {
+      route({ ...INVALID, domainBatchHosts: ['www.example.com'] }, { ...SCHEDULE, enabled: false })
+      render(<ScanScheduleTable projectId="p1" />)
+      await waitFor(() => expect(screen.getByText('nightly')).toBeTruthy())
+      for (let i = 0; i < 3; i++) await new Promise(r => setTimeout(r, 5))
+      expect(screen.queryByText(/no longer valid/)).toBeNull()
+      expect((screen.getByTitle('Enable') as HTMLButtonElement).disabled).toBe(false)
+    })
+  })
+
   test('a rejected create surfaces the server reason (e.g. the RAM overlap check)', async () => {
     render(<ScanScheduleTable projectId="p1" />)
     await waitFor(() => expect(screen.getByText('nightly')).toBeTruthy())
     fetchMock.mockResolvedValueOnce(fail(409, { error: 'not enough RAM in that window' }))
     fireEvent.click(screen.getByText('Add schedule'))
     await waitFor(() => expect(alertError).toHaveBeenCalledWith(
-      'not enough RAM in that window', 'Schedule not created'
+      'not enough RAM in that window (HTTP 409)', 'Schedule not created'
+    ))
+  })
+
+  test('a create the network dropped is reported, not swallowed', async () => {
+    render(<ScanScheduleTable projectId="p1" />)
+    await waitFor(() => expect(screen.getByText('nightly')).toBeTruthy())
+    fetchMock.mockRejectedValueOnce(new TypeError('Failed to fetch'))
+    fireEvent.click(screen.getByText('Add schedule'))
+    await waitFor(() => expect(alertError).toHaveBeenCalledWith(
+      'Could not create the schedule (network_error)', 'Schedule not created'
+    ))
+  })
+
+  test('a toggle answered by an empty 500 shows the status instead of nothing', async () => {
+    render(<ScanScheduleTable projectId="p1" />)
+    await waitFor(() => expect(screen.getByText('nightly')).toBeTruthy())
+    fetchMock.mockResolvedValueOnce({ ok: false, status: 500, text: async () => '' })
+    fireEvent.click(screen.getByTitle('Disable'))
+    await waitFor(() => expect(alertError).toHaveBeenCalledWith(
+      'Could not update the schedule (empty_response · HTTP 500)', 'Schedule'
+    ))
+  })
+
+  test('a delete refused by the route shows its code', async () => {
+    dangerConfirm.mockResolvedValue(true)
+    render(<ScanScheduleTable projectId="p1" />)
+    await waitFor(() => expect(screen.getByText('nightly')).toBeTruthy())
+    fetchMock.mockResolvedValueOnce(fail(500, { error: 'Failed to delete the schedule', code: 'P2034' }))
+    fireEvent.click(screen.getByTitle('Delete schedule'))
+    await waitFor(() => expect(alertError).toHaveBeenCalledWith(
+      'Failed to delete the schedule (P2034 · HTTP 500)', 'Schedule'
     ))
   })
 

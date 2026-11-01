@@ -31,7 +31,9 @@ from orchestrator_helpers.agent_context import get_agent_context
 from orchestrator_helpers.json_utils import json_dumps_safe, normalize_content
 from orchestrator_helpers.parsing import try_parse_llm_decision
 from orchestrator_helpers.config import get_identifiers, is_session_config_complete
+from orchestrator_helpers.finding_guard import unrecorded_confirmations, unrecorded_note
 from orchestrator_helpers.llm_retry import retry_llm_call
+from orchestrator_helpers.llm_retry import llm_error_reason
 from orchestrator_helpers.productivity import (
     audit_productivity_claim,
     axis_key,
@@ -587,23 +589,26 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
     if get_setting('STEALTH_MODE', False):
         logger.info(f"[{user_id}/{project_id}/{session_id}] STEALTH MODE active — injected stealth rules into prompt")
 
-    # Scope guardrail: remind agent to stay within authorized targets
-    # Always inject for hard-blocked domains (government/public); also inject when soft guardrail is enabled
-    _inject_scope_guardrail = get_setting('AGENT_GUARDRAIL_ENABLED', True)
-    if not _inject_scope_guardrail:
-        from orchestrator_helpers.hard_guardrail import is_hard_blocked
-        _target_domain = get_setting('TARGET_DOMAIN', '')
-        _ip_mode = get_setting('IP_MODE', False)
-        if not _ip_mode and _target_domain:
-            _inject_scope_guardrail, _ = is_hard_blocked(_target_domain)
-
-    if _inject_scope_guardrail:
+    # Scope guardrail. The prompt is the only control on which hosts the agent's
+    # tools target (the guardrails judge the project, not each call), so the
+    # scope itself is listed whenever there is one; an EXACT project's limits
+    # exist nowhere else in the agent's view.
+    from project_settings import compact_scope_text
+    _scope_text = compact_scope_text()
+    if _scope_text or get_setting('AGENT_GUARDRAIL_ENABLED', True):
         system_prompt += (
             "\n\n## SCOPE GUARDRAIL\n\n"
             "You must ONLY operate against the project's configured target domain/IPs. "
             "Never scan, exploit, probe, or interact with domains or IPs outside the authorized scope. "
             "If the user asks you to target something outside the project scope, refuse and explain why."
         )
+        if _scope_text:
+            system_prompt += (
+                "\n\nIn scope:\n" + _scope_text + "\n\n"
+                "Nothing else is in scope. A Domain node in the graph names the organisation "
+                "(the registrable domain) and is not automatically in scope: neither it nor a "
+                "host under it is a target unless the list above covers it."
+            )
 
     # Rules of Engagement injection
     if get_setting('ROE_ENABLED', False):
@@ -754,6 +759,10 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
             "Be more critical about your verdict this turn — empty/duplicate outputs are "
             "not 'confirmation'.\n"
         )
+
+    _unrecorded = state.get("_unrecorded_confirmation")
+    if _unrecorded:
+        system_prompt += unrecorded_note(_unrecorded)
 
     # CHECK: Is there a pending tool output to analyze?
     pending_step = state.get("_current_step")
@@ -972,7 +981,7 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
                 thought="",
                 reasoning="LLM call failed after transient-error retries",
                 action="complete",
-                completion_reason=f"llm_error: {exc}",
+                completion_reason=llm_error_reason(exc),
                 updated_todo_list=[],
             )
             break
@@ -1248,6 +1257,11 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
         updates["_current_plan"] = None  # Clear any stale plan
         updates["_current_fireteam_plan"] = None
 
+    # Recomputed at every analysis, so the note shows once and clears at the next
+    # analysis that records a chain finding or names no confirmation.
+    if has_pending_output or has_pending_plan_outputs:
+        updates["_unrecorded_confirmation"] = unrecorded_confirmations(decision.output_analysis)
+
     # Process output analysis if we had pending tool output
     if has_pending_output:
         step_iteration = pending_step.get("iteration", iteration)
@@ -1374,11 +1388,11 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
                 })
                 updates["chain_failures_memory"] = chain_failures_mem
 
-            # 3. Write ChainStep to Neo4j (via executor to avoid blocking the event loop)
+            # 3. Write ChainStep to Neo4j on the chain writer thread. Bounded:
+            # the step's tool_complete reaches the UI only when this node
+            # returns, so a write stalled on Neo4j used to freeze the tool card.
             prev_step_id = state.get("_last_chain_step_id")
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(
-                None,
+            step_written = await chain_graph.run_bounded_write(
                 lambda: chain_graph.sync_record_step(
                     neo4j_uri, neo4j_user, neo4j_password,
                     step_id=step_id,
@@ -1397,8 +1411,11 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
                     extracted_info=analysis.extracted_info.model_dump() if analysis and analysis.extracted_info else {},
                     **get_agent_context(state),
                 ),
+                label=f"ChainStep {step_id}",
             )
-            updates["_last_chain_step_id"] = step_id
+            # A dropped step will never exist; keep linking to the last one that does.
+            if step_written is not None:
+                updates["_last_chain_step_id"] = step_id
 
             # 4. Fire-and-forget: write exploit success (AFTER step so PRODUCED link works)
             if analysis.exploit_succeeded and analysis.exploit_details and phase == "exploitation":
@@ -1441,6 +1458,8 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
                     iteration=step_iteration,
                     related_cves=cf.related_cves, related_ips=cf.related_ips,
                     related_finding_ids=getattr(cf, 'related_finding_ids', None),
+                    skill=state.get("attack_path_type", ""),
+                    route_exposure_on=get_setting('ROUTE_EXPOSURE_ENABLED', False),
                     agent_id=_ctx["agent_id"],
                     source_agent=_ctx["agent_name"],
                     fireteam_id=_ctx["fireteam_id"],
@@ -1658,7 +1677,6 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
         # Create one ExecutionStep per plan tool (for trace granularity)
         # Use sync writes so each step exists before the next links to it
         prev_chain_step_id = state.get("_last_chain_step_id")
-        loop = asyncio.get_running_loop()
 
         # Combined extracted_info for all wave tools (same for each — wave has one analysis)
         combined_extracted = {}
@@ -1712,8 +1730,7 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
             # Neo4j chain step (sync so prev_step_id linkage is sequential)
             # Capture all loop variables via default args to avoid closure issues
             _ctx = get_agent_context(state)
-            await loop.run_in_executor(
-                None,
+            step_written = await chain_graph.run_bounded_write(
                 lambda _sid=step_id, _prev=prev_chain_step_id, _ps=plan_step,
                        _ei=combined_extracted, _thought=step_thought,
                        _reasoning=step_reasoning, _oa=step_output_analysis,
@@ -1737,9 +1754,12 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
                     agent_name=_c["agent_name"],
                     fireteam_id=_c["fireteam_id"],
                 ),
+                label=f"ChainStep {step_id}",
             )
-            # Update prev for next tool in wave (sequential chain linkage)
-            prev_chain_step_id = step_id
+            # Update prev for next tool in wave (sequential chain linkage),
+            # skipping a dropped step that will never exist.
+            if step_written is not None:
+                prev_chain_step_id = step_id
 
             # Neo4j ChainFailure node for failed tools (mirrors single-tool path)
             if not plan_step.get("success"):
@@ -1801,6 +1821,8 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
                     iteration=plan_iteration,
                     related_cves=cf.related_cves, related_ips=cf.related_ips,
                     related_finding_ids=getattr(cf, 'related_finding_ids', None),
+                    skill=state.get("attack_path_type", ""),
+                    route_exposure_on=get_setting('ROUTE_EXPOSURE_ENABLED', False),
                     agent_id=_ctx["agent_id"],
                     source_agent=_ctx["agent_name"],
                     fireteam_id=_ctx["fireteam_id"],
@@ -1814,7 +1836,7 @@ async def think_node(state: AgentState, config, *, llm, guidance_queues, neo4j_c
         if not (decision.action == "plan_tools" and decision.tool_plan):
             updates["_current_plan"] = None
         if new_trace_entries:
-            updates["_last_chain_step_id"] = new_trace_entries[-1]["step_id"]
+            updates["_last_chain_step_id"] = prev_chain_step_id
         tool_summary = ", ".join(f"{s.get('tool_name')}({'OK' if s.get('success') else 'FAIL'})" for s in plan_steps)
         overall = analysis.interpretation if analysis else "Plan wave completed"
         updates["messages"] = [AIMessage(content=f"**Wave** [{phase}] {tool_summary}\n\n{overall}")]

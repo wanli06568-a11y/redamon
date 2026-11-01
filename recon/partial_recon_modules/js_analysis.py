@@ -7,7 +7,8 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from recon.partial_recon_modules.helpers import _is_valid_url, _scope_partial_urls, partial_settings, scope_roots
+from recon.partial_recon_modules.graph_builders import declared_only_unsafe, graph_scope_subdomains
+from recon.partial_recon_modules.helpers import _is_valid_url, _scope_partial_urls, partial_settings, scope_roots, root_orgs
 
 
 def run_jsrecon(config: dict) -> None:
@@ -70,6 +71,7 @@ def run_jsrecon(config: dict) -> None:
     # Build target URLs from Neo4j graph (or start empty if user unchecked graph targets)
     include_graph = config.get("include_graph_targets", True)
     target_urls = []
+    graph_js_urls = []
     graph_subdomains = []
 
     if include_graph:
@@ -83,6 +85,7 @@ def run_jsrecon(config: dict) -> None:
                     result = session.run(
                         """
                         MATCH (e:Endpoint {user_id: $uid, project_id: $pid})
+                        WHERE NOT """ + declared_only_unsafe("e") + """
                         RETURN DISTINCT e.baseurl + e.path AS url
                         """,
                         uid=user_id, pid=project_id,
@@ -105,18 +108,25 @@ def run_jsrecon(config: dict) -> None:
                         if url and url not in target_urls:
                             target_urls.append(url)
 
+                    # The crawler's exclude list keeps /static/ and /_next/static
+                    # bundles out of the Endpoints, so the JS files the last run
+                    # analyzed are read from their js_file nodes. A source-map
+                    # pseudo-file (map_url#source) is not a URL to fetch.
                     result = session.run(
                         """
-                        MATCH (d:Domain {user_id: $uid, project_id: $pid})
-                              -[:HAS_SUBDOMAIN]->(s:Subdomain)
-                        WHERE d.name IN $domains
-                        RETURN collect(DISTINCT s.name) AS subdomains
+                        MATCH (f:JsReconFinding {user_id: $uid, project_id: $pid, finding_type: 'js_file'})
+                        WHERE f.source_url STARTS WITH 'http' AND NOT f.source_url CONTAINS '#'
+                        RETURN DISTINCT f.source_url AS url
                         """,
-                        domains=roots, uid=user_id, pid=project_id,
+                        uid=user_id, pid=project_id,
                     )
-                    record = result.single()
-                    if record:
-                        graph_subdomains = record["subdomains"] or []
+                    for record in result:
+                        url = record["url"]
+                        if isinstance(url, str) and url.startswith(("http://", "https://")) and "#" not in url:
+                            graph_js_urls.append(url)
+
+                    graph_subdomains = graph_scope_subdomains(
+                        session, user_id, project_id, roots, config.get("domain_groups"))
 
                 print(f"[+][Partial Recon] Found {len(target_urls)} URLs from graph")
             else:
@@ -126,10 +136,13 @@ def run_jsrecon(config: dict) -> None:
 
     if user_urls:
         print(f"[*][Partial Recon] Adding {len(user_urls)} user-provided URLs")
+    js_file_urls = set(graph_js_urls) - set(target_urls)
     target_urls, scope_hosts = _scope_partial_urls(
-        target_urls, user_urls, graph_subdomains, settings, roots,
+        target_urls + sorted(js_file_urls), user_urls, graph_subdomains, settings, roots,
         domain_groups=config.get("domain_groups"),
     )
+    if js_file_urls:
+        print(f"[+][Partial Recon] {len(js_file_urls & set(target_urls))} JS file(s) from the last JS Recon run")
 
     # Check for uploaded JS files (they're loaded by run_js_recon internally)
     has_uploaded_files = False
@@ -159,7 +172,8 @@ def run_jsrecon(config: dict) -> None:
             "subdomains": [{"subdomain": s, "source": "graph"} for s in graph_subdomains],
         },
         "resource_enum": {
-            "discovered_urls": target_urls,
+            "discovered_urls": [u for u in target_urls if u not in js_file_urls],
+            "js_urls": [u for u in target_urls if u in js_file_urls],
         },
         "http_probe": {
             "by_url": {},
@@ -178,7 +192,10 @@ def run_jsrecon(config: dict) -> None:
     endpoints_count = len(js_recon_data.get("endpoints", []))
     print(f"[+][Partial Recon] JS Recon found {secrets_count} secrets, {endpoints_count} endpoints")
 
-    if not js_recon_data or (not secrets_count and not endpoints_count):
+    # A host analyzed with nothing found still gets its coverage stamp: that
+    # "analyzed, no findings" is what tells it apart from "never analyzed".
+    covered = (js_recon_data.get("scan_metadata") or {}).get("coverage", {}).get("hosts")
+    if not js_recon_data or (not secrets_count and not endpoints_count and not covered):
         print("[*][Partial Recon] No JS Recon findings to update in graph")
         if not js_recon_data.get("scan_metadata", {}).get("js_files_analyzed", 0):
             print("[*][Partial Recon] No JS files were found/analyzed. Ensure target URLs contain .js files.")
@@ -231,6 +248,7 @@ def run_jsrecon(config: dict) -> None:
                                 },
                                 user_id=user_id,
                                 project_id=project_id,
+                                root_orgs=root_orgs(roots),
                             )
                             for url in user_urls:
                                 parsed = _urlparse(url)

@@ -130,3 +130,22 @@ describe('PUT /api/projects/[id] — auth profile is not writable through the ro
     expect(data).toEqual({ name: 'renamed', updatedById: 'owner' })
   })
 })
+
+test('a saved source keeps only its four fields, and a blank row is not a source', async () => {
+  wireProject(PROFILE)
+  const body = {
+    openapiSources: [
+      { id: 's1', url: 'https://example.test/spec', headers: ['Authorization: extra-secret'] },
+      { id: 's2', url: '' },
+    ],
+  }
+  mockProjectUpdate.mockImplementation(async (args: { data: Record<string, unknown> }) =>
+    ({ id: 'proj-1', userId: 'owner', ipMode: true, ...args.data }))
+  const res = await PUT(new NextRequest('http://x/api/projects/proj-1', {
+    method: 'PUT', body: JSON.stringify(body),
+  }), params)
+  expect(res.status).toBe(200)
+  const stored = mockProjectUpdate.mock.calls[0][0].data
+  expect(stored).toEqual({ openapiSources: [{ id: 's1', url: 'https://example.test/spec' }], updatedById: 'owner' })
+  expect(await res.text()).not.toContain('extra-secret')
+})

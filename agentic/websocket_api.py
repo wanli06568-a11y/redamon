@@ -31,6 +31,31 @@ def serialize_for_json(obj):
 logger = logging.getLogger(__name__)
 
 
+def _error_details(exc: BaseException) -> dict:
+    """What an ERROR frame may say about an exception: its class and, for a
+    provider error, the HTTP status the provider answered. Never its text: a
+    provider message can quote part of a key or the prompt, a Neo4j one the
+    Cypher with target data. The text goes to the log."""
+    from llm_builder import provider_error_details
+    return provider_error_details(exc)
+
+
+def _invalid_fields(exc: ValidationError) -> list:
+    """The paths of the fields a client frame got wrong, never their values."""
+    paths = {".".join(str(part) for part in err.get("loc", ())) for err in exc.errors()}
+    return sorted(p for p in paths if p)[:10]
+
+
+def _invalid_frame(message: str, exc: ValidationError, recoverable: bool) -> dict:
+    fields = _invalid_fields(exc)
+    return {
+        "message": f"{message}: {', '.join(fields)}" if fields else message,
+        "code": "invalid_frame",
+        "fields": fields,
+        "recoverable": recoverable,
+    }
+
+
 def _governed_max_sessions():
     """Concurrent agent-session ceiling byte-budgeted to available RAM, or None to
     not cap. Each session holds a full agent state (~measured envelope), so this
@@ -82,6 +107,9 @@ class MessageType(str, Enum):
     THINKING_CHUNK = "thinking_chunk"
     TOOL_START = "tool_start"
     TOOL_OUTPUT_CHUNK = "tool_output_chunk"
+    # The tool itself returned; its tool_complete (with the LLM's analysis)
+    # follows only after the next think turn.
+    TOOL_FINISHED = "tool_finished"
     TOOL_COMPLETE = "tool_complete"
     PHASE_UPDATE = "phase_update"
     TODO_UPDATE = "todo_update"
@@ -417,6 +445,15 @@ class WebSocketManager:
         """Remove task from registry"""
         self._active_tasks.pop(session_key, None)
 
+    def release_task(self, session_key: str, task: Optional[asyncio.Task]):
+        """Remove the registration only if it is still `task`'s.
+
+        A run that is finishing must not clear a NEWER run of the same session
+        that registered while it was draining its persist queue.
+        """
+        if task is not None and self._active_tasks.get(session_key) is task:
+            del self._active_tasks[session_key]
+
     def live_session_ids(self, project_id: str) -> List[str]:
         """Session ids of PROJECT whose agent task is still running.
 
@@ -443,6 +480,11 @@ class WebSocketManager:
     def clear_callback(self, session_key: str):
         """Remove callback from registry."""
         self._active_callbacks.pop(session_key, None)
+
+    def release_callback(self, session_key: str, callback: 'StreamingCallback'):
+        """Remove the callback only if it is still this run's (see release_task)."""
+        if self._active_callbacks.get(session_key) is callback:
+            del self._active_callbacks[session_key]
 
     def get_connection(self, user_id: str, project_id: str, session_id: str) -> Optional[WebSocketConnection]:
         """Get active connection by session identifiers"""
@@ -561,9 +603,11 @@ class StreamingCallback:
         self._emitted_tool_start_ids: set = set()
         self._emitted_tool_complete_ids: set = set()
         self._emitted_tool_output_ids: set = set()
+        self._emitted_tool_finished_ids: set = set()
         # Ordered persistence queue — messages are saved one-at-a-time in FIFO order
         self._persist_queue: asyncio.Queue = asyncio.Queue()
         self._persist_worker_task: Optional[asyncio.Task] = None
+        self._persist_failure_reported = False
 
     def _ensure_persist_worker(self):
         """Lazily start the background persist worker."""
@@ -582,7 +626,7 @@ class StreamingCallback:
             else:
                 msg_type, data, agent_id_key, fireteam_id_key = item
             try:
-                await save_chat_message(
+                failure = await save_chat_message(
                     session_id=self._session_id,
                     msg_type=msg_type,
                     data=data,
@@ -593,8 +637,27 @@ class StreamingCallback:
                 )
             except Exception as e:
                 logger.warning(f"Persist worker error: {e}")
+                failure = {"error_class": type(e).__name__}
+            try:
+                if isinstance(failure, dict) and not self._persist_failure_reported:
+                    self._persist_failure_reported = True
+                    await self._report_persist_failure(failure)
             finally:
                 self._persist_queue.task_done()
+
+    async def _report_persist_failure(self, failure: dict):
+        """Say once per run that the chat is not being saved. The live stream is
+        still complete; a reload would show a timeline with holes in it."""
+        try:
+            await self.connection.send_message(MessageType.ERROR, {
+                "message": "The chat is not being saved: messages from this run "
+                           "may be missing after a reload",
+                "code": "persist_failed",
+                "recoverable": True,
+                **failure,
+            })
+        except Exception:
+            logger.debug("persist_failed notice not sent", exc_info=True)
 
     async def drain_persist_queue(self):
         """Wait for all pending persist messages to be saved, then stop the worker."""
@@ -717,7 +780,8 @@ class StreamingCallback:
         ctx_key = f"{wave_id}:{step_index}:{tool_name}" if wave_id and step_index is not None else (f"{wave_id}:{tool_name}" if wave_id else tool_name)
         self._tool_context[ctx_key] = {"args": tool_args, "chunks": []}
 
-    async def on_tool_output_chunk(self, tool_name: str, chunk: str, is_final: bool = False, wave_id: str = None, step_index: int = None):
+    async def on_tool_output_chunk(self, tool_name: str, chunk: str, is_final: bool = False, wave_id: str = None, step_index: int = None,
+                                   step_id: Optional[str] = None):
         """Called when tool outputs data chunk"""
         payload = {
             "tool_name": tool_name,
@@ -728,11 +792,35 @@ class StreamingCallback:
             payload["wave_id"] = wave_id
         if step_index is not None:
             payload["step_index"] = step_index
+        if step_id:
+            payload["step_id"] = step_id
         await self.connection.send_message(MessageType.TOOL_OUTPUT_CHUNK, payload)
         # Accumulate chunks — they'll be joined and included in tool_complete
         ctx_key = f"{wave_id}:{step_index}:{tool_name}" if wave_id and step_index is not None else (f"{wave_id}:{tool_name}" if wave_id else tool_name)
         if ctx_key in self._tool_context:
             self._tool_context[ctx_key]["chunks"].append(chunk)
+
+    async def on_tool_finished(
+        self,
+        tool_name: str,
+        success: bool,
+        duration_ms: Optional[int] = None,
+        step_id: Optional[str] = None,
+    ):
+        """Called when a standalone tool call has returned, before its analysis.
+
+        Lets the UI stop the card's stopwatch at the tool's real duration and
+        show that the agent is analysing, instead of a "Running" card that
+        keeps counting through the whole next LLM turn. Persisted so a restore
+        mid-analysis shows the same thing.
+        """
+        payload = {"tool_name": tool_name, "success": success}
+        if duration_ms is not None:
+            payload["duration_ms"] = duration_ms
+        if step_id:
+            payload["step_id"] = step_id
+        await self.connection.send_message(MessageType.TOOL_FINISHED, payload)
+        self._persist("tool_finished", payload)
 
     async def on_tool_complete(
         self,
@@ -1119,9 +1207,14 @@ class StreamingCallback:
         """Called after each execution step"""
         await self.connection.send_message(MessageType.EXECUTION_STEP, step)
 
-    async def on_error(self, error_message: str, recoverable: bool = True):
-        """Called when error occurs"""
+    async def on_error(self, error_message: str, recoverable: bool = True,
+                       code: str = "", **details):
+        """Called when error occurs. `code` and `details` (an exception class, a
+        provider HTTP status, a model id) say why; never an exception's text."""
         payload = {"message": error_message, "recoverable": recoverable}
+        if code:
+            payload["code"] = code
+        payload.update(details)
         await self.connection.send_message(MessageType.ERROR, payload)
         self._persist("error", payload)
 
@@ -1198,10 +1291,13 @@ class WebSocketHandler:
             session_id = init_msg.session_id
             verified = False
 
-            async def _reject_ticket(reason: str):
+            # The reasons are fixed text, safe to show; the drawer tells a
+            # missing secret from a rejected ticket by the code.
+            async def _reject_ticket(reason: str, code: str):
                 logger.warning("Rejected /ws/agent init: %s", reason)
                 await connection.send_message(MessageType.ERROR, {
-                    "message": "WebSocket authentication failed",
+                    "message": f"WebSocket authentication failed: {reason}",
+                    "code": code,
                     "recoverable": False,
                 })
                 try:
@@ -1211,12 +1307,12 @@ class WebSocketHandler:
 
             if not secret:
                 # Fail closed: no secret configured means we cannot attest identity.
-                await _reject_ticket("ticket auth not configured")
+                await _reject_ticket("ticket auth not configured", "ws_ticket_not_configured")
                 return
 
             claims = verify_ws_ticket(init_msg.ticket, secret)
             if claims is None:
-                await _reject_ticket("Invalid or missing ticket")
+                await _reject_ticket("Invalid or missing ticket", "ws_ticket_invalid")
                 return
             # Identity comes from the verified ticket, not the client body.
             user_id = str(claims["sub"])
@@ -1267,22 +1363,46 @@ class WebSocketHandler:
                     _features.append("fireteam")
             except Exception:
                 pass
+            # agent_running is the authoritative live answer to "is this
+            # session's run still going?". The client cannot know on its own:
+            # events emitted while its socket was down (tool_complete, STOPPED,
+            # task_complete) are lost, and its DB flag lags. On every
+            # (re)connect it uses this to clear or keep its spinner.
             await connection.send_message(MessageType.CONNECTED, {
                 "session_id": session_id,
                 "message": "WebSocket connection established",
                 "timestamp": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
                 "protocol_version": 2,
                 "features": _features,
+                "agent_running": self.ws_manager.get_task(connection.get_key()) is not None,
             })
 
             logger.info(f"Session initialized: {session_id}")
 
         except ValidationError as e:
             logger.error(f"Invalid init message: {e}")
-            await connection.send_message(MessageType.ERROR, {
-                "message": "Invalid initialization message",
-                "recoverable": False
-            })
+            await connection.send_message(
+                MessageType.ERROR, _invalid_frame("Invalid initialization message", e, False))
+
+    async def _finish_run(self, connection: WebSocketConnection, callback: 'StreamingCallback'):
+        """Release a finished run: task registration first, then persistence.
+
+        The registration is dropped BEFORE the persist queue drains, so a client
+        that reconnects during the drain is told agent_running=false; its final
+        events (response, task_complete, stopped) were already sent. Registry
+        entries are released only while they still belong to this run, so a
+        query started meanwhile keeps its own.
+        """
+        key = connection.get_key()
+        this_task = asyncio.current_task()
+        self.ws_manager.release_task(key, this_task)
+        # Drain the persist queue so all messages are saved before marking agent as done
+        await callback.drain_persist_queue()
+        if connection._active_task is this_task:
+            connection._active_task = None
+        self.ws_manager.release_callback(key, callback)
+        if self.ws_manager.get_task(key) is None:
+            asyncio.create_task(update_conversation(connection.session_id, {"agentRunning": False}))
 
     async def handle_query(self, connection: WebSocketConnection, payload: dict):
         """Handle user query — launches orchestrator as background task"""
@@ -1292,6 +1412,7 @@ class WebSocketHandler:
             if not connection.authenticated:
                 await connection.send_message(MessageType.ERROR, {
                     "message": "Not authenticated. Send init message first.",
+                    "code": "not_authenticated",
                     "recoverable": False
                 })
                 return
@@ -1321,10 +1442,8 @@ class WebSocketHandler:
 
         except ValidationError as e:
             logger.error(f"Invalid query message: {e}")
-            await connection.send_message(MessageType.ERROR, {
-                "message": "Invalid query format",
-                "recoverable": True
-            })
+            await connection.send_message(
+                MessageType.ERROR, _invalid_frame("Invalid query format", e, True))
 
     async def _run_orchestrator_query(self, connection: WebSocketConnection, question: str, callback):
         """Background coroutine that runs the orchestrator invocation."""
@@ -1345,18 +1464,15 @@ class WebSocketHandler:
             logger.error(f"Error processing query: {e}")
             try:
                 await callback.connection.send_message(MessageType.ERROR, {
-                    "message": f"Error processing query: {str(e)}",
+                    "message": "Error processing query",
+                    "code": "query_failed",
+                    **_error_details(e),
                     "recoverable": True
                 })
             except Exception:
                 pass
         finally:
-            # Drain the persist queue so all messages are saved before marking agent as done
-            await callback.drain_persist_queue()
-            connection._active_task = None
-            self.ws_manager.clear_task(connection.get_key())
-            self.ws_manager.clear_callback(connection.get_key())
-            asyncio.create_task(update_conversation(connection.session_id, {"agentRunning": False}))
+            await self._finish_run(connection, callback)
 
     async def handle_approval(self, connection: WebSocketConnection, payload: dict):
         """Handle approval response — launches as background task"""
@@ -1366,6 +1482,7 @@ class WebSocketHandler:
             if not connection.authenticated:
                 await connection.send_message(MessageType.ERROR, {
                     "message": "Not authenticated",
+                    "code": "not_authenticated",
                     "recoverable": False
                 })
                 return
@@ -1392,10 +1509,8 @@ class WebSocketHandler:
 
         except ValidationError as e:
             logger.error(f"Invalid approval message: {e}")
-            await connection.send_message(MessageType.ERROR, {
-                "message": "Invalid approval format",
-                "recoverable": True
-            })
+            await connection.send_message(
+                MessageType.ERROR, _invalid_frame("Invalid approval format", e, True))
 
     async def _run_orchestrator_approval(self, connection: WebSocketConnection, approval_msg: ApprovalMessage, callback):
         """Background coroutine that runs approval resumption."""
@@ -1416,17 +1531,15 @@ class WebSocketHandler:
             logger.error(f"Error processing approval: {e}")
             try:
                 await callback.connection.send_message(MessageType.ERROR, {
-                    "message": f"Error processing approval: {str(e)}",
+                    "message": "Error processing approval",
+                    "code": "approval_failed",
+                    **_error_details(e),
                     "recoverable": True
                 })
             except Exception:
                 pass
         finally:
-            await callback.drain_persist_queue()
-            connection._active_task = None
-            self.ws_manager.clear_task(connection.get_key())
-            self.ws_manager.clear_callback(connection.get_key())
-            asyncio.create_task(update_conversation(connection.session_id, {"agentRunning": False}))
+            await self._finish_run(connection, callback)
 
     async def handle_answer(self, connection: WebSocketConnection, payload: dict):
         """Handle answer to agent question — launches as background task"""
@@ -1436,6 +1549,7 @@ class WebSocketHandler:
             if not connection.authenticated:
                 await connection.send_message(MessageType.ERROR, {
                     "message": "Not authenticated",
+                    "code": "not_authenticated",
                     "recoverable": False
                 })
                 return
@@ -1461,10 +1575,8 @@ class WebSocketHandler:
 
         except ValidationError as e:
             logger.error(f"Invalid answer message: {e}")
-            await connection.send_message(MessageType.ERROR, {
-                "message": "Invalid answer format",
-                "recoverable": True
-            })
+            await connection.send_message(
+                MessageType.ERROR, _invalid_frame("Invalid answer format", e, True))
 
     async def _run_orchestrator_answer(self, connection: WebSocketConnection, answer: str, callback):
         """Background coroutine that runs answer resumption."""
@@ -1484,17 +1596,15 @@ class WebSocketHandler:
             logger.error(f"Error processing answer: {e}")
             try:
                 await callback.connection.send_message(MessageType.ERROR, {
-                    "message": f"Error processing answer: {str(e)}",
+                    "message": "Error processing answer",
+                    "code": "answer_failed",
+                    **_error_details(e),
                     "recoverable": True
                 })
             except Exception:
                 pass
         finally:
-            await callback.drain_persist_queue()
-            connection._active_task = None
-            self.ws_manager.clear_task(connection.get_key())
-            self.ws_manager.clear_callback(connection.get_key())
-            asyncio.create_task(update_conversation(connection.session_id, {"agentRunning": False}))
+            await self._finish_run(connection, callback)
 
     async def handle_fireteam_member_confirmation(self, connection: WebSocketConnection, payload: dict):
         """Operator decision for a per-member dangerous-tool escalation.
@@ -1507,15 +1617,14 @@ class WebSocketHandler:
             msg = FireteamMemberConfirmationMessage(**payload)
         except ValidationError as e:
             logger.error(f"Invalid fireteam_member_confirmation payload: {e}")
-            await connection.send_message(MessageType.ERROR, {
-                "message": "Invalid fireteam member confirmation payload",
-                "recoverable": True,
-            })
+            await connection.send_message(
+                MessageType.ERROR, _invalid_frame("Invalid fireteam member confirmation payload", e, True))
             return
 
         if not connection.authenticated:
             await connection.send_message(MessageType.ERROR, {
                 "message": "Not authenticated",
+                "code": "not_authenticated",
                 "recoverable": False,
             })
             return
@@ -1556,6 +1665,7 @@ class WebSocketHandler:
             if not connection.authenticated:
                 await connection.send_message(MessageType.ERROR, {
                     "message": "Not authenticated",
+                    "code": "not_authenticated",
                     "recoverable": False
                 })
                 return
@@ -1582,10 +1692,8 @@ class WebSocketHandler:
 
         except ValidationError as e:
             logger.error(f"Invalid tool confirmation message: {e}")
-            await connection.send_message(MessageType.ERROR, {
-                "message": "Invalid tool confirmation format",
-                "recoverable": True
-            })
+            await connection.send_message(
+                MessageType.ERROR, _invalid_frame("Invalid tool confirmation format", e, True))
 
     async def _run_orchestrator_tool_confirmation(self, connection: WebSocketConnection, confirmation_msg: ToolConfirmationMessage, callback):
         """Background coroutine that runs tool confirmation resumption."""
@@ -1606,17 +1714,15 @@ class WebSocketHandler:
             logger.error(f"Error processing tool confirmation: {e}")
             try:
                 await callback.connection.send_message(MessageType.ERROR, {
-                    "message": f"Error processing tool confirmation: {str(e)}",
+                    "message": "Error processing tool confirmation",
+                    "code": "tool_confirmation_failed",
+                    **_error_details(e),
                     "recoverable": True
                 })
             except Exception:
                 pass
         finally:
-            await callback.drain_persist_queue()
-            connection._active_task = None
-            self.ws_manager.clear_task(connection.get_key())
-            self.ws_manager.clear_callback(connection.get_key())
-            asyncio.create_task(update_conversation(connection.session_id, {"agentRunning": False}))
+            await self._finish_run(connection, callback)
 
     async def handle_guidance(self, connection: WebSocketConnection, payload: dict):
         """Handle guidance message while agent is executing."""
@@ -1626,6 +1732,7 @@ class WebSocketHandler:
             if not connection.authenticated:
                 await connection.send_message(MessageType.ERROR, {
                     "message": "Not authenticated",
+                    "code": "not_authenticated",
                     "recoverable": False
                 })
                 return
@@ -1642,10 +1749,8 @@ class WebSocketHandler:
 
         except ValidationError as e:
             logger.error(f"Invalid guidance message: {e}")
-            await connection.send_message(MessageType.ERROR, {
-                "message": "Invalid guidance format",
-                "recoverable": True
-            })
+            await connection.send_message(
+                MessageType.ERROR, _invalid_frame("Invalid guidance format", e, True))
 
     async def handle_skill_inject(self, connection: WebSocketConnection, payload: dict):
         """Handle skill injection -- push skill content as a guidance message."""
@@ -1653,6 +1758,7 @@ class WebSocketHandler:
             if not connection.authenticated:
                 await connection.send_message(MessageType.ERROR, {
                     "message": "Not authenticated",
+                    "code": "not_authenticated",
                     "recoverable": False
                 })
                 return
@@ -1684,7 +1790,9 @@ class WebSocketHandler:
         except Exception as e:
             logger.error(f"Skill inject failed: {e}")
             await connection.send_message(MessageType.ERROR, {
-                "message": f"Failed to inject skill: {str(e)}",
+                "message": "Failed to inject skill",
+                "code": "skill_inject_failed",
+                **_error_details(e),
                 "recoverable": True
             })
 
@@ -1697,6 +1805,7 @@ class WebSocketHandler:
         if not connection.authenticated:
             await connection.send_message(MessageType.ERROR, {
                 "message": "Not authenticated",
+                "code": "not_authenticated",
                 "recoverable": False
             })
             return
@@ -1752,6 +1861,7 @@ class WebSocketHandler:
         if not connection.authenticated:
             await connection.send_message(MessageType.ERROR, {
                 "message": "Not authenticated",
+                "code": "not_authenticated",
                 "recoverable": False,
             })
             return
@@ -1759,10 +1869,8 @@ class WebSocketHandler:
             msg = ToolStopMessage(**payload)
         except ValidationError as e:
             logger.error(f"Invalid tool_stop message: {e}")
-            await connection.send_message(MessageType.ERROR, {
-                "message": "Invalid tool_stop payload",
-                "recoverable": True,
-            })
+            await connection.send_message(
+                MessageType.ERROR, _invalid_frame("Invalid tool_stop payload", e, True))
             return
 
         session_key = connection.get_key()
@@ -1787,6 +1895,7 @@ class WebSocketHandler:
         if not connection.authenticated:
             await connection.send_message(MessageType.ERROR, {
                 "message": "Not authenticated",
+                "code": "not_authenticated",
                 "recoverable": False
             })
             return
@@ -1828,17 +1937,15 @@ class WebSocketHandler:
             logger.error(f"Error resuming execution: {e}")
             try:
                 await callback.connection.send_message(MessageType.ERROR, {
-                    "message": f"Error resuming execution: {str(e)}",
+                    "message": "Error resuming execution",
+                    "code": "resume_failed",
+                    **_error_details(e),
                     "recoverable": True
                 })
             except Exception:
                 pass
         finally:
-            await callback.drain_persist_queue()
-            connection._active_task = None
-            self.ws_manager.clear_task(connection.get_key())
-            self.ws_manager.clear_callback(connection.get_key())
-            asyncio.create_task(update_conversation(connection.session_id, {"agentRunning": False}))
+            await self._finish_run(connection, callback)
 
     async def handle_ping(self, connection: WebSocketConnection, payload: dict):
         """Handle ping for keep-alive"""
@@ -1893,7 +2000,9 @@ class WebSocketHandler:
         except Exception as e:
             logger.error(f"Error handling message: {e}")
             await connection.send_message(MessageType.ERROR, {
-                "message": f"Internal error: {str(e)}",
+                "message": "Internal error",
+                "code": "internal_error",
+                **_error_details(e),
                 "recoverable": True
             })
 
@@ -1944,7 +2053,9 @@ async def websocket_endpoint(
         logger.error(f"WebSocket error: {e}")
         try:
             await connection.send_message(MessageType.ERROR, {
-                "message": f"Fatal error: {str(e)}",
+                "message": "Fatal error",
+                "code": "fatal_error",
+                **_error_details(e),
                 "recoverable": False
             })
         except:

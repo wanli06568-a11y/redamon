@@ -42,11 +42,15 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     'SUBDOMAIN_LIST': [],
     'IP_MODE': False,
     'TARGET_IPS': [],
-    # Domain batch: the third targeting mode. DOMAIN_BATCH_GROUPS is the derived,
-    # operator-approved run order: [{'rootDomain': str, 'prefixes': [str], 'hosts': [str]}].
-    # The webapp derives it; the pipeline never re-derives, so both agree on scope.
+    # Domain batch: the third targeting mode. SCOPE_GROUPS is the project's scope
+    # as the webapp derived it (`scopeGroups`), one group per scan root, in run
+    # order: [{'scanRoot', 'orgDomain', 'mode': 'enumerate'|'exact',
+    # 'includeRoot', 'exactHosts'}]. A single-domain project is one group.
+    # DOMAIN_BATCH_GROUPS is the same batch scope in the legacy shape
+    # [{'rootDomain', 'prefixes'}] for the readers that have not moved yet.
     'DOMAIN_BATCH_MODE': False,
     'DOMAIN_BATCH_GROUPS': [],
+    'SCOPE_GROUPS': [],
     'VERIFY_DOMAIN_OWNERSHIP': False,
     'OWNERSHIP_TOKEN': 'your-secret-token-here',
     'OWNERSHIP_TXT_PREFIX': '_redamon-verify',
@@ -161,6 +165,11 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     'HTTP_PROBE_AI_FAVICON_HASH_ENABLED': True,
     'HTTP_PROBE_AI_TITLE_DETECTION_ENABLED': True,
     'HTTP_PROBE_AI_WAPPALYZER_ENABLED': True,
+
+    # IP attribution: shared_edge / dedicated / unknown per IP, after http_probe.
+    # The cap bounds its one active check, a TLS handshake without SNI to :443.
+    'IP_ATTRIBUTION_ENABLED': True,
+    'IP_ATTRIBUTION_TLS_MAX_PROBES': 500,
 
     # Wappalyzer
     'WAPPALYZER_ENABLED': True,
@@ -370,6 +379,13 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     ],
     'KATANA_PARALLELISM': 8,
     'KATANA_CONCURRENCY': 15,
+
+    'OPENAPI_ENABLED': True,
+    'OPENAPI_AUTO_DISCOVER': False,
+    'OPENAPI_DISCOVERY_PATHS': ["/openapi.json", "/openapi.yaml", "/swagger.json", "/swagger.yaml", "/v3/api-docs", "/v2/api-docs", "/swagger/v1/swagger.json", "/swagger-ui/index.html", "/swagger-ui.html", "/docs", "/api-docs", "/api-docs/"],
+    'OPENAPI_SOURCES': [],
+    'OPENAPI_TIMEOUT': 10,
+    'OPENAPI_MAX_DOCUMENTS': 50,
 
     # HTTP Traffic Capture (mitmproxy integration, Phase 0+)
     # Off by default: when off, recon does not retain httpx bodies and posts
@@ -844,6 +860,33 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     'WEB_CACHE_POISON_BEHAVIORAL_ORACLE': True,              # Detect silent caches (no cache headers) via frozen-Date probe
     'WEB_CACHE_POISON_BEHAVIORAL_DELAY': 1.1,                # Seconds between the two frozen-Date probes
     'WEB_CACHE_POISON_DIFFERENTIAL': True,                   # Non-reflective detection (status/location/body diff); adds one baseline probe/vector
+
+    # Route exposure (GROUP 6 Phase A; GET/HEAD only, leads + signature findings)
+    'ROUTE_EXPOSURE_ENABLED': False,
+    'ROUTE_EXPOSURE_MAX_RPS': 5,
+    'ROUTE_EXPOSURE_WORKERS': 4,
+    'ROUTE_EXPOSURE_TIMEOUT': 10,
+    'ROUTE_EXPOSURE_MAX_ROUTES_PER_HOST': 300,
+    'ROUTE_EXPOSURE_MAX_ROUTES_TOTAL': 3000,
+    'ROUTE_EXPOSURE_SEED_PATHS': True,
+    'ROUTE_EXPOSURE_VCS_FILES': True,
+    'ROUTE_EXPOSURE_BACKUP_FILES': True,
+    'ROUTE_EXPOSURE_VERSION_VARIANTS': True,
+    'ROUTE_EXPOSURE_COMPARE_LOGGED_IN': True,
+    'ROUTE_EXPOSURE_PII_DETECTION': True,
+    # v2 discovery multiplier and riders
+    'ROUTE_EXPOSURE_SIBLINGS': True,
+    'ROUTE_EXPOSURE_FRAMEWORK_SEEDS': True,
+    'ROUTE_EXPOSURE_FOLLOW_CATALOGS': True,
+    'ROUTE_EXPOSURE_GIT_WALK': True,
+    'ROUTE_EXPOSURE_CROSS_HOST': False,
+    'ROUTE_EXPOSURE_CORS_RIDER': True,
+    'ROUTE_EXPOSURE_CACHE_RIDER': True,
+    # v3 Jev-only hooks: gated at the call site with AI_IN_PIPELINE, so they stay
+    # out of apply_ai_pipeline_overrides (the master switch must not force them).
+    'ROUTE_EXPOSURE_JEV_RANK': False,
+    'ROUTE_EXPOSURE_JEV_WALL_CHECK': False,
+    'ROUTE_EXPOSURE_JEV_ASSESS': False,
 }
 
 
@@ -1148,27 +1191,220 @@ def _fetch_urlscan_api_key(user_id: str, webapp_url: str) -> str:
 _BATCH_HOST_CHARSET = re.compile(r'^[a-z0-9.-]+$')
 
 
-def _is_public_suffix(root: str) -> bool:
-    """Is this 'registrable domain' actually a public suffix, e.g. ``co.uk``?
+class ScopeRefused(RuntimeError):
+    """The project's scope cannot be scanned as stored. Raised from the settings
+    load, so the run stops before any tool starts instead of scanning a scope
+    the operator did not approve (a public suffix, or nothing at all)."""
 
-    The batch grouping rule is last-two-labels, so ``acme.co.uk`` reduces to
-    ``co.uk``. Harmless for a literal group (it still scans only the host that
-    was listed) and NOT harmless for a wildcard one.
 
-    Imported lazily from origin_discovery, which owns the curated list for the
-    same reason: a module-level import would pull a scan module into the settings
-    layer, and this is the only place that needs it.
+def _psl():
+    """The Public Suffix List helper, or a refused run.
+
+    Guessing is worse either way: answering "not a suffix" would let `*.co.uk`
+    enumerate every registrant, and answering "suffix" would quietly narrow
+    every wildcard to nothing and still exit 0.
     """
+    import importlib
     try:
-        from recon.main_recon_modules.origin_discovery import _MULTI_LABEL_SUFFIXES
-    except Exception as e:  # noqa: BLE001 - a missing list must not admit the wildcard
-        # Fail closed, but never silently: this answer demotes EVERY wildcard in
-        # the run to a literal scan, which looks like a working scan that simply
-        # found less.
-        print(f"[!][settings] public-suffix list unavailable ({e}); treating every "
-              f"wildcard root as a public suffix, so no group will enumerate.")
-        return True
-    return root in _MULTI_LABEL_SUFFIXES
+        return importlib.import_module('recon.helpers.public_suffix')
+    except Exception as e:  # noqa: BLE001 - any import failure refuses the run
+        print(f"[!][Scope] The Public Suffix List is unavailable ({e}); refusing the run.")
+        raise ScopeRefused(f"public suffix list unavailable: {e}") from e
+
+
+def _is_public_suffix(root: str) -> bool:
+    """Is this name itself a public suffix (``co.uk``, ``github.io``)?"""
+    return _psl().is_public_suffix(root)
+
+
+def _valid_scope_name(name: str) -> bool:
+    """A lower-case DNS name that is safe as a scan target and a filename part."""
+    if not name or len(name) > 253 or not _BATCH_HOST_CHARSET.match(name):
+        return False
+    labels = name.split('.')
+    return all(0 < len(l) <= 63 and not l.startswith('-') and not l.endswith('-') for l in labels)
+
+
+def _clean_scope_name(raw: Any) -> str:
+    return str(raw or '').strip().lower().rstrip('.')
+
+
+def _parse_scope_groups(raw: Any) -> list[dict[str, Any]]:
+    """Parse and RE-VALIDATE the webapp's `scopeGroups`, in order.
+
+    Same trust boundary as the legacy parser below: the names become scan
+    targets and filename parts, so a group or host that fails the charset is
+    DROPPED, never repaired. On top of that, recon is the process that
+    enumerates, so it re-asks its own Public Suffix List and refuses a group
+    whose scan root is a suffix, whatever the webapp said.
+
+    When the two lists disagree on the org of a name that is not a suffix (one
+    is newer), the webapp's org is kept: the operator approved it in the
+    preview, and the org decides only where hosts attach in the graph, never
+    what is scanned.
+    """
+    if not isinstance(raw, list):
+        return []
+    psl = _psl()
+    groups: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        root = _clean_scope_name(entry.get('scanRoot'))
+        mode = entry.get('mode')
+        if not _valid_scope_name(root) or mode not in ('enumerate', 'exact'):
+            print(f"[!][Scope] Ignoring a malformed scope group: {str(entry.get('scanRoot'))[:80]!r}")
+            continue
+        if root in seen:
+            print(f"[!][Scope] Ignoring a second group for {root}")
+            continue
+        if psl.is_public_suffix(root):
+            print(f"[!][Scope] Refusing the group {root}: it is a public suffix, so it "
+                  f"would reach every registrant under it.")
+            continue
+        include_root = entry.get('includeRoot') is True
+        exact: list[str] = []
+        for h in entry.get('exactHosts') or []:
+            host = _clean_scope_name(h)
+            if _valid_scope_name(host) and host.endswith(f'.{root}'):
+                if host not in exact:
+                    exact.append(host)
+            else:
+                print(f"[!][Scope] Ignoring host {str(h)[:80]!r} of the group {root}")
+        if mode == 'exact' and not exact and not include_root:
+            print(f"[!][Scope] Ignoring the group {root}: no host survived")
+            continue
+
+        py_org = psl.org_domain(root)
+        org = _clean_scope_name(entry.get('orgDomain'))
+        if org != py_org:
+            under = org and (root == org or root.endswith(f'.{org}'))
+            if under and _valid_scope_name(org) and not psl.is_public_suffix(org):
+                print(f"[!][Scope] {root}: the webapp groups it under {org}, this "
+                      f"suffix list under {py_org}; keeping {org} (suffix lists differ "
+                      f"in version, see README.DEV.md 5.8).")
+            else:
+                org = py_org
+        seen.add(root)
+        groups.append({'scanRoot': root, 'orgDomain': org, 'mode': mode,
+                       'includeRoot': include_root, 'exactHosts': exact})
+    return groups
+
+
+def _scope_groups_from_legacy(legacy: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """SCOPE_GROUPS for a webapp that sends no `scopeGroups` (older release),
+    from groups already through `_parse_domain_batch_groups`."""
+    psl = _psl()
+    out: list[dict[str, Any]] = []
+    for g in legacy:
+        root = g['rootDomain']
+        prefixes = g['prefixes']
+        exact = []
+        for p in prefixes:
+            if p in ('.', '*'):
+                continue
+            host = f"{p.rstrip('.')}.{root}"
+            if _valid_scope_name(host) and host not in exact:
+                exact.append(host)
+        out.append({'scanRoot': root, 'orgDomain': psl.org_domain(root) or root,
+                    'mode': 'enumerate' if '*' in prefixes else 'exact',
+                    'includeRoot': '.' in prefixes, 'exactHosts': exact})
+    return out
+
+
+def _legacy_batch_group(group: dict[str, Any]) -> dict[str, Any]:
+    """One scope group in the DOMAIN_BATCH_GROUPS shape (webapp toLegacyRecord)."""
+    root = group['scanRoot']
+    prefixes = ['*'] if group['mode'] == 'enumerate' else []
+    if group['includeRoot']:
+        prefixes.append('.')
+    prefixes += [f"{h[:-len(root) - 1]}." for h in group['exactHosts']]
+    return {'rootDomain': root, 'prefixes': prefixes}
+
+
+def _single_domain_target(raw: Any) -> str:
+    """TARGET_DOMAIN as the webapp normalises it: lower-case, no trailing dot,
+    no `*.` marker. Validated like a batch root by `_resolve_scope`."""
+    target = _clean_scope_name(raw)
+    return target[2:] if target.startswith('*.') else target
+
+
+def _single_domain_group(target: str, subdomain_list: list[str]) -> dict[str, Any]:
+    """The one group of a single-domain project (§4.4), from TARGET_DOMAIN and
+    SUBDOMAIN_LIST when the webapp sent no `scopeGroups`."""
+    from recon.helpers.batch_groups import parse_target
+    info = parse_target(target, subdomain_list)
+    exact = [h for h in info['full_subdomains'] if h != target]
+    return {'scanRoot': target, 'orgDomain': _psl().org_domain(target) or target,
+            'mode': 'exact' if exact else 'enumerate',
+            'includeRoot': info['include_root_domain'], 'exactHosts': exact}
+
+
+def _resolve_scope(project: dict[str, Any], settings: dict[str, Any]) -> None:
+    """Fill TARGET_DOMAIN, SCOPE_GROUPS and DOMAIN_BATCH_GROUPS, or refuse.
+
+    Fails closed: a batch with no group left, or a single-domain target that is
+    not a usable name or is a public suffix, raises ScopeRefused. Before this,
+    an empty batch fell through to a single-domain run with an empty target,
+    and a suffix target ran its full enumeration.
+    """
+    has_groups = isinstance(project.get('scopeGroups'), list)
+    if settings['IP_MODE']:
+        settings['SCOPE_GROUPS'] = []
+        settings['DOMAIN_BATCH_GROUPS'] = (
+            [] if has_groups else _parse_domain_batch_groups(project.get('domainBatchGroups')))
+        return
+
+    if settings['DOMAIN_BATCH_MODE']:
+        if has_groups:
+            groups = _parse_scope_groups(project['scopeGroups'])
+            settings['DOMAIN_BATCH_GROUPS'] = [_legacy_batch_group(g) for g in groups]
+        else:
+            settings['DOMAIN_BATCH_GROUPS'] = _parse_domain_batch_groups(
+                project.get('domainBatchGroups'))
+            groups = _scope_groups_from_legacy(settings['DOMAIN_BATCH_GROUPS'])
+        if not groups:
+            print("[!][Scope] Domain batch with no usable group: refusing the run.")
+            raise ScopeRefused('domain batch has no usable scope group')
+        settings['SCOPE_GROUPS'] = groups
+        return
+
+    target = settings['TARGET_DOMAIN']
+    settings['DOMAIN_BATCH_GROUPS'] = (
+        [] if has_groups else _parse_domain_batch_groups(project.get('domainBatchGroups')))
+    if not target:
+        settings['SCOPE_GROUPS'] = []
+        return
+    if not _valid_scope_name(target) or '.' not in target:
+        print(f"[!][Scope] Target {target[:80]!r} is not a usable host name: refusing the run.")
+        raise ScopeRefused(f'target {target[:80]!r} is not a usable host name')
+    if _is_public_suffix(target):
+        print(f"[!][Scope] Target {target} is a public suffix: refusing the run.")
+        raise ScopeRefused(f'target {target} is a public suffix')
+    if has_groups:
+        groups = _parse_scope_groups(project['scopeGroups'])
+        if len(groups) != 1 or groups[0]['scanRoot'] != target:
+            print(f"[!][Scope] The webapp's scope does not match the target {target}: refusing the run.")
+            raise ScopeRefused(f'scope groups do not match the target {target}')
+    else:
+        groups = [_single_domain_group(target, settings['SUBDOMAIN_LIST'])]
+    settings['SCOPE_GROUPS'] = groups
+
+
+def log_scope(settings: dict[str, Any]) -> None:
+    """The suffix-list version and the resolved groups, once at run start.
+
+    The wording avoids the phrases container_manager's PHASE_PATTERNS match
+    (`domain ... discovery`, `port ... scan`), so these lines never move the
+    progress bar.
+    """
+    if settings.get('IP_MODE'):
+        return
+    print(f"[*][PSL] publicsuffixlist {_psl().psl_version()}")
+    for g in settings.get('SCOPE_GROUPS') or []:
+        print(f"[*][Scope] {g['scanRoot']} org={g['orgDomain']} mode={g['mode']} "
+              f"root={str(g['includeRoot']).lower()} exact={len(g['exactHosts'])}")
 
 
 def _parse_domain_batch_groups(raw: Any) -> list[dict[str, Any]]:
@@ -1253,7 +1489,8 @@ def fetch_project_settings(project_id: str, webapp_url: str) -> dict[str, Any]:
     settings['USER_ID'] = project.get('userId', DEFAULT_SETTINGS['USER_ID'])
 
     # Target Configuration
-    settings['TARGET_DOMAIN'] = project.get('targetDomain', DEFAULT_SETTINGS['TARGET_DOMAIN']).strip()
+    settings['TARGET_DOMAIN'] = _single_domain_target(
+        project.get('targetDomain', DEFAULT_SETTINGS['TARGET_DOMAIN']))
     raw_subs = project.get('subdomainList', DEFAULT_SETTINGS['SUBDOMAIN_LIST'])
     settings['SUBDOMAIN_LIST'] = [s.strip() for s in raw_subs if s.strip()]
     settings['IP_MODE'] = project.get('ipMode', DEFAULT_SETTINGS['IP_MODE'])
@@ -1261,8 +1498,7 @@ def fetch_project_settings(project_id: str, webapp_url: str) -> dict[str, Any]:
     settings['TARGET_IPS'] = [ip.strip() for ip in raw_ips if ip.strip()]
     settings['DOMAIN_BATCH_MODE'] = project.get(
         'domainBatchMode', DEFAULT_SETTINGS['DOMAIN_BATCH_MODE'])
-    settings['DOMAIN_BATCH_GROUPS'] = _parse_domain_batch_groups(
-        project.get('domainBatchGroups'))
+    _resolve_scope(project, settings)
     settings['VERIFY_DOMAIN_OWNERSHIP'] = project.get('verifyDomainOwnership', DEFAULT_SETTINGS['VERIFY_DOMAIN_OWNERSHIP'])
     settings['OWNERSHIP_TOKEN'] = project.get('ownershipToken', DEFAULT_SETTINGS['OWNERSHIP_TOKEN'])
     settings['OWNERSHIP_TXT_PREFIX'] = project.get('ownershipTxtPrefix', DEFAULT_SETTINGS['OWNERSHIP_TXT_PREFIX'])
@@ -1357,6 +1593,9 @@ def fetch_project_settings(project_id: str, webapp_url: str) -> dict[str, Any]:
     settings['HTTP_PROBE_AI_FAVICON_HASH_ENABLED'] = project.get('httpProbeAiFaviconHashEnabled', DEFAULT_SETTINGS['HTTP_PROBE_AI_FAVICON_HASH_ENABLED'])
     settings['HTTP_PROBE_AI_TITLE_DETECTION_ENABLED'] = project.get('httpProbeAiTitleDetectionEnabled', DEFAULT_SETTINGS['HTTP_PROBE_AI_TITLE_DETECTION_ENABLED'])
     settings['HTTP_PROBE_AI_WAPPALYZER_ENABLED'] = project.get('httpProbeAiWappalyzerEnabled', DEFAULT_SETTINGS['HTTP_PROBE_AI_WAPPALYZER_ENABLED'])
+
+    settings['IP_ATTRIBUTION_ENABLED'] = project.get('ipAttributionEnabled', DEFAULT_SETTINGS['IP_ATTRIBUTION_ENABLED'])
+    settings['IP_ATTRIBUTION_TLS_MAX_PROBES'] = project.get('ipAttributionTlsMaxProbes', DEFAULT_SETTINGS['IP_ATTRIBUTION_TLS_MAX_PROBES'])
 
     # Wappalyzer
     settings['WAPPALYZER_ENABLED'] = project.get('wappalyzerEnabled', DEFAULT_SETTINGS['WAPPALYZER_ENABLED'])
@@ -1499,6 +1738,13 @@ def fetch_project_settings(project_id: str, webapp_url: str) -> dict[str, Any]:
     settings['KATANA_CUSTOM_HEADERS'] = project.get('katanaCustomHeaders', DEFAULT_SETTINGS['KATANA_CUSTOM_HEADERS'])
     settings['KATANA_PARALLELISM'] = project.get('katanaParallelism', DEFAULT_SETTINGS['KATANA_PARALLELISM'])
     settings['KATANA_CONCURRENCY'] = project.get('katanaConcurrency', DEFAULT_SETTINGS['KATANA_CONCURRENCY'])
+
+    settings['OPENAPI_ENABLED'] = project.get('openapiEnabled', DEFAULT_SETTINGS['OPENAPI_ENABLED'])
+    settings['OPENAPI_DISCOVERY_PATHS'] = project.get('openapiDiscoveryPaths', DEFAULT_SETTINGS['OPENAPI_DISCOVERY_PATHS'])
+    settings['OPENAPI_AUTO_DISCOVER'] = project.get('openapiAutoDiscover', DEFAULT_SETTINGS['OPENAPI_AUTO_DISCOVER'])
+    settings['OPENAPI_SOURCES'] = project.get('openapiSources', DEFAULT_SETTINGS['OPENAPI_SOURCES'])
+    settings['OPENAPI_TIMEOUT'] = project.get('openapiTimeout', DEFAULT_SETTINGS['OPENAPI_TIMEOUT'])
+    settings['OPENAPI_MAX_DOCUMENTS'] = project.get('openapiMaxDocuments', DEFAULT_SETTINGS['OPENAPI_MAX_DOCUMENTS'])
 
     # HTTP Traffic Capture (mitmproxy integration, Phase 0+)
     settings['CAPTURE_PROXY_ENABLED'] = project.get('captureProxyEnabled', DEFAULT_SETTINGS['CAPTURE_PROXY_ENABLED'])
@@ -1803,8 +2049,7 @@ def fetch_project_settings(project_id: str, webapp_url: str) -> dict[str, Any]:
         # can only answer "may ANY group enumerate". The per-group decision lives
         # in run_domain_group(), which is the only place that sees one group's
         # prefixes; a batch with no wildcard at all resolves exactly as before.
-        if not any('*' in (g.get('prefixes') or [])
-                   for g in settings['DOMAIN_BATCH_GROUPS']):
+        if not any(g['mode'] == 'enumerate' for g in settings['SCOPE_GROUPS']):
             settings['SUBDOMAIN_DISCOVERY_ENABLED'] = False
     settings['DOMAIN_RECON_AI_TXT_HINT_ENABLED'] = project.get('domainReconAiTxtHintEnabled', DEFAULT_SETTINGS['DOMAIN_RECON_AI_TXT_HINT_ENABLED'])
     settings['DOMAIN_RECON_AI_NS_HINT_ENABLED'] = project.get('domainReconAiNsHintEnabled', DEFAULT_SETTINGS['DOMAIN_RECON_AI_NS_HINT_ENABLED'])
@@ -2027,6 +2272,30 @@ def fetch_project_settings(project_id: str, webapp_url: str) -> dict[str, Any]:
     settings['WEB_CACHE_POISON_BEHAVIORAL_DELAY'] = project.get('webCachePoisonBehavioralDelay', DEFAULT_SETTINGS['WEB_CACHE_POISON_BEHAVIORAL_DELAY'])
     settings['WEB_CACHE_POISON_DIFFERENTIAL'] = project.get('webCachePoisonDifferential', DEFAULT_SETTINGS['WEB_CACHE_POISON_DIFFERENTIAL'])
 
+    # Route Exposure
+    settings['ROUTE_EXPOSURE_ENABLED'] = project.get('routeExposureEnabled', DEFAULT_SETTINGS['ROUTE_EXPOSURE_ENABLED'])
+    settings['ROUTE_EXPOSURE_MAX_RPS'] = project.get('routeExposureMaxRps', DEFAULT_SETTINGS['ROUTE_EXPOSURE_MAX_RPS'])
+    settings['ROUTE_EXPOSURE_WORKERS'] = project.get('routeExposureWorkers', DEFAULT_SETTINGS['ROUTE_EXPOSURE_WORKERS'])
+    settings['ROUTE_EXPOSURE_TIMEOUT'] = project.get('routeExposureTimeout', DEFAULT_SETTINGS['ROUTE_EXPOSURE_TIMEOUT'])
+    settings['ROUTE_EXPOSURE_MAX_ROUTES_PER_HOST'] = project.get('routeExposureMaxRoutesPerHost', DEFAULT_SETTINGS['ROUTE_EXPOSURE_MAX_ROUTES_PER_HOST'])
+    settings['ROUTE_EXPOSURE_MAX_ROUTES_TOTAL'] = project.get('routeExposureMaxRoutesTotal', DEFAULT_SETTINGS['ROUTE_EXPOSURE_MAX_ROUTES_TOTAL'])
+    settings['ROUTE_EXPOSURE_SEED_PATHS'] = project.get('routeExposureSeedPaths', DEFAULT_SETTINGS['ROUTE_EXPOSURE_SEED_PATHS'])
+    settings['ROUTE_EXPOSURE_VCS_FILES'] = project.get('routeExposureVcsFiles', DEFAULT_SETTINGS['ROUTE_EXPOSURE_VCS_FILES'])
+    settings['ROUTE_EXPOSURE_BACKUP_FILES'] = project.get('routeExposureBackupFiles', DEFAULT_SETTINGS['ROUTE_EXPOSURE_BACKUP_FILES'])
+    settings['ROUTE_EXPOSURE_VERSION_VARIANTS'] = project.get('routeExposureVersionVariants', DEFAULT_SETTINGS['ROUTE_EXPOSURE_VERSION_VARIANTS'])
+    settings['ROUTE_EXPOSURE_COMPARE_LOGGED_IN'] = project.get('routeExposureCompareLoggedIn', DEFAULT_SETTINGS['ROUTE_EXPOSURE_COMPARE_LOGGED_IN'])
+    settings['ROUTE_EXPOSURE_PII_DETECTION'] = project.get('routeExposurePiiDetection', DEFAULT_SETTINGS['ROUTE_EXPOSURE_PII_DETECTION'])
+    settings['ROUTE_EXPOSURE_SIBLINGS'] = project.get('routeExposureSiblings', DEFAULT_SETTINGS['ROUTE_EXPOSURE_SIBLINGS'])
+    settings['ROUTE_EXPOSURE_FRAMEWORK_SEEDS'] = project.get('routeExposureFrameworkSeeds', DEFAULT_SETTINGS['ROUTE_EXPOSURE_FRAMEWORK_SEEDS'])
+    settings['ROUTE_EXPOSURE_FOLLOW_CATALOGS'] = project.get('routeExposureFollowCatalogs', DEFAULT_SETTINGS['ROUTE_EXPOSURE_FOLLOW_CATALOGS'])
+    settings['ROUTE_EXPOSURE_GIT_WALK'] = project.get('routeExposureGitWalk', DEFAULT_SETTINGS['ROUTE_EXPOSURE_GIT_WALK'])
+    settings['ROUTE_EXPOSURE_CROSS_HOST'] = project.get('routeExposureCrossHost', DEFAULT_SETTINGS['ROUTE_EXPOSURE_CROSS_HOST'])
+    settings['ROUTE_EXPOSURE_CORS_RIDER'] = project.get('routeExposureCorsRider', DEFAULT_SETTINGS['ROUTE_EXPOSURE_CORS_RIDER'])
+    settings['ROUTE_EXPOSURE_CACHE_RIDER'] = project.get('routeExposureCacheRider', DEFAULT_SETTINGS['ROUTE_EXPOSURE_CACHE_RIDER'])
+    settings['ROUTE_EXPOSURE_JEV_RANK'] = project.get('routeExposureJevRank', DEFAULT_SETTINGS['ROUTE_EXPOSURE_JEV_RANK'])
+    settings['ROUTE_EXPOSURE_JEV_WALL_CHECK'] = project.get('routeExposureJevWallCheck', DEFAULT_SETTINGS['ROUTE_EXPOSURE_JEV_WALL_CHECK'])
+    settings['ROUTE_EXPOSURE_JEV_ASSESS'] = project.get('routeExposureJevAssess', DEFAULT_SETTINGS['ROUTE_EXPOSURE_JEV_ASSESS'])
+
     # RoE: cap every rate the engagement ceiling applies to.
     apply_roe_rate_cap(settings)
 
@@ -2047,8 +2316,9 @@ def fetch_project_settings(project_id: str, webapp_url: str) -> dict[str, Any]:
 # memory actually available when the scan starts. Ratio-scale concurrency knobs;
 # byte-budget the in-memory *_MAX_* accumulators. Emits [RESOURCE-CAP] log lines
 # (rendered red in the recon drawer) only when a value is actually reduced.
-# Applied AFTER stealth/RoE so those low-resource profiles win first, then the
-# governor tightens further under live memory pressure. Fail-open on any error.
+# Applied AFTER stealth and then the RoE cap (get_settings), so those
+# low-resource profiles win first, then the governor tightens further under
+# live memory pressure. Fail-open on any error.
 # =============================================================================
 
 # The two governor tables are REGISTRY QUERIES. Neither is derivable from a
@@ -2169,6 +2439,10 @@ def get_settings() -> dict[str, Any]:
     # idempotent.
     settings = apply_stealth_overrides(settings)
     settings = apply_ai_pipeline_overrides(settings)
+    # The RoE ceiling again, after stealth: the stealth profile `set`s some
+    # roe_capped rates (naabu 10, nuclei 5), which would otherwise overwrite the
+    # cap the fetch applied. It also covers CLI mode, which never fetches.
+    settings = apply_roe_rate_cap(settings)
     # Memory governor (Part 2): last, so it tightens whatever stealth/RoE left,
     # based on the RAM available at scan start.
     settings = apply_memory_governor(settings)
@@ -2231,8 +2505,9 @@ def apply_stealth_overrides(settings: dict[str, Any]) -> dict[str, Any]:
     exclude-tag list is a UNION of the operator's own excluded tags with the
     stealth set, and expressing a union as a value would discard their choice.
 
-    Applied BEFORE the RoE capper and the memory governor, so a low-resource
-    profile wins first and the later passes only tighten further.
+    Applied BEFORE get_settings' second RoE cap and the memory governor, so a
+    low-resource profile wins first and the later passes only tighten further:
+    a `set` above the engagement ceiling is lowered back to it.
     """
     if not settings.get('STEALTH_MODE', False):
         return settings

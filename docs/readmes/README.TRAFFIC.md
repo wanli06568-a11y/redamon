@@ -144,9 +144,11 @@ Capture is **off by default** and controlled by a **two-level gate**
 1. **Global capability switch** `UserSettings.captureProxyEnabled` (operator-level).
    Flipping this is what actually spawns or stops the proxy + ingest containers
    via the orchestrator. If it is off, no capture container runs at all.
-2. **Per-project routing gate** `Project.captureProxyEnabled` (the "HTTP Traffic
-   Capture" toggle in the project form,
-   [`TrafficCaptureSection.tsx`](../webapp/src/components/projects/ProjectForm/sections/TrafficCaptureSection.tsx)).
+2. **Per-project routing gate** `Project.captureProxyEnabled` (the "Traffic
+   capture" toggle in the project form's scan modules,
+   [`ScanModulesSection.tsx`](../../webapp/src/components/projects/ProjectForm/sections/ScanModulesSection.tsx),
+   and the per-project switch in the TrafficMind settings,
+   [`TrafficCaptureToggle.tsx`](../../webapp/src/components/traffic/TrafficCaptureToggle.tsx)).
    This decides whether *that project's* traffic is routed through the running
    proxy.
 
@@ -227,6 +229,7 @@ on the direct (non-proxy) path, so internal identifiers cannot leak to a target.
 | hakrawler | `-proxy` + `-H` | same |
 | kiterunner | `--proxy` + `-H` | same |
 | arjun | `HTTP_PROXY` env + `--headers` | same |
+| openapi | `requests` `proxies=` + `X-Redamon-Ctx` header, set in the same branch as the proxy | same |
 | agent curl | `-x` + `-H` | `redamon-capture-proxy:8888` (DNS) |
 | agent httpx | `-proxy` + `-H` | same |
 | agent playwright | launch `proxy={server}` + `extra_http_headers` (both wrapped and self-contained scripts) | same |
@@ -1202,7 +1205,6 @@ LLM.
 
 ## See also
 
-- Full design rationale and phase plan: [`internal/mitmproxy_integration_plan.md`](../../_local/internal/mitmproxy_integration_plan.md)
-- Threat model context: [`internal/stride/README.TM.STRIDE.md`](../../_local/internal/stride/README.TM.STRIDE.md)
+- Threat model context: [README.TM.SYSTEM_OVERVIEW.md](README.TM.SYSTEM_OVERVIEW.md) and the control catalog [README.SECURITY_POSTURE.md](README.SECURITY_POSTURE.md)
 - Proxy image and addon: [`scanners/capture_proxy/`](../../scanners/capture_proxy/)
 - Agent tools: [`agentic/traffic_tools.py`](../../agentic/traffic_tools.py)

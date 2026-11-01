@@ -40,6 +40,7 @@ function legalValue(key: string, spec: RegistryField): unknown {
       if (spec.validator === 'http_header') return ['X-Scan-Id: abc']
       if (spec.validator === 'project_file') return ['/usr/share/seclists/a.txt']
       if (spec.validator === 'project_file_name') return ['mine.yaml']
+      if (spec.validator === 'url_path_list') return ['/openapi.json']
       return ['a']
     case 'number-list':
       return [200]
@@ -239,8 +240,9 @@ describe('the surface is the size it claims to be', () => {
     // The closed set grew by the engagement-RECORD group, which is not pipeline
     // parameters at all: the client, the contacts, the dates and the document
     // with its text and parse. Everything a scan is configured by is still open.
+    // OpenAPI source URLs may carry credentials and remain project-specific.
     expect(fieldsWhere(f => f.mcp === 'never' && f.group !== 'engagement_record').length)
-      .toBeLessThan(25)
+      .toBeLessThan(26)
   })
 
   test('every rate limit is reachable, not three of fifteen', () => {

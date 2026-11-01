@@ -15,10 +15,10 @@ const SubdomainDiscovery = (
   <div style={wrapperStyle}>
     <div style={firstSectionTitleStyle}>How input is generated</div>
     <p style={paraStyle}>
-      The only graph input is the <strong>Domain</strong> node - the project's apex domain. Subdomain Discovery uses the domain name as the seed for multiple OSINT sources (Subfinder, Amass, certificate transparency logs, DNS bruteforce, etc., depending on the modules you have enabled).
+      The input is the scan root of each enumerated scope group (a <span style={codeStyle}>*.name</span> entry); the <strong>Domain</strong> node is its registrable domain. Subdomain Discovery uses the scan root as the seed for multiple OSINT sources (Subfinder, Amass, certificate transparency logs, DNS bruteforce, etc., depending on the modules you have enabled).
     </p>
     <p style={paraStyle}>
-      Each source returns a list of candidate hostnames. Candidates are merged, deduplicated, and validated to confirm they actually belong to the apex domain. Wildcard records and bogus mock subdomains are filtered out using puredns.
+      Each source returns a list of candidate hostnames. Candidates are merged, deduplicated, and validated to confirm they actually sit under the scan root. Wildcard records and bogus mock subdomains are filtered out using puredns.
     </p>
     <p style={paraStyle}>
       You can also paste custom subdomains in the partial recon modal. They are validated to be in-scope (must end with the project domain) and merged into the same candidate set.
@@ -26,13 +26,13 @@ const SubdomainDiscovery = (
 
     <div style={sectionTitleStyle}>How output transforms the graph</div>
     <p style={paraStyle}>
-      Each confirmed subdomain becomes a <strong>Subdomain</strong> node attached to the project Domain via a <span style={codeStyle}>HAS_SUBDOMAIN</span> relationship. Then each subdomain is resolved live and the result expands the graph:
+      Each confirmed subdomain becomes a <strong>Subdomain</strong> node attached to its registrable-domain Domain node via a <span style={codeStyle}>HAS_SUBDOMAIN</span> relationship. Then each subdomain is resolved live and the result expands the graph:
     </p>
     <ul style={listStyle}>
       <li><strong>IP nodes</strong> are created for every A/AAAA record, and linked to the Subdomain via <span style={codeStyle}>RESOLVES_TO</span> relationships (one per record type).</li>
       <li><strong>DNSRecord nodes</strong> are created for MX, NS, TXT, and CNAME records, attached via <span style={codeStyle}>HAS_DNS_RECORD</span>.</li>
       <li>The Subdomain node is tagged with its resolution state (resolved / unresolved / wildcard) and a discovery timestamp.</li>
-      <li>The apex Domain node is enriched with WHOIS data (registrar, organization, country, registration dates) when WHOIS lookup is enabled.</li>
+      <li>The Domain node (the registrable domain) is enriched with WHOIS data (registrar, organization, country, registration dates) when WHOIS lookup is enabled.</li>
     </ul>
     <p style={paraStyle}>
       Existing nodes are reused (deduplicated) - running the scan again only adds newly discovered subdomains, never duplicates.
@@ -164,7 +164,7 @@ const Shodan = (
   <div style={wrapperStyle}>
     <div style={firstSectionTitleStyle}>How input is generated</div>
     <p style={paraStyle}>
-      Shodan needs <strong>IP</strong> nodes. The list is built from every IP linked to the apex Domain plus every IP linked to any in-scope Subdomain (via <span style={codeStyle}>RESOLVES_TO</span>).
+      Shodan needs <strong>IP</strong> nodes. The list is built from every IP linked to the Domain (registrable domain) node plus every IP linked to any in-scope Subdomain (via <span style={codeStyle}>RESOLVES_TO</span>).
     </p>
     <p style={paraStyle}>
       Custom IPs/CIDRs entered in the partial recon modal are validated, expanded (CIDRs above /24 are rejected), and merged into the lookup list. Each one is queried against the Shodan API for its passive intelligence record.
@@ -191,8 +191,8 @@ const OsintEnrichment = (
       An orchestrator that runs whichever OSINT sources you have enabled (Shodan, Censys, AlienVault OTX, NetLAS, VirusTotal, ZoomEye, CriminalIP). It feeds each enabled source the appropriate inputs from the graph:
     </p>
     <ul style={listStyle}>
-      <li><strong>IP-based sources</strong> get every IP in scope (apex + resolved subdomains).</li>
-      <li><strong>Domain-based sources</strong> get the apex Domain and in-scope Subdomain names.</li>
+      <li><strong>IP-based sources</strong> get every IP in scope (the Domain node's + resolved subdomains').</li>
+      <li><strong>Domain-based sources</strong> get the registrable domain and the in-scope Subdomain names.</li>
     </ul>
 
     <div style={sectionTitleStyle}>How output transforms the graph</div>
@@ -224,7 +224,7 @@ const Naabu = (
     </p>
     <p style={paraStyle}>The graph sources are merged additively (no priority chain):</p>
     <ol style={listStyle}>
-      <li><strong>Apex Domain IPs</strong> - every IP linked to the root Domain node.</li>
+      <li><strong>Domain IPs</strong> - every IP linked to the Domain (registrable domain) node.</li>
       <li><strong>Subdomain IPs</strong> - every IP linked to any Subdomain (A/AAAA records).</li>
     </ol>
     <p style={paraStyle}>The merged list is deduplicated by IP. Custom inputs from the partial recon modal:</p>
@@ -258,7 +258,7 @@ const Masscan = (
   <div style={wrapperStyle}>
     <div style={firstSectionTitleStyle}>How input is generated</div>
     <p style={paraStyle}>
-      Masscan needs <strong>IP</strong> addresses. The input list is built from every IP linked to the apex Domain plus every IP linked to any Subdomain that successfully resolved (i.e. has at least one A or AAAA record).
+      Masscan needs <strong>IP</strong> addresses. The input list is built from every IP linked to the Domain (registrable domain) node plus every IP linked to any Subdomain that successfully resolved (i.e. has at least one A or AAAA record).
     </p>
     <p style={paraStyle}>
       DNS resolution must run first - Masscan does not accept hostnames. CIDR notation is supported and is the recommended format for large IP ranges.
@@ -288,7 +288,7 @@ const Nmap = (
       Nmap scans a list of IP addresses against a list of ports. Both come from the graph:
     </p>
     <ul style={listStyle}>
-      <li><strong>IPs</strong> - read from IP nodes that already have Port relationships (output of Naabu/Masscan). Falls back to apex Domain IPs if no port-scan data exists yet.</li>
+      <li><strong>IPs</strong> - read from IP nodes that already have Port relationships (output of Naabu/Masscan). Falls back to the Domain node's IPs if no port-scan data exists yet.</li>
       <li><strong>Ports</strong> - the union of every Port node discovered in earlier phases. If no Port nodes exist, Nmap falls back to its built-in top-ports list.</li>
     </ul>
     <p style={paraStyle}>
@@ -391,7 +391,7 @@ const Httpx = (
 
     <div style={sectionTitleStyle}>When the scan refuses to start</div>
     <p style={{ ...paraStyle, margin: 0 }}>
-      Only if the graph has no Port-mapped hosts <em>and</em> no resolved Subdomains <em>and</em> the apex Domain has no IPs <em>and</em> no custom targets were entered.
+      Only if the graph has no Port-mapped hosts <em>and</em> no resolved Subdomains <em>and</em> the Domain node has no IPs <em>and</em> no custom targets were entered.
     </p>
   </div>
 )
@@ -399,6 +399,28 @@ const Httpx = (
 // ============================================================================
 // RESOURCE ENUMERATION
 // ============================================================================
+
+const IpAttribution = (
+  <div style={wrapperStyle}>
+    <div style={firstSectionTitleStyle}>How input is generated</div>
+    <p style={paraStyle}>
+      IP Attribution reads every <strong>IP</strong> node linked to an in-scope Subdomain (via <span style={codeStyle}>RESOLVES_TO</span>), with its open <strong>Port</strong> nodes and the CDN name a scanner already put on it. A link written by Shodan&apos;s reverse DNS does not count as a name resolving to the IP.
+    </p>
+    <p style={paraStyle}>
+      The only traffic is one TLS handshake without SNI to port 443 of each IP with 443 open, to read the certificate the IP presents when no name is asked for. It is capped per scan, paced at the engagement rate ceiling, never sent to a host the rules of engagement exclude, and skipped in stealth mode. There is no custom input: the step tags IPs already in the graph.
+    </p>
+
+    <div style={sectionTitleStyle}>How output transforms the graph</div>
+    <ul style={listStyle}>
+      <li>Each <strong>IP</strong> node gets an ownership tag: shared edge (a CDN edge serving many companies), dedicated (its default certificate covers a target domain) or unknown, with the reasons, the default certificate&apos;s names and how many names resolve to it.</li>
+      <li>A shared edge is also marked as a CDN on the IP node, without clearing a tag another scanner set.</li>
+      <li>No node is created: an IP not already in the graph is not tagged.</li>
+    </ul>
+    <p style={{ ...paraStyle, margin: 0 }}>
+      Vhost/SNI, origin discovery, the Shodan and Netlas CVE writers and the Priority Board read the tag.
+    </p>
+  </div>
+)
 
 const Katana = (
   <div style={wrapperStyle}>
@@ -508,6 +530,20 @@ const Kiterunner = (
     </ul>
     <p style={{ ...paraStyle, margin: 0 }}>
       Endpoints are deduplicated by (BaseURL + path + method). Different methods on the same path produce separate Endpoint nodes.
+    </p>
+  </div>
+)
+
+const OpenAPI = (
+  <div style={wrapperStyle}>
+    <div style={firstSectionTitleStyle}>How input is generated</div>
+    <p style={paraStyle}>
+      OpenAPI starts from the specification documents listed under Configured documents. With Auto-discover on, it also looks at the live BaseURLs from HTTP probing, at crawled URLs whose path looks like API documentation, and at a short list of common documentation paths on each in-scope host. Custom URLs entered in the partial recon window are fetched as specification documents even when Auto-discover is off. Every document, redirect and reference must stay on the same host and inside the project scope, and a host that resolves to an internal address it was not given is refused. Anything else is skipped before a request is sent. Stealth mode turns this step off.
+    </p>
+
+    <div style={sectionTitleStyle}>How output transforms the graph</div>
+    <p style={{ ...paraStyle, margin: 0 }}>
+      Each operation the document declares becomes an <strong>Endpoint</strong> under the <strong>BaseURL</strong> of the API server it names, linked with HAS_ENDPOINT. A path with variables, such as /users/&#123;id&#125;, is stored with an example value, and the original pattern is kept on the Endpoint. Declared query, body and path parameters become <strong>Parameter</strong> nodes linked with HAS_PARAMETER. An Endpoint that crawling already found keeps everything it had and is marked as declared. Servers on hosts that discovery has not found are listed in the run log but not added. OpenAPI never calls a declared operation. Later scanners request an endpoint known only from a specification with GET or HEAD only, and nuclei templates send their own requests to it as to any other target URL.
     </p>
   </div>
 )
@@ -638,6 +674,32 @@ const SerializedScan = (
       Confirmation needs captured request traffic, so pairing this with TrafficMind (the HTTP capture proxy)
       gives the agent the corpus it digs through.
     </p>
+  </div>
+)
+
+const RouteExposure = (
+  <div style={wrapperStyle}>
+    <div style={firstSectionTitleStyle}>How input is generated</div>
+    <p style={paraStyle}>
+      Route Exposure reads the routes recon already found: the BaseURL and Endpoint nodes (crawl, ffuf,
+      kiterunner, OpenAPI, the routes JS Recon pulled from bundles), with their methods and any OpenAPI security
+      declaration. Next to them it generates routes of its own: well-known internal, admin and debug paths,
+      version-control and env files, backup copies of server-side files and older API versions.
+    </p>
+    <p style={{ ...paraStyle, margin: 0 }}>
+      In partial recon the URLs typed in the modal are added. Each route is requested with GET (HEAD and a 1 KB
+      read for a backup) without credentials, and again logged in where your authentication profile covers the
+      host. Logout, delete, reset and other state-changing paths are never requested. With no BaseURL, no
+      Endpoint and no typed URL there is nothing to request, and the run stops.
+    </p>
+
+    <div style={sectionTitleStyle}>How output transforms the graph</div>
+    <ul style={listStyle}>
+      <li>A route that answers without credentials where authentication was expected, or that returns sensitive fields or other people&apos;s personal data, becomes an <strong>info-severity Vulnerability</strong> lead with <span style={codeStyle}>source: &quot;route_exposure&quot;</span> and <span style={codeStyle}>needs_agent_confirmation: true</span>, linked from its <strong>Endpoint</strong> and <strong>BaseURL</strong> via <span style={codeStyle}>HAS_VULNERABILITY</span>. It stays at the bottom of the Priority Board until the agent confirms it; reports and Insights hide it until then.</li>
+      <li>A route whose answer proves the exposure by itself (an exposed .git or .env file, a backup archive, a debug console or endpoint, a debug page, a route catalog, a secret) becomes a <strong>Vulnerability</strong> with its real severity, linked from the <strong>BaseURL</strong>.</li>
+      <li>A generated route that answered with content becomes a new <strong>Endpoint</strong> via <span style={codeStyle}>HAS_ENDPOINT</span>; an exposed file never does.</li>
+      <li>Every route recon already had is enriched with its anonymous status (<span style={codeStyle}>anon_status</span>).</li>
+    </ul>
   </div>
 )
 
@@ -856,7 +918,7 @@ const SubdomainTakeover = (
       Crucially, <strong>unresolved subdomains are still scanned</strong>. A subdomain with a CNAME but no A record is exactly the takeover signal we're looking for. If a subdomain ever existed in the graph but no longer resolves, it stays in the test list.
     </p>
     <p style={paraStyle}>
-      BaseURL and Domain are listed as inputs but only used for context: the apex Domain bounds the scope filter, and existing BaseURLs help confirm the host was previously live. Custom subdomains from the partial recon modal must be in-scope (must end with the project domain) and are added to the scan list even if they don't resolve.
+      BaseURL and Domain are listed as inputs but only used for context: the scope groups bound the scope filter, and existing BaseURLs help confirm the host was previously live. Custom subdomains from the partial recon modal must be in scope (under an enumerated scan root, or one of a listed group's hosts) and are added to the scan list even if they don't resolve.
     </p>
 
     <div style={sectionTitleStyle}>How output transforms the graph</div>
@@ -887,8 +949,7 @@ const VhostSni = (
       <li><strong>ExternalDomain</strong> nodes that resolve to the same IP (out-of-scope, but co-hosted, often the highest-signal source).</li>
       <li>TLS Subject Alternative Names captured on each <strong>BaseURL</strong> served from this IP, plus any standalone <strong>Certificate</strong> nodes.</li>
       <li>CNAME targets recorded in <strong>DNSRecord</strong> entries.</li>
-      <li>Reverse-DNS PTR record stored on the <strong>IP</strong> node.</li>
-      <li>The default wordlist (~2,300 admin / dev / staging / internal / modern-stack prefixes), expanded as <span style={codeStyle}>{`{prefix}.{target_apex}`}</span>.</li>
+      <li>The default wordlist (~2,300 admin / dev / staging / internal / modern-stack prefixes), expanded as <span style={codeStyle}>{`{prefix}.{scan_root}`}</span> for an enumerated scope group; a listed group gets no wordlist, and a shared CDN edge IP (flagged by naabu, httpx or tlsx with an edge CDN name, or inside a CDN&apos;s published edge ranges) gets none either: it would only find the CDN. That skip shows in the report&apos;s Coverage Limitations.</li>
       <li>Any custom wordlist provided in the section settings (newline-separated, prefixes or full hostnames).</li>
     </ul>
     <p style={paraStyle}>
@@ -900,7 +961,8 @@ const VhostSni = (
 
     <div style={sectionTitleStyle}>How output transforms the graph</div>
     <ul style={listStyle}>
-      <li>Each anomaly produces a <strong>Vulnerability</strong> node typed as <em>Hidden Virtual Host</em> (L7 only), <em>Hidden SNI Route</em> (L4 only), or <em>Routing Inconsistency / Host Header Bypass</em> (L7 vs L4 disagreement). Severity is escalated to <em>medium</em> when the discovered hostname matches an internal-keyword pattern (admin, jenkins, k8s, vault, etc.) and to <em>high</em> when L7 and L4 routing disagree.</li>
+      <li>Each anomaly produces a <strong>Vulnerability</strong> node typed as <em>Hidden Virtual Host</em> (L7 only, or both layers serving the same page), <em>Hidden SNI Route</em> (L4 only), or <em>Routing Inconsistency / Host Header Bypass</em> (L7 and L4 serving different pages). Severity is escalated to <em>medium</em> when the discovered hostname matches an internal-keyword pattern (admin, jenkins, k8s, vault, etc.) and to <em>high</em> when L7 and L4 routing disagree.</li>
+      <li>A name this run&apos;s DNS already points at the IP is never a hidden vhost, since anyone can resolve it: it is still probed, and reported only for a routing inconsistency.</li>
       <li>The Vulnerability is attached to the discovered <strong>Subdomain</strong> via <span style={codeStyle}>HAS_VULNERABILITY</span>. For host-header-bypass findings the <strong>IP</strong> also gets the same Vulnerability so it surfaces in IP-level dashboards.</li>
       <li>Every probed Subdomain is enriched in place with <em>vhost_tested</em>, <em>vhost_hidden</em>, <em>vhost_routing_layer</em>, <em>vhost_status_code</em>, <em>vhost_size_delta</em>, and <em>sni_routed</em>.</li>
       <li>Every probed IP is enriched with <em>vhost_baseline_status</em>, <em>vhost_baseline_size</em>, <em>hosts_hidden_vhosts</em>, <em>hidden_vhost_count</em>, and <em>is_reverse_proxy</em>.</li>
@@ -962,7 +1024,7 @@ const SecurityChecks = (
       <li><strong>BaseURLs</strong> → header checks (Referrer-Policy, COOP/CORP/COEP, Cache-Control, CSP), session/cookie checks, login form checks, insecure form action checks.</li>
       <li><strong>IPs</strong> → Direct IP Access checks, port-based checks (admin ports exposed, exposed databases, Redis without auth, Kubernetes API exposed, SMTP open relay), TLS expiry on direct IPs.</li>
       <li><strong>Subdomains</strong> → DNS checks (SPF missing, DMARC missing, DNSSEC missing, zone transfer), TLS expiry on hostnames.</li>
-      <li><strong>Domain (apex)</strong> → DNS-level checks scoped to the root domain (apex SPF, apex DMARC).</li>
+      <li><strong>Domain (registrable domain)</strong> → DNS-level checks run once per registrable domain (SPF, DMARC, DNSSEC).</li>
     </ul>
     <p style={paraStyle}>
       All four sources are <strong>additive</strong> - there's no priority chain. Disabling a specific toggle in the settings skips that check's input slice. Custom subdomains, IPs, and URLs from the partial recon modal merge into the appropriate pool.
@@ -1079,11 +1141,13 @@ export const INPUT_LOGIC_TOOLTIPS: Record<string, ReactNode> = {
   Tlsx,
   // HTTP probing
   Httpx,
+  IpAttribution,
   // Resource enumeration
   Katana,
   ZapAjaxSpider,
   Hakrawler,
   Kiterunner,
+  OpenAPI,
   Ffuf,
   Jsluice,
   JsRecon,
@@ -1098,6 +1162,7 @@ export const INPUT_LOGIC_TOOLTIPS: Record<string, ReactNode> = {
   SubdomainTakeover,
   VhostSni,
   WebCachePoison,
+  RouteExposure,
   SecurityChecks,
   OriginDiscovery,
   CveLookup,

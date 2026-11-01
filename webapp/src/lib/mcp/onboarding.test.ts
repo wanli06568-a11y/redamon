@@ -28,6 +28,7 @@
  * @vitest-environment node
  */
 import { existsSync, readFileSync } from 'fs'
+import { wikiCheckoutPresent } from '@/lib/wikiCheckout.testUtils'
 import path from 'path'
 import { fileURLToPath } from 'url'
 import { describe, test, expect, beforeAll, vi } from 'vitest'
@@ -572,7 +573,7 @@ describe('the inline onboarding (the MCP instructions string)', () => {
     expect(text).toContain('graph_summary')
     expect(text).toContain('written by the TARGET')
     expect(text).toContain('NEVER SCANNED')
-    expect(text).toContain('cannot change what RedAmon points at')
+    expect(text).toContain('Never change what RedAmon points at on your own initiative')
   })
 
   test('it names the token\'s real permissions and its profile', () => {
@@ -747,8 +748,8 @@ describe('the profile table reaches the output', () => {
 
 const WIKI_DIR = process.env.MCP_DOCS_WIKI_DIR
   || fileURLToPath(new URL('../../../../redamon.wiki/', import.meta.url))
-/** A real checkout: a fresh clone leaves the submodule directory empty. */
-const hasWikiCheckout = () => existsSync(path.join(WIKI_DIR, 'Home.md'))
+/** A real wiki checkout; an empty one fails unless allowed (wikiCheckout.testUtils.ts). */
+const hasWikiCheckout = () => wikiCheckoutPresent(WIKI_DIR)
 
 describe('the Agent Onboarding documentation', () => {
   /**

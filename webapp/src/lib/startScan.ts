@@ -14,8 +14,10 @@ import { loadEngagement } from '@/lib/engagement'
 import { resolveTrufflehogStart } from '@/lib/trufflehogStart'
 import { orchestratorFetch } from '@/lib/orchestrator'
 import { normalizeOrchestratorStartError } from '@/lib/orchestratorError'
-import { startFullScan } from '@/lib/startFullScan'
+import { classifyOrchestratorThrow, startFullScan } from '@/lib/startFullScan'
 import { parseScanMode, type ScanTrigger } from '@/lib/scanTimeline'
+import { legacyGraphDomains, legacyGraphRefusal } from '@/lib/legacyGraph'
+import { resolveScopeGroups } from '@/lib/scopeGroups'
 
 const RECON_ORCHESTRATOR_URL = process.env.RECON_ORCHESTRATOR_URL || 'http://localhost:8010'
 const WEBAPP_URL = process.env.WEBAPP_URL || 'http://localhost:3000'
@@ -30,6 +32,16 @@ export interface DispatchStartResult {
   state?: unknown
   scanJobId?: string | null
   runId?: string
+  /** 'unknown' when the orchestrator call threw: the scan may or may not have started. */
+  startOutcome?: 'unknown'
+  /** The webapp could not freeze the graph, so nothing was started. */
+  snapshotFailed?: boolean
+  /** The orchestrator's (or startFullScan's) reason code, e.g. 'spawn_failed'. */
+  code?: string
+  /** The orchestrator's own HTTP status, when it answered with an error. */
+  upstreamStatus?: number
+  /** The errno of a start call that got no answer. */
+  cause?: string
 }
 
 export type StartScanPayload = Record<string, unknown>
@@ -94,7 +106,11 @@ export async function dispatchStart(
   if (kind === 'full_recon') {
     const mode = parseScanMode(payload.mode) ?? 'new'
     const trigger: ScanTrigger = 'scheduled'
-    const r = await startFullScan({ projectId, mode, trigger, actorUserId: opts.actorUserId ?? null })
+    // quietTransient: the queue retries a transient refusal, so the start path
+    // must not record a failed ScanJob for each attempt.
+    const r = await startFullScan({
+      projectId, mode, trigger, actorUserId: opts.actorUserId ?? null, quietTransient: true,
+    })
     if (r.ok) {
       return { ok: true, status: 200, state: r.state, scanJobId: r.scanJobId ?? null, runId: runId(r.state) }
     }
@@ -106,14 +122,32 @@ export async function dispatchStart(
       activationInProgress: r.activationInProgress,
       busy: r.busy,
       scanJobId: r.scanJobId ?? null,
+      ...(r.startOutcome ? { startOutcome: r.startOutcome } : {}),
+      ...(r.snapshotFailed ? { snapshotFailed: true } : {}),
+      ...(r.code ? { code: r.code } : {}),
+      ...(r.upstreamStatus ? { upstreamStatus: r.upstreamStatus } : {}),
+      ...(r.cause ? { cause: r.cause } : {}),
     }
   }
 
   const project = await prisma.project.findUnique({
     where: { id: projectId },
-    select: { id: true, userId: true, supplyChainInputMode: true },
+    select: {
+      id: true, userId: true, supplyChainInputMode: true,
+      targetDomain: true, subdomainList: true, ipMode: true, domainBatchMode: true, domainBatchHosts: true,
+    },
   })
   if (!project) return { ok: false, status: 404, error: 'Project not found' }
+
+  // The writers that attach to Domain nodes refuse an old-model graph
+  // (§4.11.6). 422, not the routes' 409: the queue reads a 409 as "busy" and
+  // would requeue the job until a full recon happened to run.
+  if (kind === 'partial_recon' || kind === 'gvm' || kind === 'ai_attack') {
+    const legacy = await legacyGraphDomains(project.userId, projectId, resolveScopeGroups(project).groups)
+    if (legacy && legacy.length > 0) {
+      return { ok: false, status: 422, error: legacyGraphRefusal(legacy).error }
+    }
+  }
 
   // The engagement rule applies to the OTHER scanners too, and it has to be
   // checked here rather than only in startFullScan: GVM sweeps ports, the
@@ -126,9 +160,11 @@ export async function dispatchStart(
   // control.
   const engagement = await loadEngagement(projectId)
   if (engagement.blockers.length > 0) {
+    // 422 as in startFullScan: the queue reads a 409 as "busy" and would
+    // requeue this until a person fixed the engagement record.
     return {
       ok: false,
-      status: 409,
+      status: 422,
       error:
         'This is a third-party engagement and it is not startable: ' +
         engagement.blockers.join(' '),
@@ -223,20 +259,42 @@ export async function dispatchStart(
     return { ok: false, status: 400, error: `Unknown scan kind: ${kind}` }
   }
 
-  const response = await orchestratorFetch(`${RECON_ORCHESTRATOR_URL}${path}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  })
+  let response: Response
+  try {
+    response = await orchestratorFetch(`${RECON_ORCHESTRATOR_URL}${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+  } catch (err) {
+    console.error(`[jobQueue] orchestrator start call for ${kind} on ${projectId} failed:`, err)
+    const thrown = classifyOrchestratorThrow(err)
+    const why = { code: thrown.code, ...(thrown.cause ? { cause: thrown.cause } : {}) }
+    if (!thrown.outcomeUnknown) {
+      return { ok: false, status: thrown.status, error: 'The orchestrator could not be reached, so the scan was not started.', ...why }
+    }
+    // A timeout or a reset is not a refusal: the orchestrator may have spawned
+    // the container anyway, and partial recon and AI attack allow parallel
+    // runs, so a blind retry could start a duplicate.
+    return {
+      ok: false,
+      status: thrown.status,
+      startOutcome: 'unknown',
+      error: 'The orchestrator did not answer, so it is unknown whether the scan started.',
+      ...why,
+    }
+  }
 
   if (!response.ok) {
     const errorData = await response.json().catch(() => ({}))
-    const { error, limit } = normalizeOrchestratorStartError(errorData, fallback)
+    const { error, limit, code } = normalizeOrchestratorStartError(errorData, fallback)
     return {
       ok: false,
       status: response.status,
       error,
       ...(limit ? { limit: limit as Record<string, unknown> } : {}),
+      ...(code ? { code } : {}),
+      upstreamStatus: response.status,
     }
   }
 

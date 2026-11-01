@@ -24,6 +24,7 @@ from prompt_safety import wrap_untrusted, UNTRUSTED_OUTPUT_GUIDANCE
 from orchestrator_helpers.parsing import try_parse_llm_decision
 from orchestrator_helpers.json_utils import normalize_content, json_dumps_safe
 from orchestrator_helpers.llm_retry import retry_llm_call
+from orchestrator_helpers.llm_retry import llm_error_reason
 import orchestrator_helpers.chain_graph_writer as chain_graph
 from orchestrator_helpers.productivity import (
     audit_productivity_claim,
@@ -1013,7 +1014,7 @@ async def fireteam_member_think_node(
             )
             return {
                 "task_complete": True,
-                "completion_reason": f"llm_error: {exc}",
+                "completion_reason": llm_error_reason(exc),
             }
 
         raw_content = normalize_content(response.content if hasattr(response, "content") else response)
@@ -1284,6 +1285,8 @@ async def fireteam_member_think_node(
                         related_cves=cf.related_cves or [],
                         related_ips=cf.related_ips or [],
                         related_finding_ids=getattr(cf, 'related_finding_ids', None),
+                        skill=state.get("attack_path_type", ""),
+                        route_exposure_on=get_setting('ROUTE_EXPOSURE_ENABLED', False),
                         agent_id=member_id,
                         source_agent=member_name,
                         fireteam_id=fireteam_id,
@@ -1439,7 +1442,6 @@ async def fireteam_member_think_node(
         # Sequential Neo4j writes so each step links to the prior via prev_step_id.
         chain_prev = prev_step_id
         last_written_step_id: Optional[str] = None
-        loop = asyncio.get_running_loop()
 
         for i, plan_step in enumerate(plan_steps):
             step_id = uuid4().hex
@@ -1470,12 +1472,12 @@ async def fireteam_member_think_node(
 
             if neo4j_creds:
                 neo4j_uri, neo4j_user, neo4j_password = neo4j_creds
-                # Sync step write (so the next step's prev_step_id chain is
-                # valid in Neo4j). Off the event loop via executor since this
-                # opens a Bolt session.
+                # Awaited step write (so the next step's prev_step_id chain is
+                # valid in Neo4j), on the chain writer thread and bounded so a
+                # stalled Neo4j cannot freeze the member.
+                step_exists = False
                 try:
-                    await loop.run_in_executor(
-                        None,
+                    step_exists = await chain_graph.run_bounded_write(
                         lambda _sid=step_id, _prev=chain_prev, _ps=plan_step,
                                _ei=combined_extracted, _thought=step_thought,
                                _reasoning=step_reasoning, _oa=step_output_analysis,
@@ -1502,8 +1504,10 @@ async def fireteam_member_think_node(
                                 agent_name=member_name,
                                 fireteam_id=fireteam_id,
                             ),
-                    )
-                    last_written_step_id = step_id
+                        label=f"member ChainStep {step_id}",
+                    ) is not None
+                    if step_exists:
+                        last_written_step_id = step_id
                 except Exception as e:
                     logger.warning("member plan_step sync write failed: %s", e)
 
@@ -1524,7 +1528,9 @@ async def fireteam_member_think_node(
                     except Exception as e:
                         logger.warning("member plan_failure write failed: %s", e)
 
-            chain_prev = step_id
+                # The next step links only to a step that will exist.
+                if step_exists:
+                    chain_prev = step_id
 
         # Combined findings / exploit_success anchored to the last step.
         if neo4j_creds and last_written_step_id and analysis is not None:
@@ -1570,6 +1576,8 @@ async def fireteam_member_think_node(
                         related_cves=cf.related_cves or [],
                         related_ips=cf.related_ips or [],
                         related_finding_ids=getattr(cf, 'related_finding_ids', None),
+                        skill=state.get("attack_path_type", ""),
+                        route_exposure_on=get_setting('ROUTE_EXPOSURE_ENABLED', False),
                         agent_id=member_id,
                         source_agent=member_name,
                         fireteam_id=fireteam_id,

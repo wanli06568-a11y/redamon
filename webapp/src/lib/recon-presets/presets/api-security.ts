@@ -22,6 +22,7 @@ Pentesters and security engineers testing REST APIs, GraphQL endpoints, or micro
 - ffuf with API-specific extensions (.json, .xml, .graphql, .yaml, .wadl, .wsdl) and smart fuzz
 - jsluice to extract API endpoints from JavaScript files
 - Nuclei DAST mode with Interactsh for API-specific vulnerability testing
+- OpenAPI import with Auto-discover: API specification documents found on live hosts become declared endpoints and parameters (never called; later scanners request them with GET or HEAD only)
 
 ### What it disables
 - Port scanning (Naabu, Masscan, Nmap) -- API testing targets known HTTP endpoints
@@ -86,6 +87,7 @@ Pentesters and security engineers testing REST APIs, GraphQL endpoints, or micro
 
     // --- httpx: tech detect + response capture for API detection ---
     httpxEnabled: true,
+    ipAttributionEnabled: true,
     httpxThreads: 50,
     httpxTimeout: 15,
     httpxRetries: 2,
@@ -176,6 +178,7 @@ Pentesters and security engineers testing REST APIs, GraphQL endpoints, or micro
 
     // --- Kiterunner: routes-large, high concurrency ---
     kiterunnerEnabled: true,
+    openapiAutoDiscover: true,
     kiterunnerWordlists: ['routes-large'],
     kiterunnerRateLimit: 150,
     kiterunnerConnections: 150,
@@ -229,6 +232,8 @@ Pentesters and security engineers testing REST APIs, GraphQL endpoints, or micro
 
     // --- DISABLE security checks ---
     serializedScanEnabled: true,
+    // Route exposure: unauthenticated internal/admin/debug routes, exposed .git/.env/backups, PII in responses.
+    routeExposureEnabled: true,
     securityCheckEnabled: false,
 
     // --- DISABLE all OSINT ---

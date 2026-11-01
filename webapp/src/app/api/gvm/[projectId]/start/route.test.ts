@@ -19,6 +19,7 @@ const h = vi.hoisted(() => ({
   existsSync: vi.fn(),
   recordScanStart: vi.fn(),
   guard: vi.fn(),
+  legacy: vi.fn(),
 }))
 
 vi.mock('@/lib/prisma', () => ({
@@ -37,6 +38,11 @@ vi.mock('@/lib/access', () => ({
 vi.mock('@/lib/scanTimeline', async orig => ({
   ...(await orig<typeof import('@/lib/scanTimeline')>()),
   recordScanStart: (...a: unknown[]) => h.recordScanStart(...a),
+}))
+
+vi.mock('@/lib/legacyGraph', async orig => ({
+  ...(await orig<typeof import('@/lib/legacyGraph')>()),
+  legacyGraphDomains: (...a: unknown[]) => h.legacy(...a),
 }))
 
 import { POST } from './route'
@@ -58,6 +64,7 @@ beforeEach(() => {
   h.recordScanStart.mockResolvedValue(null)
   h.orchestratorFetch.mockResolvedValue({ ok: true, json: async () => ({ status: 'starting' }) })
   h.findProject.mockResolvedValue(BATCH)
+  h.legacy.mockResolvedValue([])
 })
 
 describe('domain batch precondition', () => {
@@ -112,5 +119,90 @@ describe('domain batch precondition', () => {
     const res = await call()
     expect(res.status).toBe(404)
     expect(h.findProject).not.toHaveBeenCalled()
+  })
+})
+
+describe('an old-model graph', () => {
+  test('refuses the start with 409 and names the old Domain nodes', async () => {
+    h.legacy.mockResolvedValue(['co.uk'])
+    const res = await call()
+    expect(res.status).toBe(409)
+    const body = await res.json()
+    expect(body.error).toMatch(/built before the current scope model; run a full recon first/)
+    expect(body.legacyGraph).toEqual(['co.uk'])
+    expect(h.orchestratorFetch).not.toHaveBeenCalled()
+  })
+
+  test('is asked with the derived scope groups of the batch', async () => {
+    await call()
+    expect(h.legacy.mock.calls[0][0]).toBe('u1')
+    expect(h.legacy.mock.calls[0][2].map((g: { scanRoot: string }) => g.scanRoot))
+      .toEqual(['example.com', 'other.com'])
+  })
+
+  test('an unanswerable check lets the start through', async () => {
+    h.legacy.mockResolvedValue(null)
+    const res = await call()
+    expect(res.status).toBe(200)
+  })
+})
+
+describe('a start the orchestrator or the DB refuses', () => {
+  beforeEach(() => {
+    h.findProject.mockResolvedValue({ ...BATCH, domainBatchMode: false, domainBatchHosts: [], targetDomain: 'example.com' })
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+  })
+
+  test('a non-JSON 500 still says which status the orchestrator answered', async () => {
+    h.orchestratorFetch.mockResolvedValue(new Response('Internal Server Error', { status: 500 }))
+    const res = await call()
+    expect(res.status).toBe(500)
+    expect(await res.json()).toEqual({
+      error: 'Failed to start GVM scan', code: 'orchestrator_error', upstreamStatus: 500,
+    })
+    expect(h.recordScanStart).not.toHaveBeenCalled()
+  })
+
+  test("the orchestrator's own reason code is passed through", async () => {
+    h.orchestratorFetch.mockResolvedValue(new Response(
+      JSON.stringify({ detail: { detail: 'GVM container could not be created', code: 'spawn_failed' } }),
+      { status: 500 },
+    ))
+    const body = await (await call()).json()
+    expect(body).toMatchObject({ error: 'GVM container could not be created', code: 'spawn_failed', upstreamStatus: 500 })
+  })
+
+  test('a memory-governor refusal keeps its limit for the queue offer', async () => {
+    const limit = { limitType: 'ram', detail: 'Not enough memory', current: 9, ceiling: 8 }
+    h.orchestratorFetch.mockResolvedValue(new Response(JSON.stringify({ detail: limit }), { status: 409 }))
+    const res = await call()
+    expect(res.status).toBe(409)
+    const body = await res.json()
+    expect(body.limit).toEqual(limit)
+    expect(body.upstreamStatus).toBe(409)
+    expect(typeof body.error).toBe('string')
+  })
+
+  test('an unreachable orchestrator is a 503 naming it, with the errno', async () => {
+    const err = new TypeError('fetch failed')
+    ;(err as TypeError & { cause?: unknown }).cause = Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' })
+    h.orchestratorFetch.mockRejectedValue(err)
+    const res = await call()
+    expect(res.status).toBe(503)
+    expect(await res.json()).toEqual({
+      error: 'Failed to start GVM scan', code: 'orchestrator_unreachable', cause: 'ECONNREFUSED',
+    })
+  })
+
+  test('a DB failure answers its Prisma code, never the message', async () => {
+    h.findProject.mockRejectedValue(Object.assign(
+      new Error("Can't reach database server while reading target example.com"),
+      { name: 'PrismaClientInitializationError', code: 'P1001' },
+    ))
+    const res = await call()
+    expect(res.status).toBe(500)
+    const body = await res.json()
+    expect(body).toEqual({ error: 'Failed to start GVM scan', code: 'P1001' })
+    expect(JSON.stringify(body)).not.toContain('example.com')
   })
 })

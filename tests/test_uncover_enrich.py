@@ -144,12 +144,13 @@ class TestBuildQueries(unittest.TestCase):
         self.assertEqual(queries, ['example.com'])
 
     def test_with_whois_org(self):
-        queries = _build_queries('example.com', {'_WHOIS_ORG': 'Example Inc.'})
-        self.assertEqual(len(queries), 2)
-        self.assertIn('ssl:"Example Inc."', queries)
+        # The group's org is passed in, never read back from shared settings
+        # where an earlier group's org would linger.
+        queries = _build_queries('example.com', {'_WHOIS_ORG': 'Other Group Inc.'}, 'Example Inc.')
+        self.assertEqual(queries, ['example.com', 'ssl:"Example Inc."'])
 
     def test_skips_na_org(self):
-        queries = _build_queries('example.com', {'_WHOIS_ORG': 'N/A'})
+        queries = _build_queries('example.com', {}, 'N/A')
         self.assertEqual(len(queries), 1)
 
 
@@ -270,6 +271,34 @@ class TestMergeIpMetadata(unittest.TestCase):
         uncover_data = {"hosts": [], "ips": ["1.2.3.4"], "ip_ports": {}}
         merge_uncover_into_pipeline(combined, uncover_data, "example.com")
         self.assertIn("1.2.3.4", combined["metadata"]["expanded_ips"])
+
+
+class TestMergeLogCountsOnlyWhatJoined(unittest.TestCase):
+    """The merge log reported every new IP as merged "into pipeline", also in a
+    group that refused them, and none of them is ever port-scanned (plan 12.17)."""
+
+    @staticmethod
+    def _merge_log(root):
+        import contextlib
+        import io
+        combined = {"domain": root, "dns": {"domain": {}, "subdomains": {}},
+                    "metadata": {"root_domain": root, "org_domain": "example.com",
+                                 "scope_mode": "enumerate", "include_root_domain": False}}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            merge_uncover_into_pipeline(combined, {"hosts": [], "ips": ["192.0.2.9"], "ip_ports": {}},
+                                        root, {})
+        return out.getvalue()
+
+    def test_a_group_below_its_org_reports_no_ip_as_merged(self):
+        log = self._merge_log("api.example.com")
+        self.assertIn("not added as targets", log)
+        self.assertNotIn("Merged:", log)
+
+    def test_the_org_group_says_where_its_ips_went(self):
+        log = self._merge_log("example.com")
+        self.assertNotIn("into pipeline", log)
+        self.assertIn("1 new IP(s) join the host scope, not the port scan", log)
 
 
 class TestRunUncoverExpansionIsolated(unittest.TestCase):

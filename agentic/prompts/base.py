@@ -394,7 +394,7 @@ Escalation (cheapest first): use_tool → plan_tools → deploy_fireteam.
 
 Phase patterns:
 - Informational: different surfaces of one target (auth / API / JS), or same technique across N targets. Skip if each surface fits in ≤2 tools.
-- Exploitation: independent vuln classes on a mapped surface (SQLi / SSRF / auth-bypass). NOT a single multi-step exploit chain (sequential), NOT two members with `metasploit` skill (msfconsole singleton race — validator rejects).
+- Exploitation: independent vuln classes on a mapped surface (SQLi / SSRF / auth-bypass). NOT a single multi-step exploit chain (sequential), NOT two members whose `tools` each include a Metasploit tool (`metasploit_console`, `msf_restart`: msfconsole singleton race — validator rejects).
 - Post-exploitation: parallel research/planning tracks only. Multi-session msfconsole interaction is serialized through the singleton — do it yourself.
 
 Hard limits: max {max_members} members per wave, dangerous tools escalate to operator, do NOT specify iteration counts.
@@ -645,7 +645,31 @@ def build_attack_path_behavior(attack_path_type):
     elif not attack_path_type:
         return ""  # Not yet classified
     else:
-        return f"Follow the workflow guidance in the Available Tools section for attack path: {attack_path_type}"
+        return (f"Follow the workflow guidance in the Available Tools section for attack path: {attack_path_type}"
+                + _route_exposure_nudge(attack_path_type))
+
+
+#: One sentence per skill that owns a kind of recon route-exposure result.
+_ROUTE_EXPOSURE_NUDGES = {
+    "access_control": "Recon's route-exposure leads are in the graph: work them first with the Route "
+                      "exposure leads steps, record each proof in the same response, then verify the "
+                      "CONFIRMS edge.",
+    "path_traversal": "Recon's exposed-file findings are in the graph: prove them first with the Exposed "
+                      "files steps, record each proof in the same response, then verify the CONFIRMS edge.",
+    "rce": "Recon's debug-console findings are in the graph: check them first with the Debug consoles "
+           "steps, record each proof in the same response, then verify the CONFIRMS edge.",
+}
+
+
+def _route_exposure_nudge(attack_path_type) -> str:
+    """The extra sentence for a skill with route-exposure parts, only while the
+    project runs recon's route exposure scan: otherwise "" and the behaviour
+    text stays byte-identical."""
+    sentence = _ROUTE_EXPOSURE_NUDGES.get(attack_path_type)
+    if not sentence:
+        return ""
+    from project_settings import get_setting
+    return ("\n" + sentence) if get_setting('ROUTE_EXPOSURE_ENABLED', False) else ""
 
 
 def build_kali_install_prompt():
@@ -1253,6 +1277,7 @@ When `exploit_succeeded` is true, include `exploit_details`:
 ### Chain Findings
 
 Include `chain_findings` when the output reveals notable intelligence: confirmed vulns, found credentials, discovered services, exploit modules, defense detection, or successful attack outcomes.
+`chain_findings` is a field INSIDE `output_analysis` (beside `interpretation`), never a top-level key of your response.
 Always emit `service_identified` findings when new ports/services are discovered, and `configuration_found` when new technologies are identified.
 Use goal/outcome types when an attack objective is achieved: exploit_success, access_gained, privilege_escalation, data_exfiltration, lateral_movement, persistence_established, denial_of_service_success, social_engineering_success, remote_code_execution, session_hijacked.
 
@@ -1752,7 +1777,15 @@ RETURN t.name, t.version, c.id, c.severity, c.cvss
 ```
 
 ### Infrastructure Overview
+A Domain node is a registrable (organisation) domain: `example.com` for `api.example.com`. A
+project can hold several. A deeper scan root (`*.api.example.com` in the target list) is a
+Subdomain with `is_scan_root: true` under its organisation's Domain, never a Domain itself.
 ```cypher
+// Hosts under one scan root (a deeper scan root is a Subdomain, not a Domain)
+MATCH (s:Subdomain)-[:BELONGS_TO]->(d:Domain {name: "example.com"})
+WHERE s.name = "api.example.com" OR s.name ENDS WITH ".api.example.com"
+RETURN s.name, s.status, s.is_scan_root
+
 // All subdomains for a domain with HTTP status
 MATCH (s:Subdomain)-[:BELONGS_TO]->(d:Domain {name: "example.com"})
 RETURN s.name, s.status, s.status_codes
@@ -2090,6 +2123,7 @@ LIMIT 500
    - source="gvm" -> network vulnerabilities (HAS_VULNERABILITY from IP/Subdomain)
    - source="security_check" -> DNS/email security checks (SPF, DMARC)
    - source="netlas" -> passive CVE detection via NVD (HAS_VULNERABILITY from Service)
+   - source="route_exposure" -> recon's route exposure: candidates (needs_agent_confirmation) and signature findings (HAS_VULNERABILITY from Endpoint / BaseURL)
 7. **Case sensitivity**:
    - Vulnerability.severity is lowercase: "critical", "high", "medium", "low"
    - CVE.severity is uppercase: "CRITICAL", "HIGH", "MEDIUM", "LOW"

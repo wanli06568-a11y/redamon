@@ -85,7 +85,7 @@ Engineers wanting to extend the platform should focus on the LangGraph chapter, 
 11. [Exploit-Path Search (LATS)](#exploit-path-search-lats)
 12. [Productivity Verdict & Unproductive-Streak Loop Detector](#productivity-verdict--unproductive-streak-loop-detector-1)
 13. [Wave Execution (Parallel Tool Plans)](#wave-execution-parallel-tool-plans)
-14. [Fireteam - Parallel Specialist Sub-Agents](#fireteam--parallel-specialist-sub-agents)
+14. [Fireteam - Parallel Specialist Sub-Agents](#fireteam---parallel-specialist-sub-agents)
 15. [Output Analysis (Inline)](#output-analysis-inline)
 16. [Guardrails (Hard, Soft, Scope)](#guardrails-hard-soft-scope)
 17. [Rules of Engagement (RoE)](#rules-of-engagement-roe)
@@ -93,7 +93,7 @@ Engineers wanting to extend the platform should focus on the LangGraph chapter, 
 19. [Frontend Integration](#frontend-integration)
 20. [Detailed Workflows](#detailed-workflows)
 21. [Multi-Objective Support](#multi-objective-support)
-22. [EvoGraph - Evolutive Attack Chain Graph](#evograph--evolutive-attack-chain-graph)
+22. [EvoGraph, Evolutive Attack Chain Graph](#evograph-evolutive-attack-chain-graph)
 23. [Security & Multi-Tenancy](#security--multi-tenancy)
 24. [Token Accounting & Cost Tracking](#token-accounting--cost-tracking)
 25. [Knowledge Base Integration](#knowledge-base-integration)
@@ -597,7 +597,7 @@ EvoGraph is the agent's **structured long-term memory**, persisted in Neo4j alon
 
 The model has five node types: `AttackChain` (the root, one per session), `ChainStep` (each tool execution with inputs, outputs, and analysis), `ChainFinding` (intelligence discovered during a step, classified by severity), `ChainDecision` (strategic choices like phase transitions or aborts), and `ChainFailure` (structured records of dead ends with `lesson_learned` text). Each of these is connected back to the recon graph via "bridge relationships", for example, a `ChainFinding` of type `vulnerability_confirmed` automatically gets a `FOUND_ON` edge to the relevant `IP` node and a `FINDING_RELATES_CVE` edge to the `CVE` node. The bridges are populated both from explicit fields the LLM emits and from regex-scanning the evidence prose, so even when the LLM forgets to fill `related_cves` the bridges still get drawn.
 
-The advantage is twofold. **Within a session**, the agent's prompt no longer carries a flat wall-of-text execution trace, instead it gets a deduplicated, severity-sorted Findings section, a Failed-Attempts section with lessons, and a Decisions section, so the model spends its tokens on signal rather than scrolling. **Across sessions**, the next time the operator works on the same project, the agent loads the prior chains via `query_prior_chains()` and starts already knowing what was tried, what worked, and what failed. This turns the agent from a stateless tool runner into a **knowledge-accumulating system** that builds on prior work. Full details: [EvoGraph chapter](#evograph--evolutive-attack-chain-graph).
+The advantage is twofold. **Within a session**, the agent's prompt no longer carries a flat wall-of-text execution trace, instead it gets a deduplicated, severity-sorted Findings section, a Failed-Attempts section with lessons, and a Decisions section, so the model spends its tokens on signal rather than scrolling. **Across sessions**, the next time the operator works on the same project, the agent loads the prior chains via `query_prior_chains()` and starts already knowing what was tried, what worked, and what failed. This turns the agent from a stateless tool runner into a **knowledge-accumulating system** that builds on prior work. Full details: [EvoGraph chapter](#evograph-evolutive-attack-chain-graph).
 
 ### Recon Graph & `query_graph` (Persistent Project Intelligence)
 
@@ -613,13 +613,13 @@ A **Fireteam** is how the root agent fans out into N specialist sub-agents that 
 
 When the root's `think` decides `action=deploy_fireteam`, the deploy node spawns one async task per member, each running a stripped-down 5-node ReAct subgraph (`think` / `execute_tool` / `execute_plan` / `await_confirmation` / `complete`) against its own `FireteamMemberState`. Members run concurrently and interleave naturally on the event loop. Each member writes attributed `ChainStep` and `ChainFinding` rows to EvoGraph in real time, so the graph DB knows which specialist produced which finding. Dangerous-tool approvals are handled **per-member, in parallel, in-place**: a member parks on its own `asyncio.Event` and the operator decides on each panel independently, N members can be awaiting decisions simultaneously without serializing.
 
-The advantage over a single agent doing the same work sequentially is **speed and focus**. A single agent investigating an auth surface, a route map, and a security-header posture would do them one at a time and accumulate context-switch cost in its prompt. Three Fireteam members do them in parallel, each with a focused prompt scoped to their mission, and the root only sees the consolidated findings at the end. The operator sees one Fireteam card on screen with three always-visible specialist panels, no modal queues, no detached cards, no sequential gating. Full details: [Fireteam chapter](#fireteam--parallel-specialist-sub-agents).
+The advantage over a single agent doing the same work sequentially is **speed and focus**. A single agent investigating an auth surface, a route map, and a security-header posture would do them one at a time and accumulate context-switch cost in its prompt. Three Fireteam members do them in parallel, each with a focused prompt scoped to their mission, and the root only sees the consolidated findings at the end. The operator sees one Fireteam card on screen with three always-visible specialist panels, no modal queues, no detached cards, no sequential gating. Full details: [Fireteam chapter](#fireteam---parallel-specialist-sub-agents).
 
 ### Skills System (Built-In, User, Chat)
 
-Skills are **reusable expert playbooks** the agent loads into its prompt to specialize its behaviour for a given attack technique. Three families coexist. **Built-in attack skills** (CVE exploit, brute force, SQL injection, XSS, phishing, DoS) are hard-coded prompt blocks that ship with the platform; the attack-path classifier picks one when it analyzes a new objective. **User attack skills** are markdown files under `agentic/skills/` (with categories like `vulnerabilities/`, `network/`, `cloud/`, `tooling/`); they are discovered at startup by `skill_loader.py`, classified by the LLM as `user_skill:<id>`, and injected as `## User Attack Skill` blocks. **Chat skills** are on-demand reference docs under `agentic/community-skills/` that the operator can inject mid-session via `/skill <name>` without changing the agent's classification.
+Skills are **reusable expert playbooks** the agent loads into its prompt to specialize its behaviour for a given attack technique. Three families coexist. **Built-in attack skills** (CVE exploit, brute force, SQL injection, XSS, phishing, DoS) are hard-coded prompt blocks that ship with the platform; the attack-path classifier picks one when it analyzes a new objective. **User attack skills** are Markdown files each user uploads (Global Settings, or a project's Agent Skills), stored as database rows (`UserAttackSkill`) with a name and a description, and fetched with the project settings on every orchestrator entry (`webapp/src/lib/userSkillAgentPayload.ts`); a project turns on at most 20 of them. The classifier picks one as `user_skill:<id>` and its text is injected as a `## User Attack Skill` block. Ready-made ones ship in `agentic/community-skills/` for **Import from Community**. **Chat skills** are on-demand reference docs under `agentic/skills/`, loaded by `skill_loader.py`, that the operator can inject mid-session via `/skill <name>` without changing the agent's classification.
 
-All three families share the same markdown-with-YAML-frontmatter format, so anyone, engineer or pentester, can write a new skill without touching Python. A skill file declares a name and description in frontmatter; the body is plain prose with whatever instructions, payload examples, and command snippets the author wants the agent to internalize. Up to 5 skills can be active simultaneously per session.
+All three are plain Markdown, so anyone, engineer or pentester, can write a new skill without touching Python. A chat skill declares its name and description in YAML frontmatter. A user attack skill may carry the same frontmatter block: the upload dialog reads it to fill the name and description, and it then stays in the stored text, which the agent reads as part of the skill; the router and the skill menu use the database name and description. The body is plain prose with whatever instructions, payload examples, and command snippets the author wants the agent to internalize.
 
 The advantage of the skill system is **extensibility without redeployment**. A red team encountering a new vulnerability class can write a skill markdown in 20 minutes and have the agent specialize for that class on the next session, no code change, no container rebuild, no prompt refactor. The classifier picks the right skill automatically based on the operator's natural-language objective. Full details: [Skills System chapter](#skills-system-built-in-user-chat).
 
@@ -663,7 +663,7 @@ The advantage is that an engagement's full operational envelope lives in **one p
 
 ### MCP Tool Integration (Phase-Based Tool Access)
 
-The agent's tools are not Python functions that ship inside the agent container, they are exposed by **separate Docker containers** speaking the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/), a JSON-RPC standard for plugging tools into language-model agents. Four MCP servers run inside a single Kali Linux sandbox: `network_recon` (curl, naabu, kali_shell, code execution), `nuclei` (CVE templates), `metasploit` (the full msfconsole), and `nmap` (deep scanning + NSE). The agent's `MCPToolsManager` maintains streaming HTTP connections to each, with retry-with-backoff to handle container startup races.
+The agent's tools are not Python functions that ship inside the agent container, they are exposed by **separate Docker containers** speaking the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/), a JSON-RPC standard for plugging tools into language-model agents. Five MCP servers run inside a single Kali Linux sandbox: `network_recon` (curl, naabu, kali_shell, code execution), `nuclei` (CVE templates), `metasploit` (the full msfconsole), `nmap` (deep scanning + NSE) and `playwright` (browser automation). The agent's `MCPToolsManager` maintains streaming HTTP connections to each, with retry-with-backoff to handle container startup races.
 
 Tools are gated by **phase**. The `TOOL_PHASE_MAP` setting (database-driven) declares which tools are allowed in `informational`, `exploitation`, and `post_exploitation`. The `PhaseAwareToolExecutor` enforces this at the executor level, even if the LLM tries to call a tool in the wrong phase, the call is rejected before it reaches the MCP server. A separate `tool_registry.py` is the *single source of truth* for tool metadata (names, purposes, argument hints, dangerous flag), and the prompt builder generates the tools-available section dynamically from this registry so the LLM never sees a tool that isn't actually allowed in the current phase.
 
@@ -873,12 +873,12 @@ Skills are reusable expert playbooks the agent loads into its prompt. Three fami
 | Family | Source | Affects classification? | Affects tool routing? | Lifecycle |
 |---|---|---|---|---|
 | **Built-in attack skills** | Hard-coded prompt blocks under [agentic/prompts/](../../agentic/prompts/) (CVE exploit, brute force, SQL injection, XSS, phishing, DoS, post-exploitation) | Yes, the classifier picks one | Yes, drives `get_phase_tools()` and the exploitation prompt block | Always available; togglable per project via `ATTACK_SKILL_CONFIG.builtIn` |
-| **User attack skills** | Markdown files under [agentic/skills/](../../agentic/skills/) (categorised: `vulnerabilities/`, `network/`, `cloud/`, `tooling/`, `frameworks/`, `protocols/`, `wireless/`, `social_engineering/`, `mobile/`, `api_security/`, `active_directory/`, `reporting/`, `scan_modes/`, `coordination/`, `technologies/`) | Yes, classified as `user_skill:<id>` | No (uses generic phase tools) | Discovered at startup by [agentic/skill_loader.py](../../agentic/orchestrator_helpers/skill_loader.py); admin-curated; up to `MAX_SKILLS=5` per session |
-| **Chat skills** | Same markdown format under [agentic/community-skills/](../../agentic/community-skills/) (e.g. `xss_exploitation.md`, `sqli_exploitation.md`, `ssrf_exploitation.md`, `api_testing.md`) | No | No | On-demand reference docs, injected via `/skill` or guidance queue mid-session |
+| **User attack skills** | Database rows (`UserAttackSkill`): Markdown each user uploads, one file or a batch, in Global Settings or a project's Agent Skills; ready-made ones in [agentic/community-skills/](../../agentic/community-skills/) for Import from Community | Yes, classified as `user_skill:<id>` | No (uses generic phase tools) | Fetched with the project settings (`webapp/src/lib/userSkillAgentPayload.ts`, read through `get_enabled_user_skills()`); off until a project turns them on, at most 20 per project |
+| **Chat skills** | Markdown with YAML frontmatter under [agentic/skills/](../../agentic/skills/) (categorised: `vulnerabilities/`, `network/`, `cloud/`, `tooling/`, ...) | No | No | Discovered by [skill_loader.py](../../agentic/orchestrator_helpers/skill_loader.py); on-demand reference docs, injected via `/skill` or guidance queue mid-session |
 
 ### Skill File Format
 
-Both user and chat skills are plain Markdown with YAML frontmatter:
+Chat skills are plain Markdown with YAML frontmatter. A user attack skill may carry the same block: the webapp's upload dialog (`webapp/src/lib/skillMetadata.ts`) reads `name` and `description` from it, the name falling back to the first `#` heading; the block stays in the stored text, and nothing reads it again after the upload:
 
 ```markdown
 ---
@@ -889,7 +889,7 @@ description: SSRF discovery, payload crafting, and chained internal-service abus
 # Body content goes here in plain markdown...
 ```
 
-The loader's `_parse_frontmatter` is intentionally minimal (no full YAML parser), only top-level `key: value` pairs are read. The body is the entire markdown after the closing `---`.
+The chat-skill loader's `_parse_frontmatter` is intentionally minimal (no full YAML parser), only top-level `key: value` pairs are read. The body is the entire markdown after the closing `---`.
 
 ### Skill Discovery and Resolution
 
@@ -950,7 +950,9 @@ Each block is a Python string template with placeholders that `prompts/__init__.
 
 ### Plugin Overrides of Built-In Skill Text
 
-Through the plugin platform (see [README.PLUGINS.md](README.PLUGINS.md)), a person can approve a plugin's rewrite of a built-in skill's static workflow parts. The webapp delivers the approved versions in the project settings payload (`skillTextOverrides`, only to the agent's master-key settings fetch), and `fetch_agent_settings` maps them to `SKILL_TEXT_OVERRIDES`. Every static part listed in [prompts/skill_parts.py](../../agentic/prompts/skill_parts.py) (47 parts across the 14 skills; blocks built from operator data are not listed) is appended through `resolve_skill_part` in [prompts/skill_part_seam.py](../../agentic/prompts/skill_part_seam.py), which renders the approved text only when every part of that skill's version still matches the factory text's SHA-256 and passes validation, and the factory text otherwise; the skill's gates still decide whether a part is rendered at all. It reads the session's own settings only and never raises, so without an approved override the prompt is byte-for-byte the factory prompt (pinned by `tests/test_skill_workflow_golden.py`). Each `phase_update` event carries `skill_workflow: {skillId, revision, changeSetId}` (revision 1 and `changeSetId` `null` = factory text; the whole record `null` when the turn rendered no skill text). Revision numbers restart per scope, so `changeSetId` is what identifies a version. A turn that rendered a user attack skill records `{skillId: "user_skill:<id>", kind: "user", contentSha256}` instead: the first 16 hex characters of the SHA-256 of the skill's UTF-8 content, and no `revision` key (a new version of a user skill is a new skill), so readers take `revision` with a default. `skillId` names the skill actually rendered: when the label's skill is off and an enabled version `supersedes` it, that version's text is rendered and recorded, while the label, the chain graph and the phase stay as they are. The validator judges what the model will read: invisible and control characters, and the headings of the sections placed after the skill text (also when split around a placeholder or disguised with look-alike letters), are refused, and the seam checks the rendered text again. The webapp reads the parts and validates proposals through the master-key endpoints `GET /plugins/skill-parts` and `POST /plugins/skill-parts/validate` ([plugin_api.py](../../agentic/plugin_api.py)).
+Through the plugin platform (see [README.PLUGINS.md](README.PLUGINS.md)), a person can approve a plugin's rewrite of a built-in skill's static workflow parts. The webapp delivers the approved versions in the project settings payload (`skillTextOverrides`, only to the agent's master-key settings fetch), and `fetch_agent_settings` maps them to `SKILL_TEXT_OVERRIDES`. Every static part listed in [prompts/skill_parts.py](../../agentic/prompts/skill_parts.py) (58 parts across the 14 skills; blocks built from operator data are not listed) is appended through `resolve_skill_part` in [prompts/skill_part_seam.py](../../agentic/prompts/skill_part_seam.py), which renders the approved text only when every part of that skill's version still matches the factory text's SHA-256 and passes validation, and the factory text otherwise; the skill's gates still decide whether a part is rendered at all. It reads the session's own settings only and never raises, so without an approved override the prompt is byte-for-byte the factory prompt (pinned by `agentic/tests/test_skill_workflow_golden.py`). Each `phase_update` event carries `skill_workflow: {skillId, revision, changeSetId}` (revision 1 and `changeSetId` `null` = factory text; the whole record `null` when the turn rendered no skill text). Revision numbers restart per scope, so `changeSetId` is what identifies a version. A turn that rendered a user attack skill records `{skillId: "user_skill:<id>", kind: "user", contentSha256}` instead: the first 16 hex characters of the SHA-256 of the skill's UTF-8 content, and no `revision` key (a new version of a user skill is a new skill), so readers take `revision` with a default. `skillId` names the skill actually rendered: when the label's skill is off and an enabled version `supersedes` it, that version's text is rendered and recorded, while the label, the chain graph and the phase stay as they are. The validator judges what the model will read: invisible and control characters, and the headings of the sections placed after the skill text (also when split around a placeholder or disguised with look-alike letters), are refused, and the seam checks the rendered text again. The webapp reads the parts and validates proposals through the master-key endpoints `GET /plugins/skill-parts` and `POST /plugins/skill-parts/validate` ([plugin_api.py](../../agentic/plugin_api.py)).
+
+Seven of those parts load only with recon's route exposure scan. `access_control`, `path_traversal` and `rce` each append theirs after their existing parts when `ROUTE_EXPOSURE_ENABLED` (the project's `routeExposureEnabled`, mirrored into the agent's settings) is on, so a project that never runs the scan renders byte-for-byte today's prompt. They work the scan's `Vulnerability {source: 'route_exposure'}` nodes: Access Control confirms or rejects the leads (and, with its browser-leads part, proves the CORS, cache and client-side-gating leads: four hostile origins with a never-served proof-of-concept file, a unique cache-buster read logged in then anonymously, and a sessionless `execute_playwright` render of the hidden pages the graph links to the same bundle, then the pair), Path Traversal proves the exposed files, RCE proves the debug consoles, each recording `vulnerability_confirmed` against the node's id. Three of them also need their own switch and the Rules of Engagement: `PATH_TRAVERSAL_GIT_RECONSTRUCT_ENABLED` and `RCE_HEAPDUMP_ANALYSIS_ENABLED` (both also need data exfiltration allowed; the heap dump also needs sensitive data handling above `no_access`) and `PATH_TRAVERSAL_VALIDATE_SECRETS_ENABLED`; the parent part prints ENABLED or DISABLED to match. The shared text (the record contract, the safety rules and the values-in-files rule) lives in [prompts/route_exposure_shared.py](../../agentic/prompts/route_exposure_shared.py), concatenated into each part at import so every part stays one hashable string.
 
 ### Skill Settings
 
@@ -1266,10 +1268,12 @@ sequenceDiagram
     O-->>B: tool_start (naabu)
     B-->>C: tool_start
 
-    Note over O: tool executes...
+    Note over O: tool executes (bounded by its deadline)...
 
     O-->>B: tool_output_chunk
     B-->>C: tool_output_chunk
+    O-->>B: tool_finished (tool returned, analysis pending)
+    B-->>C: tool_finished
 
     Note over O: Iteration 2, analyse previous output
 
@@ -1289,6 +1293,12 @@ sequenceDiagram
     O-->>B: task_complete
     B-->>C: task_complete
 ```
+
+A standalone tool's `tool_complete` carries the LLM's analysis, so it only fires after the next think turn. `tool_finished` is sent as soon as the tool itself returns; the card then freezes at the tool's real duration and reads "Analyzing output" instead of "Running" through that turn. Every root tool event (`tool_start`, `tool_output_chunk`, `tool_finished`, `tool_complete`) carries the step's `step_id`, and the frontend pairs cards by it: pairing by tool name let one lost `tool_complete` swallow the next same-name tool's completion.
+
+Each tool call is also bounded by a wall-clock deadline (`TOOL_DEADLINES_S` in [`agentic/tools.py`](../../agentic/tools.py): the tool's own server-side limit plus a margin). The MCP SSE transport cannot provide that bound itself: kali-sandbox sends a keep-alive every 15s, which resets the client's `sse_read_timeout`, so a lost answer used to be awaited forever.
+
+**Reconnects.** Events sent while the browser's socket is down are not replayed; they exist only in the `ChatMessage` table. Every `connected` payload therefore carries `agent_running`, the server's live answer to "is this session's run still going?". On each (re)connect the drawer re-reads the conversation, reconciles it with what is on screen, and takes the spinner state from that flag; when the run is over, cards still marked running are closed as finished or interrupted. A run releases its task registration before draining its persist queue, so a page reconnecting during that drain is told the run is over. The socket stays open while a run is active even with the drawer closed, and Stop / guidance clicked while it is down wait in an outbox until the next `connected`.
 
 ### Wave Execution Events
 
@@ -1530,7 +1540,7 @@ sequenceDiagram
 Independent of the configurable tool confirmation, a **deterministic hard guardrail** permanently blocks government, military, educational, and international organization domains. This guardrail:
 
 - **Cannot be toggled off**, it runs regardless of project settings
-- Is implemented identically in Python (`agentic/hard_guardrail.py`) and TypeScript (`webapp/src/lib/hard-guardrail.ts`)
+- Is implemented identically in Python (`agentic/orchestrator_helpers/hard_guardrail.py`) and TypeScript (`webapp/src/lib/hard-guardrail.ts`)
 - Blocks by TLD suffix patterns (`.gov`, `.mil`, `.edu`, `.int`, and country-code variants like `.gov.uk`, `.ac.jp`)
 - Blocks by exact domain match for 300+ intergovernmental organizations on generic TLDs (e.g., `un.org`, `nato.int`, `europa.eu`, `worldbank.org`)
 - Provides defense-in-depth alongside the soft LLM-based guardrail
@@ -3164,8 +3174,8 @@ The agent enforces three layered guardrails on every target it might touch. Each
 
 | Layer | File | Mechanism | Toggleable? | When evaluated |
 |---|---|---|---|---|
-| **Hard** | [agentic/hard_guardrail.py](../../agentic/orchestrator_helpers/hard_guardrail.py) | Pure regex/string match against TLD patterns + ~200-domain exact set | **No**, non-disableable | At `initialize_node`; also re-checked in `think_node` when injecting the scope reminder |
-| **Soft** | [agentic/guardrail.py](../../agentic/orchestrator_helpers/guardrail.py) | LLM-based "is this safe to scan" classifier with retry | Yes, `AGENT_GUARDRAIL_ENABLED` | At `initialize_node` after hard guardrail passes |
+| **Hard** | [agentic/orchestrator_helpers/hard_guardrail.py](../../agentic/orchestrator_helpers/hard_guardrail.py) | Pure regex/string match against TLD patterns + ~200-domain exact set | **No**, non-disableable | At `initialize_node`; also re-checked in `think_node` when injecting the scope reminder |
+| **Soft** | [agentic/orchestrator_helpers/guardrail.py](../../agentic/orchestrator_helpers/guardrail.py) | LLM-based "is this safe to scan" classifier with retry | Yes, `AGENT_GUARDRAIL_ENABLED` | At `initialize_node` after hard guardrail passes |
 | **Scope reminder** | [agentic/orchestrator_helpers/nodes/think_node.py](../../agentic/orchestrator_helpers/nodes/think_node.py) (lines ~289-305) | Prompt-level injection: "you must only operate against the project's configured target" | Implicit (depends on hard-block status + `AGENT_GUARDRAIL_ENABLED`) | Every think iteration |
 
 ### Hard Guardrail, The Floor
@@ -4181,7 +4191,7 @@ flowchart TB
 
 ### Internal-Endpoint Authentication (STRIDE D3)
 
-The agent's billed-LLM REST endpoints - `/llm/ffuf-extensions`, `/llm/nuclei-tags`, `/llm/waf-classify`, `/llm/nuclei-fp-filter`, `/llm/takeover-classify`, `/guardrail/check-target`, `/roe/parse`, `/models`, `/llm-provider/test` - and the TypeSafe Jev endpoints - `/jev/ffuf-extensions`, `/jev/nuclei-tags`, `/jev/waf-classify`, `/jev/takeover-classify`, `/jev/ffuf-base-paths`, `/jev/page-type`, `/jev/tool-health`, `/jev/crawl-seed-order`, `/jev/serialized-classify` - are gated by `agentic/llm_guard.py` (a FastAPI dependency). The `/jev/*` endpoints share the same per-user budget, and additionally bind the project to its owner before loading the owner's Jev token (`agentic/jev_client.py`):
+The agent's billed-LLM REST endpoints - `/llm/ffuf-extensions`, `/llm/nuclei-tags`, `/llm/waf-classify`, `/llm/nuclei-fp-filter`, `/llm/takeover-classify`, `/guardrail/check-target`, `/roe/parse`, `/skill-metadata/generate`, `/models`, `/llm-provider/test` - and the TypeSafe Jev endpoints - `/jev/ffuf-extensions`, `/jev/nuclei-tags`, `/jev/waf-classify`, `/jev/takeover-classify`, `/jev/ffuf-base-paths`, `/jev/page-type`, `/jev/tool-health`, `/jev/crawl-seed-order`, `/jev/serialized-classify`, `/jev/route-privacy-rank`, `/jev/route-exposure-assess` - are gated by `agentic/llm_guard.py` (a FastAPI dependency). The `/jev/*` endpoints share the same per-user budget, and additionally bind the project to its owner before loading the owner's Jev token (`agentic/jev_client.py`):
 
 - **Auth**: constant-time (`hmac.compare_digest`) `X-Internal-Key`, accepting either `INTERNAL_API_KEY` or the scoped `SCANNER_API_KEY`. Fails **open** with a one-time warning only when neither secret is set (dev), closing as soon as the key exists.
 - **Rate limit**: a stdlib token bucket keyed by `(user_id, source-ip)` (`LLM_GUARD_RATE_CAPACITY`, `LLM_GUARD_RATE_REFILL_PER_SEC`).
@@ -4272,7 +4282,7 @@ When a Deep Think pre-step runs, its `usage_metadata` is added to `_dt_in` / `_d
 
 ## Knowledge Base Integration
 
-When the agent calls `web_search` (or any retrieval tool), the request is routed through a federated KB-first pipeline: **knowledge base** (curated infosec corpus) → **web search fallback**. Configured per-project via the webapp; defaults inherited from `agentic/kb_config.yaml`.
+When the agent calls `web_search` (or any retrieval tool), the request is routed through a federated KB-first pipeline: **knowledge base** (curated infosec corpus) → **web search fallback**. Configured per-project via the webapp; defaults inherited from `services/knowledge_base/kb_config.yaml` (baked into the agent image as the `knowledge_base` package).
 
 | Setting | Default | Purpose |
 |---|---|---|
@@ -4286,7 +4296,7 @@ When the agent calls `web_search` (or any retrieval tool), the request is routed
 | `KB_OVERFETCH_FACTOR` | inherits yaml | How many extra chunks to fetch before MMR truncates |
 | `KB_SOURCE_BOOSTS` | inherits yaml | Per-source ranking multipliers (e.g. boost CISA KEV for known-exploited CVEs) |
 
-When `KB_ENABLED=null`, the project inherits the top-level `KB_ENABLED` flag from `agentic/kb_config.yaml`. This lets ops disable KB system-wide for testing without touching every project.
+When `KB_ENABLED=null`, the project inherits the top-level `KB_ENABLED` flag from `services/knowledge_base/kb_config.yaml`. This lets ops disable KB system-wide for testing without touching every project.
 
 ---
 
@@ -4464,15 +4474,15 @@ This section is a **map of the source tree** for engineers who need to find a sp
 | `api.py` | REST API endpoints |
 | `websocket_api.py` | WebSocket streaming API |
 | `utils.py` | Utility functions |
-| `hard_guardrail.py` | Deterministic non-disableable target blocking (TLD patterns + ~200 IGO domains) |
-| `guardrail.py` | LLM-based soft guardrail (well-known commercial sites, IP-mode reverse DNS) |
-| `skill_loader.py` | Markdown skill discovery and YAML frontmatter parsing |
+| `orchestrator_helpers/hard_guardrail.py` | Deterministic non-disableable target blocking (TLD patterns + ~200 IGO domains) |
+| `orchestrator_helpers/guardrail.py` | LLM-based soft guardrail (well-known commercial sites, IP-mode reverse DNS) |
+| `orchestrator_helpers/skill_loader.py` | Markdown skill discovery and YAML frontmatter parsing |
 | `skills/` | User attack skills (markdown files, classified as `user_skill:<id>`) |
 | `community-skills/` | Chat skills (on-demand reference docs injected via `/skill`) |
-| `report_summarizer.py` | Post-engagement narrative synthesis (6 report sections) |
-| `chat_persistence.py` | Async Postgres helpers for `ChatMessage` and conversation rows |
-| `key_rotation.py` | Round-robin API key rotator for rate-limit avoidance |
-| `model_providers.py` | LLM provider factory (Anthropic / OpenAI / etc.) |
+| `orchestrator_helpers/report_summarizer.py` | Post-engagement narrative synthesis (6 report sections) |
+| `orchestrator_helpers/chat_persistence.py` | Async Postgres helpers for `ChatMessage` and conversation rows |
+| `orchestrator_helpers/key_rotation.py` | Round-robin API key rotator for rate-limit avoidance |
+| `orchestrator_helpers/model_providers.py` | LLM provider factory (Anthropic / OpenAI / etc.) |
 | `logging_config.py` | Structured logging with rotation |
 | `prompts/` | System prompts package (phase-aware, attack-path-specific) |
 | `prompts/base.py` | Core ReAct, analysis, Deep Think, and report prompts |
@@ -4503,6 +4513,7 @@ This section is a **map of the source tree** for engineers who need to find a sp
 | `orchestrator_helpers/nodes/think_node.py` | ReAct think + Deep Think pre-step + LATS hook + RoE/stealth/scope-guardrail injection |
 | `orchestrator_helpers/nodes/execute_tool_node.py` | Sequential tool execution with progress streaming |
 | `orchestrator_helpers/nodes/execute_plan_node.py` | Wave execution, parallel tool plan runner via `asyncio.gather()` |
+| `orchestrator_helpers/roe_gate.py` | `check_tool_call()`: the RoE and recon-budget gate the single-tool node, the plan wave and every fireteam member ask before dispatch |
 | `orchestrator_helpers/nodes/approval_nodes.py` | `await_approval` / `process_approval` / `await_question` / `process_answer` |
 | `orchestrator_helpers/nodes/tool_confirmation_nodes.py` | `await_tool_confirmation` / `process_tool_confirmation` |
 | `orchestrator_helpers/nodes/generate_response_node.py` | Final-report synthesis when task completes or aborts |

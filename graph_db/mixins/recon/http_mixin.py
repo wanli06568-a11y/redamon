@@ -16,10 +16,12 @@ ONE BaseURL per service, MANY Endpoints per BaseURL.
 """
 import json
 import hashlib
+import re
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs
 
 from graph_db.cpe_resolver import _is_ip_address
+from graph_db.mixins.recon.scope import org_for_scan_root
 from graph_db.cert_key import build_cert_key
 from graph_db.schema import NON_RECON_SOURCES
 from graph_db.technology_identity import (  # noqa: F401  re-exported for callers
@@ -28,6 +30,11 @@ from graph_db.technology_identity import (  # noqa: F401  re-exported for caller
     resolve_tech_version,
     tech_name_key,
 )
+
+
+#: A root page whose exact body this many distinct BaseURLs serve (200 or 403)
+#: is one shared deny or parking page, not each host's own content.
+SHARED_BODY_MIN_BASEURLS = 3
 
 
 def _split_url(url: str) -> tuple[str, str]:
@@ -39,6 +46,16 @@ def _split_url(url: str) -> tuple[str, str]:
     base_url = f"{parsed.scheme}://{parsed.netloc}"
     path = parsed.path or "/"
     return base_url, path
+
+
+def _asn_label(value) -> str | None:
+    """httpx -asn reports {"as_number": "AS13335", ...}. Stored as the "AS<n>"
+    string Netlas and FOFA write: Neo4j rejects a map property, which would drop
+    the whole Endpoint write."""
+    if isinstance(value, dict):
+        value = value.get("as_number")
+    match = re.search(r"\d+", str(value or ""))
+    return f"AS{match.group(0)}" if match else None
 
 
 class HttpMixin:
@@ -145,9 +162,14 @@ class HttpMixin:
                         "cname": url_info.get("cname"),
                         "cdn": url_info.get("cdn"),
                         "is_cdn": url_info.get("is_cdn", False),
-                        "asn": url_info.get("asn"),
+                        "asn": _asn_label(url_info.get("asn")),
                         "favicon_hash": url_info.get("favicon_hash"),
                         "is_live": url_info.get("status_code") is not None,
+                        # status_code is the last hop's (httpx follows redirects).
+                        "final_url": url_info.get("final_url"),
+                        "first_status_code": url_info.get("first_status_code"),
+                        "redirect_chain_codes": url_info.get("redirect_chain_codes"),
+                        "redirected_off_host": url_info.get("redirected_off_host"),
                         "source": "http_probe",
                         # AI surface recon (lap-1 Patch D — moved from BaseURL to Endpoint)
                         "is_ai_framework_detected": url_info.get("is_ai_framework_detected"),
@@ -173,11 +195,14 @@ class HttpMixin:
                         MERGE (e:Endpoint {path: $path, method: 'GET', baseurl: $base_url, user_id: $user_id, project_id: $project_id})
                         SET e += $props,
                             e.updated_at = datetime()
+                        SET e.openapi_declared_only = CASE WHEN coalesce(e.openapi_declared_only, e.openapi_declared, false) THEN false ELSE e.openapi_declared_only END
                         """,
                         path=path, base_url=base_url, user_id=user_id, project_id=project_id, props=endpoint_props
                     )
                     stats.setdefault("endpoints_created", 0)
                     stats["endpoints_created"] += 1
+
+                    self._tag_ip_from_httpx(session, url_info, user_id, project_id, stats)
 
                     # ---- BaseURL -[:HAS_ENDPOINT]-> Endpoint ------------------
                     session.run(
@@ -673,6 +698,10 @@ class HttpMixin:
             # Update Domain node with http probe metadata
             metadata = recon_data.get("metadata", {})
             root_domain = metadata.get("root_domain", "")
+            # The flat per-tool stamp goes on the org Domain (§4.11.3): a scan
+            # root below its org has no Domain node of its own.
+            if root_domain:
+                root_domain = metadata.get("org_domain") or org_for_scan_root(root_domain, recon_data)
             summary = http_probe_data.get("summary", {})
 
             if root_domain:
@@ -748,6 +777,8 @@ class HttpMixin:
                     hosts=list(no_response_hosts), user_id=user_id, project_id=project_id
                 )
 
+            self._mark_shared_body_clusters(session, user_id, project_id, stats)
+
             print(f"[+][graph-db] Created {stats['baseurls_created']} BaseURL nodes")
             print(f"[+][graph-db] Created/Updated {stats['services_created']} Service nodes")
             print(f"[+][graph-db] Created {stats['technologies_created']} Technology nodes")
@@ -759,3 +790,75 @@ class HttpMixin:
                 print(f"[!][graph-db] {len(stats['errors'])} errors occurred")
 
         return stats
+
+    @staticmethod
+    def _tag_ip_from_httpx(session, url_info: dict, user_id: str, project_id: str,
+                           stats: dict) -> None:
+        """Carry httpx's CDN and ASN to the resolved IP, which IP attribution reads.
+
+        Only ever adds: is_cdn never goes from true to false, a cdn_name or asn
+        another tool wrote first is kept, and cdn_source is 'httpx' only when no
+        tool had tagged the address. Matches the tenant-scoped IP, never creates
+        one. A failure costs this tag only, never the Endpoint.
+        """
+        ip = url_info.get("ip")
+        is_cdn = bool(url_info.get("is_cdn"))
+        asn = _asn_label(url_info.get("asn"))
+        if not ip or not (is_cdn or asn):
+            return
+        try:
+            session.run(
+                """
+                MATCH (i:IP {address: $ip, user_id: $user_id, project_id: $project_id})
+                WITH i, coalesce(i.is_cdn, false) AS already_tagged
+                SET i.cdn_source = CASE WHEN $is_cdn AND NOT already_tagged THEN 'httpx'
+                                        ELSE i.cdn_source END,
+                    i.is_cdn = CASE WHEN $is_cdn THEN true ELSE i.is_cdn END,
+                    i.cdn_name = coalesce(i.cdn_name, $cdn_name),
+                    i.asn = coalesce(i.asn, $asn)
+                """,
+                ip=ip, is_cdn=is_cdn, cdn_name=(url_info.get("cdn") or None) if is_cdn else None,
+                asn=asn, user_id=user_id, project_id=project_id,
+            )
+        except Exception as e:
+            stats["errors"].append(f"httpx IP tag {ip}: {e}")
+
+    @staticmethod
+    def _mark_shared_body_clusters(session, user_id: str, project_id: str, stats: dict) -> None:
+        """Mark root Endpoints whose body many BaseURLs share (shared_body_cluster).
+
+        Recomputed over the whole project on every http_probe write, full or
+        partial, because a partial run does not recreate Endpoints: an Endpoint
+        whose host now serves its own page loses the mark here. The mark tracks
+        target state, so it moves no `updated_at`.
+        """
+        try:
+            row = session.run(
+                """
+                MATCH (bu:BaseURL {user_id: $user_id, project_id: $project_id})-[:HAS_ENDPOINT]->
+                      (e:Endpoint {user_id: $user_id, project_id: $project_id, path: '/'})
+                WHERE e.body_sha256 IS NOT NULL AND e.status_code IN $statuses
+                WITH e.body_sha256 AS body, collect(DISTINCT bu.url) AS bases, collect(DISTINCT e) AS eps
+                WHERE size(bases) >= $min_bases
+                UNWIND eps AS e
+                SET e.shared_body_cluster = size(bases)
+                RETURN collect(elementId(e)) AS clustered
+                """,
+                user_id=user_id, project_id=project_id, statuses=[200, 403],
+                min_bases=SHARED_BODY_MIN_BASEURLS,
+            ).single()
+            clustered = list((row or {}).get("clustered") or [])
+            session.run(
+                """
+                MATCH (e:Endpoint {user_id: $user_id, project_id: $project_id})
+                WHERE e.shared_body_cluster IS NOT NULL AND NOT elementId(e) IN $clustered
+                REMOVE e.shared_body_cluster
+                """,
+                user_id=user_id, project_id=project_id, clustered=clustered,
+            )
+            stats["shared_body_endpoints"] = len(clustered)
+            if clustered:
+                print(f"[+][graph-db] {len(clustered)} root Endpoint(s) serve a page "
+                      f"{SHARED_BODY_MIN_BASEURLS}+ BaseURLs share (shared_body_cluster)")
+        except Exception as e:
+            stats["errors"].append(f"shared body cluster pass failed: {e}")

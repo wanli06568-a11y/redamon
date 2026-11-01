@@ -19,6 +19,8 @@ import {
 } from 'lucide-react'
 import { Modal, useAlertModal } from '@/components/ui'
 import { MCP_SCOPES, type McpScope } from '@/lib/mcpAuth'
+import { copyText } from '@/lib/copyText'
+import { readApiError, toApiError } from '@/lib/apiError'
 import {
   PROFILE_LIST,
   PROFILES,
@@ -126,15 +128,15 @@ export default function AgentOnboardingModal({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ profile, scopes, serverUrl, style, layout }),
       })
-      const data = await r.json().catch(() => ({}))
       if (!r.ok) {
-        setError(data.error || `Could not generate the pack (${r.status})`)
+        setError((await readApiError(r, 'Could not generate the pack')).message)
         return
       }
+      const data = await r.json()
       setFiles(data.files)
       setActive(0)
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Could not generate the pack')
+      setError(toApiError(e, 'Could not generate the pack').message)
     } finally {
       setGenerating(false)
     }
@@ -145,7 +147,7 @@ export default function AgentOnboardingModal({
   const copy = async () => {
     if (!files) return
     try {
-      await navigator.clipboard.writeText(files[active].content)
+      await copyText(files[active].content)
       setCopied(true)
       setTimeout(() => setCopied(false), 2000)
     } catch {

@@ -12,6 +12,7 @@ by per-topic sub-mixins in the graph_db.mixins.recon package:
     JsReconMixin   -> JS recon (JsReconFinding, Secret)
     TriageMixin    -> finding triage verdicts + mute/unmute suppression
     UserInputMixin -> user input nodes + partial discovery + tool input gathering
+    IpAttributionMixin -> each IP's ownership tag (shared_edge / dedicated / unknown)
 
 The public surface is unchanged: Neo4jClient(... ReconMixin ...) resolves
 every original method via MRO.
@@ -26,10 +27,12 @@ from graph_db.mixins.recon.js_recon_mixin import JsReconMixin
 from graph_db.mixins.recon.user_input_mixin import UserInputMixin
 from graph_db.mixins.recon.takeover_mixin import TakeoverMixin
 from graph_db.mixins.recon.serialized_mixin import SerializedScanMixin
+from graph_db.mixins.recon.route_exposure_mixin import RouteExposureMixin
 from graph_db.mixins.recon.vhost_sni_mixin import VhostSniMixin
 from graph_db.mixins.recon.ai_surface_recon_mixin import AiSurfaceReconMixin
 from graph_db.mixins.recon.triage_mixin import TriageMixin
 from graph_db.mixins.recon.tlsx_mixin import TlsxMixin
+from graph_db.mixins.recon.ip_attribution_mixin import IpAttributionMixin
 
 
 class ReconMixin(
@@ -42,9 +45,11 @@ class ReconMixin(
     UserInputMixin,
     TakeoverMixin,
     SerializedScanMixin,
+    RouteExposureMixin,
     VhostSniMixin,
     AiSurfaceReconMixin,
     TriageMixin,
     TlsxMixin,
+    IpAttributionMixin,
 ):
     pass

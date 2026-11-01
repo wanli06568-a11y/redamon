@@ -1,12 +1,19 @@
 'use client'
 
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { AlertTriangle, ArrowLeft, Bot, Check, Copy, Trash2 } from 'lucide-react'
 import { Drawer, ExternalLink, useToast } from '@/components/ui'
 import { trufflehogDisplayFields } from '@/lib/trufflehogDisplay'
+import { confirmedInGraph, endpointExposureFields, isRouteExposureFinding, routeExposureDisplayFields } from '@/lib/routeExposureDisplay'
+import { COVERAGE_STAMP_PROPERTIES, coverageLines, recordedCoverageModules } from '@/lib/coverageStamps'
 import { copyText } from '@/lib/copyText'
+import { muteableLabel } from '@/lib/muteTarget'
+import { dispositionText, readDisposition } from '@/lib/triage/disposition'
+import { OWNERSHIP_PROPERTIES, ownershipLine } from '@/lib/ipOwnership'
 import { GraphData, GraphNode } from '../../types'
 import { badgeColors, buildNodeContext, getNodeColor, getNodeUrl, nodeLabel } from '../../utils'
+import { domainScopeRoots, scanRootBadge } from '../../utils/scopeRootsForNode'
+import type { ScopeGroup } from '@/lib/scopeGroups'
 import { renderPropertyValue } from '../../utils/renderPropertyValue'
 import { ClusterNodeList } from './ClusterNodeList'
 import { NodeAgentModal } from './NodeAgentModal'
@@ -45,6 +52,9 @@ interface NodeDrawerProps {
   graphData?: GraphData | null
   projectName?: string
   targetDomain?: string
+  /** The project's current scope groups; undefined on a saved version, whose
+   *  stored scan roots are then shown without the current/removed split. */
+  scopeGroups?: ScopeGroup[]
   // Start a fresh agent session seeded with the node context + the request.
   onStartAgentSession?: (request: string, context: string, nodeLabel: string) => void
 }
@@ -60,6 +70,7 @@ export function NodeDrawer({
   graphData,
   projectName,
   targetDomain,
+  scopeGroups,
   onStartAgentSession,
 }: NodeDrawerProps) {
   const toast = useToast()
@@ -100,7 +111,19 @@ export function NodeDrawer({
     setShowDeleteConfirm(false)
   }
 
-  const hiddenKeys = ['project_id', 'user_id']
+  // Whether a missing stamp reads "not scanned" or "coverage not recorded" is a
+  // project-wide question: did the module stamp ANY host.
+  const recordedModules = useMemo(() => recordedCoverageModules(graphData?.nodes), [graphData])
+  const coverage = displayNode?.type === 'BaseURL'
+    ? coverageLines(displayNode.properties ?? {}, recordedModules)
+    : []
+
+  const isIp = displayNode?.type === 'IP'
+  const hiddenKeys: string[] = [
+    'project_id', 'user_id',
+    ...(coverage.length ? COVERAGE_STAMP_PROPERTIES : []),
+    ...(isIp ? OWNERSHIP_PROPERTIES : []),
+  ]
   const sortedProperties = displayNode
     ? Object.entries(displayNode.properties || {})
         .filter(([key]) => !hiddenKeys.includes(key))
@@ -115,9 +138,22 @@ export function NodeDrawer({
         })
     : []
 
+  // Findings only: an asset or a reference node is never "reportable".
+  const disposition = displayNode && muteableLabel([displayNode.type])
+    ? readDisposition(displayNode.properties)
+    : null
+
   const trufflehogFields = displayNode?.type === 'MultiscannerFinding'
     ? trufflehogDisplayFields((displayNode.properties ?? {}) as Record<string, unknown>)
     : []
+
+  const routeExposure = !displayNode
+    ? []
+    : isRouteExposureFinding(displayNode.type, displayNode.properties)
+      ? routeExposureDisplayFields(displayNode.properties ?? {}, confirmedInGraph(displayNode.id, graphData?.links))
+      : displayNode.type === 'Endpoint'
+        ? endpointExposureFields(displayNode.properties ?? {})
+        : []
 
   const drawerTitle = node
     ? showList && listCluster
@@ -129,7 +165,7 @@ export function NodeDrawer({
 
   const handleCopyContext = async () => {
     if (!displayNode) return
-    const context = buildNodeContext(displayNode, graphData, { projectName, targetDomain })
+    const context = buildNodeContext(displayNode, graphData, { projectName, targetDomain, scopeGroups })
     try {
       await copyText(context)
       setCopied(true)
@@ -142,7 +178,7 @@ export function NodeDrawer({
 
   const handleAgentSubmit = (request: string) => {
     if (!displayNode) return
-    const context = buildNodeContext(displayNode, graphData, { projectName, targetDomain })
+    const context = buildNodeContext(displayNode, graphData, { projectName, targetDomain, scopeGroups })
     setShowAgentModal(false)
     onStartAgentSession?.(request, context, nodeLabel(displayNode))
   }
@@ -228,8 +264,15 @@ export function NodeDrawer({
                 className={styles.propertyBadge}
                 style={badgeColors(getNodeColor(displayNode))}
               >
-                {displayNode.type}
+                {displayNode.type === 'Domain' && !displayNode.properties?.ip_mode
+                  ? 'Domain (organisation)' : displayNode.type}
               </span>
+              {(() => {
+                const badge = scanRootBadge(displayNode, scopeGroups)
+                return badge && (
+                  <span className={styles.propertyBadge} data-testid="scan-root-badge">{badge}</span>
+                )
+              })()}
             </div>
             <div className={styles.propertyRow}>
               <span className={styles.propertyKey}>ID</span>
@@ -246,6 +289,36 @@ export function NodeDrawer({
                 })()}
               </span>
             </div>
+            {isIp && (
+              <div className={styles.propertyRow} data-testid="drawer-ownership">
+                <span className={styles.propertyKey}>Ownership</span>
+                <span className={`${styles.propertyValue} ${styles.proseValue}`}>
+                  {ownershipLine(displayNode.properties)}
+                </span>
+              </div>
+            )}
+            {disposition && (
+              <div className={styles.propertyRow} data-testid="drawer-disposition">
+                <span className={styles.propertyKey}>Disposition</span>
+                <span className={styles.propertyValue}>{dispositionText(disposition)}</span>
+              </div>
+            )}
+            {(() => {
+              const roots = domainScopeRoots(displayNode, scopeGroups)
+              return roots && (
+                <div className={styles.propertyRow} data-testid="domain-scan-roots">
+                  <span className={styles.propertyKey}>Scan roots under this domain</span>
+                  <span className={styles.propertyValue}>
+                    {roots.current.map(label => <div key={label}>{label}</div>)}
+                    {roots.removed.length > 0 && (
+                      <div style={{ color: 'var(--text-muted)' }}>
+                        {roots.removed.join(', ')}: removed from scope, cleared by the next full recon
+                      </div>
+                    )}
+                  </span>
+                </div>
+              )
+            })()}
           </div>
 
           {/* A Secret Multiscanner finding's asset/location/extra_data are generic on the
@@ -260,6 +333,33 @@ export function NodeDrawer({
                 <div key={label} className={styles.propertyRow}>
                   <span className={styles.propertyKey}>{label}</span>
                   <span className={styles.propertyValue}>{value}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {routeExposure.length > 0 && (
+            <div className={styles.section} data-testid="route-exposure-section">
+              <h3 className={styles.sectionTitleProperties}>Route exposure</h3>
+              {routeExposure.map(({ label, value }) => (
+                <div key={label} className={styles.propertyRow}>
+                  <span className={styles.propertyKey}>{label}</span>
+                  <span className={`${styles.propertyValue} ${styles.proseValue}`}>{value}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {coverage.length > 0 && (
+            <div className={styles.section} data-testid="coverage-section">
+              <h3 className={styles.sectionTitleProperties}>Coverage</h3>
+              {coverage.map(line => (
+                <div key={line.module} className={styles.propertyRow} data-state={line.state}>
+                  <span className={styles.propertyKey}>{line.label}</span>
+                  <span className={`${styles.coverageValue} ${styles[`coverage_${line.state}`] ?? ''}`}>
+                    {line.text}
+                    {line.at && <span className={styles.coverageAt}> · run started {line.at}</span>}
+                  </span>
                 </div>
               ))}
             </div>

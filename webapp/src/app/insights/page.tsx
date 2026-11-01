@@ -16,7 +16,9 @@ import {
 } from './hooks/useInsightsData'
 import { DashboardHeader } from './components/DashboardHeader'
 import { KPICards } from './components/KPICards'
+import { QueryErrors } from './components/QueryErrors'
 import { SeverityDonut } from './components/SeverityDonut'
+import { JudgedFindingsNote } from './components/JudgedFindingsNote'
 import { CvssHistogram } from './components/CvssHistogram'
 import { NodeTypeBar } from './components/NodeTypeBar'
 import { ConnectedNodesBar } from './components/ConnectedNodesBar'
@@ -41,6 +43,7 @@ import { ExploitsCard } from './components/ExploitsCard'
 import { FindingsBySource } from './components/FindingsBySource'
 import { FindingsByCategory } from './components/FindingsByCategory'
 import { VulnSourcePie } from './components/VulnSourcePie'
+import { DispositionBreakdown } from './components/DispositionBreakdown'
 import { CweBreakdownBar } from './components/CweBreakdownBar'
 import { VulnTargetsBar } from './components/VulnTargetsBar'
 import { GvmRemediationPie } from './components/GvmRemediationPie'
@@ -64,7 +67,9 @@ import { AttackFlowSankey } from './components/AttackFlowSankey'
 import { AttackChainSankey } from './components/AttackChainSankey'
 import { VulnAccumulationArea } from './components/VulnAccumulationArea'
 import { formatNumber } from './utils/formatters'
+import { errorMessage } from '@/lib/apiError'
 import { type RiskFinding } from '@/lib/projectRisk'
+import { SCANNER_SEVERITY_LABEL } from '@/lib/triage/disposition'
 import styles from './page.module.css'
 
 /**
@@ -146,20 +151,29 @@ export default function InsightsPage() {
       {/* Header */}
       <DashboardHeader
         projectName={currentProject?.name || null}
-        targetDomain={
-          currentProject?.domainBatchMode
-            // A batch project has no single targetDomain; name its groups so the
-            // header is not blank.
-            ? `${currentProject.domainBatchDomains?.length ?? 0} domains` + ((currentProject.domainBatchWildcardDomains?.length ?? 0) > 0 ? ` (${currentProject.domainBatchWildcardDomains?.length} enumerated)` : '')
-            : currentProject?.targetDomain || null
-        }
+        targetDomain={currentProject?.targetLabel || currentProject?.targetDomain || null}
         ipMode={currentProject?.ipMode || false}
         isLoading={isAnyLoading}
         onRefresh={refresh}
       />
 
+      <QueryErrors queries={[
+        { label: 'Graph overview', isError: graphOverview.isError, error: graphOverview.error },
+        { label: 'Vulnerabilities', isError: vulns.isError, error: vulns.error },
+        { label: 'Attack surface', isError: surface.isError, error: surface.error },
+        { label: 'Activity', isError: activity.isError, error: activity.error },
+        { label: 'Attack chains', isError: attackChains.isError, error: attackChains.error },
+      ]} />
+
       {/* KPI Cards + Pipeline Status */}
-      <KPICards items={kpis} isLoading={graphOverview.isLoading} pipeline={pipeline.data} sessions={sessions.data} />
+      <KPICards
+        items={kpis}
+        isLoading={graphOverview.isLoading}
+        pipeline={pipeline.data}
+        sessions={sessions.data}
+        pipelineError={pipeline.isError ? errorMessage(pipeline.error, 'Failed to load pipeline status') : null}
+        sessionsError={sessions.isError ? errorMessage(sessions.error, 'Failed to load agent sessions') : null}
+      />
 
       {/* Executive Summary */}
       <div className={styles.section}>
@@ -275,11 +289,12 @@ export default function InsightsPage() {
       <div className={styles.section}>
         <div className={styles.sectionTitle}>Vulnerabilities & CVE Intelligence</div>
         <div className={styles.grid4}>
-          <SeverityDonut data={vulns.data?.severityDistribution} isLoading={vulns.isLoading} title="Vulnerability Severity" />
+          <DispositionBreakdown data={vulns.data?.disposition} isLoading={vulns.isLoading} />
+          <SeverityDonut data={vulns.data?.severityDistribution} isLoading={vulns.isLoading} title={SCANNER_SEVERITY_LABEL} />
           <SeverityDonut data={vulns.data?.cveSeverity} isLoading={vulns.isLoading} title="CVE Severity" />
           <CvssHistogram data={vulns.data?.cvssHistogram} isLoading={vulns.isLoading} />
-          <VulnSourcePie data={vulns.data?.findings} isLoading={vulns.isLoading} />
         </div>
+        <JudgedFindingsNote judged={vulns.data?.judged} />
         <div className={styles.grid4}>
           <FindingsBySource data={vulns.data?.findings} isLoading={vulns.isLoading} />
           <FindingsByCategory data={vulns.data?.findings} isLoading={vulns.isLoading} />
@@ -290,10 +305,11 @@ export default function InsightsPage() {
           <TechCveBar data={vulns.data?.cveChains} isLoading={vulns.isLoading} />
           <AttackPatternsBar data={vulns.data?.cveChains} isLoading={vulns.isLoading} />
         </div>
-        <div className={styles.grid3}>
+        <div className={styles.grid4}>
           <CvssExploitScatter cveChains={vulns.data?.cveChains} exploits={vulns.data?.exploits} isLoading={vulns.isLoading} />
           <VulnCategoryRose data={vulns.data?.findings} isLoading={vulns.isLoading} />
           <TopVulnTechBubble data={vulns.data?.cveChains} isLoading={vulns.isLoading} />
+          <VulnSourcePie data={vulns.data?.findings} isLoading={vulns.isLoading} />
         </div>
         {/* Conditional row: Exploits + GVM Remediation + CISA KEV */}
         {((vulns.data?.exploits?.length ?? 0) > 0 || (vulns.data?.gvmRemediation?.length ?? 0) > 0) && (
@@ -365,6 +381,14 @@ export default function InsightsPage() {
                 {formatNumber(vulns.data.githubSecrets.sensitiveFiles)}
               </div>
             </div>
+            {(vulns.data.githubSecrets.publicClientKeys ?? 0) > 0 && (
+              <div className="statCard" title="Keys that are public by design (publishable, browser or analytics keys). Not counted as secrets.">
+                <div className="statLabel">Public Client Keys</div>
+                <div className="statValue">
+                  {formatNumber(vulns.data.githubSecrets.publicClientKeys ?? 0)}
+                </div>
+              </div>
+            )}
           </div>
         </div>
       )}

@@ -9,6 +9,8 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from recon.partial_recon_modules.helpers import (
+    typed_host_ok,
+    root_orgs,
     _is_valid_hostname,
     _is_valid_url,
     _should_include_root_domain,
@@ -17,7 +19,10 @@ from recon.partial_recon_modules.helpers import (
     scope_roots,
 )
 from recon.partial_recon_modules.graph_builders import (
+    graph_scope_subdomains,
     _build_http_probe_data_from_graph,
+    declared_only,
+    declared_only_unsafe,
     graph_target_hosts,
     graph_url_scope,
     url_host,
@@ -66,7 +71,7 @@ def run_paramspider(config: dict) -> None:
         for entry in user_targets.get("subdomains", []):
             entry = entry.strip().lower()
             if entry and _is_valid_hostname(entry):
-                if host_in_roots(entry, roots):
+                if typed_host_ok(entry, roots, config.get("domain_groups")):
                     user_subdomains.append(entry)
                 else:
                     print(f"[!][Partial Recon] Skipping subdomain outside scope: {entry}")
@@ -473,6 +478,7 @@ def run_kiterunner(config: dict) -> None:
                                 },
                                 user_id=user_id,
                                 project_id=project_id,
+                                root_orgs=root_orgs(roots),
                             )
                             for url in user_urls:
                                 parsed = _urlparse(url)
@@ -583,10 +589,17 @@ def run_arjun(config: dict) -> None:
                 with driver.session() as session:
                     keep = graph_url_scope(session, user_id, project_id, roots,
                                            config.get("domain_groups"), apex_filter=False)
-                    # Get all endpoint full URLs (baseurl + path) from the graph
+                    # Get all endpoint full URLs (baseurl + path) from the graph.
+                    # Arjun sends its own methods, not the Endpoint's: with any
+                    # method but GET configured, no path known only from an API
+                    # specification is a target (D15).
+                    arjun_methods = {str(m).upper() for m in settings.get('ARJUN_METHODS', ['GET', 'POST']) or []}
+                    skip_declared = (declared_only("e") if arjun_methods - {'GET'}
+                                     else declared_only_unsafe("e"))
                     result = session.run(
                         """
                         MATCH (e:Endpoint {user_id: $uid, project_id: $pid})
+                        WHERE NOT """ + skip_declared + """
                         RETURN DISTINCT e.baseurl + e.path AS url
                         """,
                         uid=user_id, pid=project_id,
@@ -717,18 +730,8 @@ def run_arjun(config: dict) -> None:
                 if graph_client.verify_connection():
                     driver = graph_client.driver
                     with driver.session() as session:
-                        result = session.run(
-                            """
-                            MATCH (d:Domain {user_id: $uid, project_id: $pid})
-                                  -[:HAS_SUBDOMAIN]->(s:Subdomain)
-                            WHERE d.name IN $domains
-                            RETURN collect(DISTINCT s.name) AS subdomains
-                            """,
-                            domains=roots, uid=user_id, pid=project_id,
-                        )
-                        record = result.single()
-                        if record:
-                            recon_data["subdomains"] = record["subdomains"] or []
+                        recon_data["subdomains"] = graph_scope_subdomains(
+                            session, user_id, project_id, roots, config.get("domain_groups"))
         except Exception:
             pass
 
@@ -805,6 +808,7 @@ def run_arjun(config: dict) -> None:
                                 },
                                 user_id=user_id,
                                 project_id=project_id,
+                                root_orgs=root_orgs(roots),
                             )
                             for url in user_urls:
                                 parsed = _urlparse(url)

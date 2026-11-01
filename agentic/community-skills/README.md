@@ -1,6 +1,6 @@
 # Community Skills
 
-Ready-to-use attack skill workflows contributed by the community. Download any `.md` file and upload it via **Global Settings > Agent Skills** to activate it for your user.
+Ready-to-use attack skill workflows contributed by the community. Download any `.md` file and upload it via **Global Settings > Agent Skills** (or a project's Agent Skills section) to activate it for your user; **Upload Batch** takes several files at once, and **Import from Community** brings in the whole catalog.
 
 ## Skills
 
@@ -23,10 +23,11 @@ Ready-to-use attack skill workflows contributed by the community. Download any `
 | [mass_assignment.md](mass_assignment.md) | [@samugit83](https://github.com/samugit83) | Privileged-field injection, ownership takeover, feature-gate and billing tampering across REST, GraphQL, JSON Patch, batch writes |
 | [subdomain_takeover.md](subdomain_takeover.md) | [@samugit83](https://github.com/samugit83) | Dangling CNAME / orphaned NS / unverified provider claim across S3, GitHub Pages, Heroku, Azure, CloudFront, Fastly and ~80 more |
 | [insecure_file_uploads.md](insecure_file_uploads.md) | [@samugit83](https://github.com/samugit83) | Web shells, SVG/HTML stored XSS, magic-byte and config-drop bypass, ImageMagick/Ghostscript/ExifTool abuse, zip slip, presigned-URL tampering, processing-race AV bypass |
+| [php2shell_upload_progress.md](php2shell_upload_progress.md) | [@samugit83](https://github.com/samugit83) | php2shell (CVE-2026-109618/109619) exposure check: fingerprint PHP version, decide the affected range, corroborate the `session.upload_progress` path non-destructively, and verify the mitigation. Detection and triage only, no exploitation |
 
 ## Contributing
 
 1. Create your `.md` skill file following the [Writing a Skill File](https://github.com/samugit83/redamon/wiki/Agent-Skills#writing-a-skill-file) format
-2. Test it in your RedAmon instance by uploading via Global Settings
+2. Test it in your RedAmon instance by uploading it with **Upload Skill** (or with others through **Upload Batch**) in Global Settings
 3. Fork the repo, add your `.md` file to this folder, and update this table with your GitHub username
 4. Open a Pull Request

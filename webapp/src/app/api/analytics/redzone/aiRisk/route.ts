@@ -3,7 +3,10 @@ import { rowCap } from '../rowCap'
 import { guardProject } from '@/lib/access'
 import { getGraphSession } from '@/app/api/graph/neo4j'
 import { notMuted } from '@/lib/graphMute'
+import { reportCountable } from '@/lib/triage/reportable'
+import { DECLARED_ONLY } from '@/lib/declaredOnly'
 import { corroborateAttackFindings, type RawAttackRow } from '@/lib/report/aiAttackFindings'
+import { internalError } from '@/lib/routeErrors'
 
 function toNum(val: unknown): number | null {
   if (val == null) return null
@@ -27,7 +30,7 @@ export async function GET(request: NextRequest) {
     // --- MCP tool-poisoning / exfiltration / annotation findings ---
     const findings = await session.run(
       `MATCH (v:Vulnerability {project_id: $pid, source: 'ai_surface_recon'})
-       WHERE ${notMuted('v')}
+       WHERE ${notMuted('v')} AND ${reportCountable('v')}
        OPTIONAL MATCH (e:Endpoint)-[:HAS_VULNERABILITY]->(v)
        RETURN toString(id(v)) AS nodeId,
               v.severity AS severity, v.type AS type, v.name AS name,
@@ -47,7 +50,8 @@ export async function GET(request: NextRequest) {
               p.name AS name, coalesce(e.path, p.endpoint_path) AS endpointPath,
               coalesce(e.baseurl, p.baseurl) AS baseUrl,
               p.ai_tool_arg_path AS toolArgPath, p.position AS position,
-              p.updated_at AS updatedAt
+              p.updated_at AS updatedAt,
+              ${DECLARED_ONLY('e')} AS declaredOnly
        ORDER BY p.name LIMIT ${rowCap()}`,
       { pid })
 
@@ -56,7 +60,8 @@ export async function GET(request: NextRequest) {
       `MATCH (ep:Endpoint {project_id: $pid}) WHERE ep.is_ai_rag_ingest = true
        RETURN toString(id(ep)) AS nodeId,
               ep.baseurl AS baseUrl, ep.path AS path, ep.method AS method,
-              ep.ai_interface_type AS interfaceType, ep.updated_at AS updatedAt
+              ep.ai_interface_type AS interfaceType, ep.updated_at AS updatedAt,
+              ${DECLARED_ONLY('ep')} AS declaredOnly
        ORDER BY ep.baseurl, ep.path LIMIT ${rowCap()}`,
       { pid })
 
@@ -88,7 +93,7 @@ export async function GET(request: NextRequest) {
     const tested = await session.run(
       `MATCH (v:Vulnerability {project_id: $pid})
        WHERE v.source IN ['garak', 'pyrit', 'giskard', 'promptfoo']
-         AND ${notMuted('v')}
+         AND ${notMuted('v')} AND ${reportCountable('v')}
        OPTIONAL MATCH (parent)-[:HAS_VULNERABILITY]->(v)
        // One row per finding even when it has several parents (Endpoint + IP);
        // prefer the most specific parent so corroboration isn't double-counted.
@@ -145,12 +150,14 @@ export async function GET(request: NextRequest) {
         nodeId: (r.get('nodeId') as string | null) ?? null,
         name: r.get('name'), endpointPath: r.get('endpointPath'), baseUrl: r.get('baseUrl'),
         toolArgPath: r.get('toolArgPath'), position: r.get('position'),
+        declaredOnly: r.get('declaredOnly') === true,
         updatedAt: r.get('updatedAt') ?? null,
       })),
       ragPoints: rag.records.map((r: { get: (key: string) => unknown }) => ({
         nodeId: (r.get('nodeId') as string | null) ?? null,
         baseUrl: r.get('baseUrl'), path: r.get('path'), method: r.get('method'),
         interfaceType: r.get('interfaceType'),
+        declaredOnly: r.get('declaredOnly') === true,
         updatedAt: r.get('updatedAt') ?? null,
       })),
       exposedRuntimes: exposed.records.map((r: { get: (key: string) => unknown }) => ({
@@ -179,9 +186,7 @@ export async function GET(request: NextRequest) {
       },
     })
   } catch (error) {
-    console.error('Red-zone aiRisk error:', error)
-    return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Query failed' }, { status: 500 })
+    return internalError(error, 'Query failed', { log: 'Red-zone aiRisk error' })
   } finally {
     await session.close()
   }

@@ -13,7 +13,7 @@ Enable every single tool in the pipeline and push every parameter to its maximum
 Pentesters running a final comprehensive sweep on a target they have full authorization to test, or security teams doing a thorough baseline assessment of their own infrastructure. Expect this scan to take several hours on large targets.
 
 ### What it enables
-- All 6 scan modules: domain_discovery, port_scan, http_probe, resource_enum, vuln_scan, js_recon
+- All 5 scan modules: domain_discovery, port_scan, http_probe, resource_enum, vuln_scan (JS recon runs by its own switch)
 - Subdomain discovery: all 5 tools at 10000 max results + Amass active + brute force + Puredns validation
 - Port scanning: Naabu SYN (top 1000) + Masscan (10000 pps) + Nmap T4 with version detection and NSE scripts
 - httpx: all 20 probes enabled, response body capture, high concurrency
@@ -33,6 +33,7 @@ Pentesters running a final comprehensive sweep on a target they have full author
 - CVE lookup: 50 max CVEs per service, min CVSS 0
 - MITRE: full CWE + CAPEC enrichment
 - All 10 OSINT providers at maximum results (Shodan, URLScan 10000, OTX, Censys, FOFA 5000, Netlas, VirusTotal, ZoomEye 5000, CriminalIP, Uncover 1000)
+- OpenAPI import with Auto-discover: API specification documents found on live hosts become declared endpoints and parameters (never called; later scanners request them with GET or HEAD only)
 
 ### What it disables
 - Nothing. Every tool is enabled.
@@ -55,7 +56,7 @@ Pentesters running a final comprehensive sweep on a target they have full author
   environment: 'either',
   parameters: {
     // All 6 scan modules
-    scanModules: ['domain_discovery', 'port_scan', 'http_probe', 'resource_enum', 'vuln_scan', 'js_recon'],
+    scanModules: ['domain_discovery', 'port_scan', 'http_probe', 'resource_enum', 'vuln_scan'],
 
     // No stealth
     stealthMode: false,
@@ -114,6 +115,7 @@ Pentesters running a final comprehensive sweep on a target they have full author
 
     // --- httpx: all probes maxed ---
     httpxEnabled: true,
+    ipAttributionEnabled: true,
     httpxThreads: 75,
     httpxTimeout: 20,
     httpxRetries: 3,
@@ -252,6 +254,7 @@ Pentesters running a final comprehensive sweep on a target they have full author
 
     // --- Kiterunner: routes-large, high connections ---
     kiterunnerEnabled: true,
+    openapiAutoDiscover: true,
     kiterunnerWordlists: ['routes-large'],
     kiterunnerRateLimit: 200,
     kiterunnerConnections: 200,
@@ -327,6 +330,8 @@ Pentesters running a final comprehensive sweep on a target they have full author
 
     // --- All 28 security checks ---
     serializedScanEnabled: true,
+    // Route exposure: unauthenticated internal/admin/debug routes, exposed .git/.env/backups, PII in responses.
+    routeExposureEnabled: true,
     securityCheckEnabled: true,
     securityCheckDirectIpHttp: true,
     securityCheckDirectIpHttps: true,

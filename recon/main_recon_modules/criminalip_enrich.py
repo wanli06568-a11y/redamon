@@ -351,8 +351,8 @@ def run_criminalip_enrichment(combined_result: dict, settings: dict) -> dict:
 
     domain = combined_result.get("domain", "")
     is_ip_mode = combined_result.get("metadata", {}).get("ip_mode", False)
-    ips = _extract_ips_from_recon(combined_result)
-    ips = filter_ips_for_enrichment(ips, combined_result, "CriminalIP")
+    all_ips = _extract_ips_from_recon(combined_result)
+    ips = filter_ips_for_enrichment(all_ips, combined_result, "CriminalIP")
 
     print("[*][CriminalIP] Starting OSINT enrichment")
     print(f"[+][CriminalIP] Extracted {len(ips)} unique IPs for enrichment")
@@ -362,19 +362,32 @@ def run_criminalip_enrichment(combined_result: dict, settings: dict) -> dict:
         "domain_report": None,
     }
     cip_scope = cb.scope("criminalip", label="CriminalIP", unit="IP(s)")
+    # IPs Criminal IP answered for, "no data" included; the prune keeps the
+    # others' CVEs.
+    checked: set[str] = set()
+    failed = False
 
     try:
-        if domain and not is_ip_mode:
-            print(f"[*][CriminalIP] Fetching domain report for {domain}...")
-            res = _cip_get("domain/report", keys, params={"query": domain})
+        def _domain_report(d):
+            """The org's Criminal IP domain report, or None without one."""
+            print(f"[*][CriminalIP] Fetching domain report for {d}...")
+            res = _cip_get("domain/report", keys, params={"query": d})
             if res.answered:
-                cip_data["domain_report"] = _parse_domain_report(domain, res.data)
-                if cip_data["domain_report"]:
-                    print(f"[+][CriminalIP] Domain report retrieved for {domain}")
+                report = _parse_domain_report(d, res.data)
+                if report:
+                    print(f"[+][CriminalIP] Domain report retrieved for {d}")
                 else:
-                    print(f"[!][CriminalIP] No domain report data for {domain}")
-            elif res.outcome is not cb.Outcome.SKIPPED:
+                    print(f"[!][CriminalIP] No domain report data for {d}")
+                return report
+            if res.outcome is not cb.Outcome.SKIPPED:
                 print(f"[!][CriminalIP] Domain report unavailable ({res.detail})")
+            return None
+
+        if domain and not is_ip_mode:
+            # The org, once per run; the org's other groups reuse the answer.
+            from recon.helpers.org_work import once_per_org, org_of
+            cip_data["domain_report"], _ = once_per_org(
+                "criminalip_domain", org_of(combined_result), _domain_report, label="CriminalIP")
 
         max_workers = settings.get("CRIMINALIP_WORKERS", 5)
         rate_limiter = _RateLimiter(1.0)
@@ -388,6 +401,8 @@ def run_criminalip_enrichment(combined_result: dict, settings: dict) -> dict:
             rate_limiter.wait()
             print(f"[*][CriminalIP] Fetching IP data for {ip}...")
             res = _cip_get("ip/data", keys, params={"ip": ip, "full": "true"}, admitted=True)
+            if res.answered:
+                checked.add(ip)
             if not res.ok:
                 return None
             report = _parse_ip_report(ip, res.data)
@@ -418,8 +433,12 @@ def run_criminalip_enrichment(combined_result: dict, settings: dict) -> dict:
         logger.error(f"CriminalIP enrichment failed: {type(e).__name__}")
         print(f"[!][CriminalIP] Enrichment error: {type(e).__name__}")
         print(f"[!][CriminalIP] Pipeline continues without full Criminal IP data")
+        failed = True
 
     cip_scope.finish("criminalip_enrich", payload=cip_data)
+    from recon.helpers.passive_cve_coverage import note_cve_coverage
+    note_cve_coverage("criminalip", "criminalip_enrich", ips, checked,
+                      no_input=not all_ips, failed=failed)
     combined_result["criminalip"] = cip_data
     return combined_result
 

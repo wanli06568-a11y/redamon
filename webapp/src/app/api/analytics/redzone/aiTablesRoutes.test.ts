@@ -56,11 +56,17 @@ describe('AI red-zone routes — guards', () => {
   test.each([
     ['aiSurface', aiSurface.GET],
     ['aiRisk', aiRisk.GET],
-  ])('%s returns 500 on query error', async (_name, handler) => {
-    shouldThrow = new Error('boom')
+  ])('%s returns 500 on query error with a fixed message and the Neo4j code', async (_name, handler) => {
+    // The raw Neo4j message can quote the Cypher and its target values; only
+    // the code reaches the browser.
+    shouldThrow = Object.assign(new Error('boom: MATCH (h {name:"target.example"})'), {
+      code: 'Neo.TransientError.General.DatabaseUnavailable',
+    })
     const res = await handler(req('p1'))
     expect(res.status).toBe(500)
-    expect((await res.json()).error).toBe('boom')
+    const body = await res.json()
+    expect(body).toEqual({ error: 'Query failed', code: 'Neo.TransientError.General.DatabaseUnavailable' })
+    expect(JSON.stringify(body)).not.toContain('target.example')
   })
 
   test.each([
@@ -249,5 +255,30 @@ describe('AI red-zone routes — Node ID', () => {
     // Two tools fold into one row; its id is the worst-ASR row whose evidence it shows.
     expect(sheets.testedVulns).toHaveLength(1)
     expect(sheets.testedVulns[0]).toMatchObject({ nodeId: '21', evidence: 'strong' })
+  })
+})
+
+describe('AI red-zone routes — endpoints known only from an API specification', () => {
+  const PREDICATE = 'coalesce(ep.openapi_declared_only, ep.openapi_declared, false) AS declaredOnly'
+
+  test('aiSurface flags declared-only LLM endpoints instead of hiding them', async () => {
+    runQueue = [[{ baseUrl: 'https://a', path: '/v1/chat', method: 'POST', declaredOnly: true }]]
+    const body = await (await aiSurface.GET(req('p1'))).json()
+    expect(runCalls[0].cypher).toContain(PREDICATE)
+    expect(body.sheets.llmEndpoints[0].declaredOnly).toBe(true)
+  })
+
+  test('aiRisk reads the flag from the parent Endpoint for parameters, and on RAG points', async () => {
+    await aiRisk.GET(req('p1'))
+    const params = runCalls.find(c => c.cypher.includes('is_ai_prompt_injectable'))!.cypher
+    expect(params).toContain('coalesce(e.openapi_declared_only, e.openapi_declared, false) AS declaredOnly')
+    const rag = runCalls.find(c => c.cypher.includes('is_ai_rag_ingest = true'))!.cypher
+    expect(rag).toContain(PREDICATE)
+  })
+
+  test('a row without the flag reads as observed', async () => {
+    runQueue = [[{ baseUrl: 'https://a', path: '/v1/chat', declaredOnly: null }]]
+    const body = await (await aiSurface.GET(req('p1'))).json()
+    expect(body.sheets.llmEndpoints[0].declaredOnly).toBe(false)
   })
 })

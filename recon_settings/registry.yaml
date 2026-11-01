@@ -13,7 +13,6 @@ tools:
     phase: standalone
     traffic: active
     form_section: "AgentBehaviourSection"
-    produces: ["AttackChain", "ChainStep", "ChainFinding", "ChainDecision", "ChainFailure"]
   ai_surface_recon:
     title: "AI attack-surface recon"
     phase: http_probe
@@ -31,7 +30,6 @@ tools:
     module: "recon.main_recon_modules.domain_recon"
     partial_recon_module: "subdomain_discovery"
     form_section: "SubdomainDiscoverySection"
-    produces: ["Subdomain"]
   arjun:
     title: "Arjun"
     phase: resource_enum
@@ -40,7 +38,6 @@ tools:
     module: "recon.main_recon_modules.resource_enum"
     partial_recon_module: "parameter_discovery"
     form_section: "ArjunSection"
-    produces: ["Parameter"]
   auth_profile:
     title: "Authenticated session"
     phase: http_probe
@@ -55,7 +52,6 @@ tools:
     module: "recon.main_recon_modules.subdomain_takeover"
     partial_recon_module: "vulnerability_scanning"
     form_section: "TakeoverSection"
-    produces: ["Vulnerability"]
   banner_grab:
     title: "Banner grab"
     phase: port_scan
@@ -64,7 +60,6 @@ tools:
     module: "recon.main_recon_modules.port_scan"
     partial_recon_module: "port_scanning"
     form_section: "NaabuSection"
-    produces: ["Service"]
   capture_proxy:
     title: "Capture proxy"
     phase: standalone
@@ -81,7 +76,6 @@ tools:
     graph_writer: "update_graph_from_censys"
     partial_recon_module: "osint_enrichment"
     form_section: "OsintEnrichmentSection"
-    produces: ["IP", "Port", "Certificate"]
   criminalip:
     title: "CriminalIP"
     phase: domain_discovery
@@ -92,7 +86,6 @@ tools:
     graph_writer: "update_graph_from_criminalip"
     partial_recon_module: "osint_enrichment"
     form_section: "OsintEnrichmentSection"
-    produces: ["IP", "Port"]
   crtsh:
     title: "crt.sh"
     phase: domain_discovery
@@ -101,7 +94,6 @@ tools:
     module: "recon.main_recon_modules.domain_recon"
     partial_recon_module: "subdomain_discovery"
     form_section: "SubdomainDiscoverySection"
-    produces: ["Subdomain", "Certificate"]
   cve_lookup:
     title: "CVE lookup"
     phase: vuln_scan
@@ -109,7 +101,6 @@ tools:
     enabled_key: "CVE_LOOKUP_ENABLED"
     partial_recon_module: "vulnerability_scanning"
     form_section: "CveLookupSection"
-    produces: ["CVE"]
   cypherfix:
     title: "CypherFix"
     phase: standalone
@@ -128,7 +119,6 @@ tools:
     module: "recon.main_recon_modules.domain_recon"
     partial_recon_module: "subdomain_discovery"
     form_section: "SubdomainDiscoverySection"
-    produces: ["DNSRecord", "Subdomain", "IP"]
   domain_recon_ai:
     title: "Domain recon AI hints"
     phase: domain_discovery
@@ -152,7 +142,6 @@ tools:
     module: "recon.main_recon_modules.resource_enum"
     partial_recon_module: "web_crawling"
     form_section: "FfufSection"
-    produces: ["Endpoint"]
   fireteam:
     title: "Fireteam"
     phase: standalone
@@ -168,7 +157,6 @@ tools:
     graph_writer: "update_graph_from_fofa"
     partial_recon_module: "osint_enrichment"
     form_section: "OsintEnrichmentSection"
-    produces: ["IP", "Port", "Technology"]
   gau:
     title: "gau"
     phase: resource_enum
@@ -178,13 +166,11 @@ tools:
     module: "recon.main_recon_modules.resource_enum"
     partial_recon_module: "web_crawling"
     form_section: "GauSection"
-    produces: ["Endpoint", "Parameter"]
   github:
     title: "GitHub secret hunt"
     phase: standalone
     traffic: passive
     form_section: "GithubSection"
-    produces: ["GithubHunt", "GithubRepository", "GithubSecret", "GithubSensitiveFile", "GithubPath"]
   graphql:
     title: "GraphQL security"
     phase: vuln_scan
@@ -194,7 +180,6 @@ tools:
     isolated_fn: "run_graphql_scan_isolated"
     partial_recon_module: "graphql_scanning"
     form_section: "GraphqlScanSection"
-    produces: ["Endpoint", "Vulnerability"]
   graphql_cop:
     title: "GraphQL Cop"
     phase: vuln_scan
@@ -203,13 +188,11 @@ tools:
     image: "dolevf/graphql-cop:1.14"
     partial_recon_module: "graphql_scanning"
     form_section: "GraphqlScanSection"
-    produces: ["Vulnerability"]
   gvm:
     title: "GVM vulnerability scan"
     phase: standalone
     traffic: active
     form_section: "GvmScanSection"
-    produces: ["ExploitGvm", "Vulnerability"]
   hackertarget:
     title: "HackerTarget"
     phase: domain_discovery
@@ -218,7 +201,6 @@ tools:
     module: "recon.main_recon_modules.domain_recon"
     partial_recon_module: "subdomain_discovery"
     form_section: "SubdomainDiscoverySection"
-    produces: ["Subdomain"]
   hakrawler:
     title: "hakrawler"
     phase: resource_enum
@@ -228,7 +210,6 @@ tools:
     module: "recon.main_recon_modules.resource_enum"
     partial_recon_module: "web_crawling"
     form_section: "HakrawlerSection"
-    produces: ["Endpoint"]
   http_probe_ai:
     title: "HTTP probe AI hints"
     phase: http_probe
@@ -243,12 +224,21 @@ tools:
     module: "recon.main_recon_modules.http_probe"
     partial_recon_module: "http_probing"
     form_section: "HttpxSection"
-    produces: ["BaseURL", "Technology", "Header", "Certificate"]
   hydra:
     title: "Hydra"
     phase: standalone
     traffic: active
     form_section: "BruteForceSection"
+  ip_attribution:
+    title: "IP attribution"
+    phase: http_probe
+    traffic: active
+    enabled_key: "IP_ATTRIBUTION_ENABLED"
+    module: "recon.main_recon_modules.ip_attribution"
+    isolated_fn: "run_ip_attribution_isolated"
+    graph_writer: "update_graph_from_ip_attribution"
+    partial_recon_module: "ip_attribution"
+    form_section: "IpAttributionSection"
   js_recon:
     title: "JS recon"
     phase: js_recon
@@ -257,16 +247,14 @@ tools:
     module: "recon.main_recon_modules.js_recon"
     partial_recon_module: "js_analysis"
     form_section: "JsReconSection"
-    produces: ["JsReconFinding", "Endpoint", "Secret"]
   jsluice:
     title: "jsluice"
     phase: js_recon
     traffic: active
     enabled_key: "JSLUICE_ENABLED"
     module: "recon.main_recon_modules.js_recon"
-    partial_recon_module: "js_analysis"
+    partial_recon_module: "web_crawling"
     form_section: "JsluiceSection"
-    produces: ["JsReconFinding", "Endpoint", "Secret"]
   katana:
     title: "Katana"
     phase: resource_enum
@@ -276,16 +264,14 @@ tools:
     module: "recon.main_recon_modules.resource_enum"
     partial_recon_module: "web_crawling"
     form_section: "KatanaSection"
-    produces: ["Endpoint", "Parameter"]
   kiterunner:
     title: "Kiterunner"
     phase: resource_enum
     traffic: active
     enabled_key: "KITERUNNER_ENABLED"
     module: "recon.main_recon_modules.resource_enum"
-    partial_recon_module: "web_crawling"
+    partial_recon_module: "parameter_discovery"
     form_section: "KiterunnerSection"
-    produces: ["Endpoint"]
   knockpy:
     title: "knockpy"
     phase: domain_discovery
@@ -294,7 +280,6 @@ tools:
     module: "recon.main_recon_modules.domain_recon"
     partial_recon_module: "subdomain_discovery"
     form_section: "SubdomainDiscoverySection"
-    produces: ["Subdomain"]
   masscan:
     title: "masscan"
     phase: port_scan
@@ -304,7 +289,6 @@ tools:
     isolated_fn: "run_masscan_scan_isolated"
     partial_recon_module: "port_scanning"
     form_section: "MasscanSection"
-    produces: ["Port", "Service"]
   mitre:
     title: "MITRE ATT&CK enrichment"
     phase: vuln_scan
@@ -313,7 +297,6 @@ tools:
     module: "recon.main_recon_modules.add_mitre"
     partial_recon_module: "vulnerability_scanning"
     form_section: "MitreSection"
-    produces: ["MitreData", "Capec"]
   naabu:
     title: "naabu"
     phase: port_scan
@@ -324,7 +307,6 @@ tools:
     isolated_fn: "run_port_scan_isolated"
     partial_recon_module: "port_scanning"
     form_section: "NaabuSection"
-    produces: ["Port"]
   netlas:
     title: "Netlas"
     phase: domain_discovery
@@ -335,7 +317,6 @@ tools:
     graph_writer: "update_graph_from_netlas"
     partial_recon_module: "osint_enrichment"
     form_section: "OsintEnrichmentSection"
-    produces: ["IP", "Port"]
   nmap:
     title: "Nmap"
     phase: port_scan
@@ -344,7 +325,6 @@ tools:
     module: "recon.main_recon_modules.nmap_scan"
     partial_recon_module: "port_scanning"
     form_section: "NmapSection"
-    produces: ["Service", "Vulnerability"]
   nuclei:
     title: "Nuclei"
     phase: vuln_scan
@@ -354,7 +334,6 @@ tools:
     module: "recon.main_recon_modules.vuln_scan"
     partial_recon_module: "vulnerability_scanning"
     form_section: "NucleiSection"
-    produces: ["Vulnerability"]
   origin_discovery:
     title: "Origin discovery"
     phase: http_probe
@@ -364,7 +343,14 @@ tools:
     isolated_fn: "run_origin_discovery_enrichment_isolated"
     partial_recon_module: "origin_enrichment"
     form_section: "OriginDiscoverySection"
-    produces: ["IP"]
+  openapi_recon:
+    title: "OpenAPI ingestion"
+    phase: resource_enum
+    traffic: active
+    enabled_key: "OPENAPI_ENABLED"
+    module: "recon.main_recon_modules.resource_enum"
+    partial_recon_module: "openapi_recon"
+    form_section: "OpenApiSection"
   osint_enrichment:
     title: "OSINT enrichment"
     phase: domain_discovery
@@ -382,7 +368,6 @@ tools:
     graph_writer: "update_graph_from_otx"
     partial_recon_module: "osint_enrichment"
     form_section: "OsintEnrichmentSection"
-    produces: ["ThreatPulse", "Malware"]
   paramspider:
     title: "ParamSpider"
     phase: resource_enum
@@ -391,7 +376,6 @@ tools:
     module: "recon.main_recon_modules.resource_enum"
     partial_recon_module: "parameter_discovery"
     form_section: "ParamSpiderSection"
-    produces: ["Parameter"]
   path_traversal:
     title: "Path traversal"
     phase: standalone
@@ -431,7 +415,6 @@ tools:
     module: "recon.main_recon_modules.domain_recon"
     partial_recon_module: "subdomain_discovery"
     form_section: "SubdomainDiscoverySection"
-    produces: ["Subdomain", "IP"]
   rce:
     title: "Remote code execution"
     phase: standalone
@@ -448,14 +431,23 @@ tools:
     traffic: none
     enabled_key: "ROE_ENABLED"
     form_section: "RoeSection"
+  route_exposure:
+    title: "Route exposure scan"
+    phase: vuln_scan
+    traffic: active
+    enabled_key: "ROUTE_EXPOSURE_ENABLED"
+    module: "recon.route_exposure"
+    isolated_fn: "run_route_exposure_isolated"
+    graph_writer: "update_graph_from_route_exposure"
+    partial_recon_module: "route_exposure_scanning"
+    form_section: "RouteExposureSection"
   security_check:
     title: "Security checks"
     phase: http_probe
     traffic: active
     enabled_key: "SECURITY_CHECK_ENABLED"
-    partial_recon_module: "http_probing"
+    partial_recon_module: "vulnerability_scanning"
     form_section: "SecurityChecksSection"
-    produces: ["Vulnerability"]
   serialized_scan:
     title: "Serialized object scan"
     phase: js_recon
@@ -466,7 +458,6 @@ tools:
     graph_writer: "update_graph_from_serialized_scan"
     partial_recon_module: "serialized_scanning"
     form_section: "SerializedScanSection"
-    produces: ["Vulnerability"]
   shodan:
     title: "Shodan"
     phase: domain_discovery
@@ -476,7 +467,6 @@ tools:
     isolated_fn: "run_shodan_enrichment_isolated"
     partial_recon_module: "osint_enrichment"
     form_section: "ShodanSection"
-    produces: ["IP", "Port", "Service", "CVE"]
   sqli:
     title: "SQL injection"
     phase: standalone
@@ -503,7 +493,6 @@ tools:
     module: "recon.main_recon_modules.domain_recon"
     partial_recon_module: "subdomain_discovery"
     form_section: "SubdomainDiscoverySection"
-    produces: ["Subdomain"]
   subjack:
     title: "subjack"
     phase: vuln_scan
@@ -513,13 +502,11 @@ tools:
     isolated_fn: "run_subdomain_takeover_isolated"
     partial_recon_module: "vulnerability_scanning"
     form_section: "TakeoverSection"
-    produces: ["Vulnerability"]
   supply_chain:
     title: "Supply chain scan"
     phase: standalone
     traffic: passive
     form_section: "SupplyChainScanSection"
-    produces: ["Package", "MalPackageFinding"]
   supply_chain_recon:
     title: "Supply chain recon"
     phase: standalone
@@ -527,7 +514,6 @@ tools:
     enabled_key: "SUPPLY_CHAIN_RECON_ENABLED"
     partial_recon_module: "supply_chain"
     form_section: "SupplyChainReconSection"
-    produces: ["Package", "MalPackageFinding"]
   takeover:
     title: "Subdomain takeover"
     phase: vuln_scan
@@ -537,7 +523,6 @@ tools:
     isolated_fn: "run_subdomain_takeover_isolated"
     partial_recon_module: "vulnerability_scanning"
     form_section: "TakeoverSection"
-    produces: ["Vulnerability"]
   targeting:
     title: "Targeting and scope"
     phase: standalone
@@ -552,13 +537,11 @@ tools:
     module: "recon.main_recon_modules.tls_scan"
     partial_recon_module: "tlsx_scanning"
     form_section: "TlsxSection"
-    produces: ["Certificate", "Service"]
   trufflehog:
     title: "TruffleHog"
     phase: standalone
     traffic: passive
     form_section: "TrufflehogSection"
-    produces: ["MultiscannerScan", "MultiscannerFinding", "Secret"]
   uncover:
     title: "uncover"
     phase: domain_discovery
@@ -569,7 +552,6 @@ tools:
     isolated_fn: "run_uncover_expansion_isolated"
     partial_recon_module: "osint_enrichment"
     form_section: "OsintEnrichmentSection"
-    produces: ["IP", "Port"]
   urlscan:
     title: "urlscan.io"
     phase: domain_discovery
@@ -578,7 +560,6 @@ tools:
     module: "recon.main_recon_modules.urlscan_enrich"
     partial_recon_module: "osint_enrichment"
     form_section: "UrlscanSection"
-    produces: ["Endpoint", "ExternalDomain"]
   vhost_sni:
     title: "Vhost / SNI enumeration"
     phase: http_probe
@@ -586,9 +567,8 @@ tools:
     enabled_key: "VHOST_SNI_ENABLED"
     module: "recon.main_recon_modules.vhost_sni_enum"
     isolated_fn: "run_vhost_sni_enrichment_isolated"
-    partial_recon_module: "http_probing"
+    partial_recon_module: "vulnerability_scanning"
     form_section: "VhostSniSection"
-    produces: ["Subdomain", "Certificate"]
   virustotal:
     title: "VirusTotal"
     phase: domain_discovery
@@ -599,7 +579,6 @@ tools:
     graph_writer: "update_graph_from_virustotal"
     partial_recon_module: "osint_enrichment"
     form_section: "OsintEnrichmentSection"
-    produces: ["Malware", "ExternalDomain"]
   waf:
     title: "WAF detection"
     phase: http_probe
@@ -613,7 +592,6 @@ tools:
     module: "recon.main_recon_modules.http_probe"
     partial_recon_module: "http_probing"
     form_section: "HttpxSection"
-    produces: ["Technology"]
   web_cache_poison:
     title: "Web cache poisoning"
     phase: standalone
@@ -622,7 +600,6 @@ tools:
     image: "redamon-wcvs:latest"
     partial_recon_module: "cache_scanning"
     form_section: "WebCachePoisonSection"
-    produces: ["Vulnerability"]
   whois:
     title: "WHOIS"
     phase: domain_discovery
@@ -631,7 +608,6 @@ tools:
     module: "recon.main_recon_modules.domain_recon"
     partial_recon_module: "subdomain_discovery"
     form_section: "SubdomainDiscoverySection"
-    produces: ["Domain"]
   zap:
     title: "ZAP Ajax Spider"
     phase: resource_enum
@@ -641,7 +617,6 @@ tools:
     module: "recon.main_recon_modules.resource_enum"
     partial_recon_module: "web_crawling"
     form_section: "ZapAjaxSpiderSection"
-    produces: ["Endpoint", "Parameter"]
   zoomeye:
     title: "ZoomEye"
     phase: domain_discovery
@@ -652,9 +627,86 @@ tools:
     graph_writer: "update_graph_from_zoomeye"
     partial_recon_module: "osint_enrichment"
     form_section: "OsintEnrichmentSection"
-    produces: ["IP", "Port"]
 
 fields:
+  openapiEnabled:
+    tool: openapi_recon
+    runtime_key: "OPENAPI_ENABLED"
+    unit: none
+    phase: resource_enum
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    stealth: { set: false }
+    meaning: >-
+      Whether to import declared API operations from OpenAPI documents. Fetches specifications but never calls declared operations.
+  openapiAutoDiscover:
+    tool: openapi_recon
+    runtime_key: "OPENAPI_AUTO_DISCOVER"
+    unit: none
+    phase: resource_enum
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    stealth: { set: false }
+    meaning: >-
+      Discover specifications from crawl results and configured paths on known in-scope base URLs. Opt-in and disabled in stealth mode.
+  openapiDiscoveryPaths:
+    tool: openapi_recon
+    runtime_key: "OPENAPI_DISCOVERY_PATHS"
+    unit: none
+    phase: resource_enum
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    stealth: { set: [] }
+    roe_parse: deny
+    validator: url_path_list
+    meaning: >-
+      Paths probed for OpenAPI documents on every in-scope origin during
+      auto-discovery: at most 200, each starting with /, without whitespace, a
+      query or a fragment. A path that breaks those rules is refused at the
+      write and skipped at scan time without dropping the others. Empty
+      disables common-path probes.
+  openapiSources:
+    tool: openapi_recon
+    runtime_key: "OPENAPI_SOURCES"
+    unit: none
+    phase: resource_enum
+    traffic: active
+    roe_capped: false
+    mcp: never
+    stealth: { set: [] }
+    deny_reason: secret
+    readable: false
+    read_deny_reason: credential
+    validator: json_object
+    meaning: >-
+      Project-specific specification sources. URLs may contain credentials; excluded from MCP reads and writes and reusable presets.
+  openapiTimeout:
+    tool: openapi_recon
+    runtime_key: "OPENAPI_TIMEOUT"
+    unit: seconds
+    phase: resource_enum
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    stealth: { ceiling: 10 }
+    bounds: { min: 1, max: 60 }
+    meaning: >-
+      Per-request timeout in seconds when fetching a specification or same-origin reference.
+  openapiMaxDocuments:
+    tool: openapi_recon
+    runtime_key: "OPENAPI_MAX_DOCUMENTS"
+    unit: count
+    phase: resource_enum
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    stealth: { ceiling: 1 }
+    bounds: { min: 1, max: 200 }
+    meaning: >-
+      Maximum number of specification documents attempted per target run.
   activationStartedAt:
     tool: project
     runtime_key: null
@@ -2320,14 +2372,13 @@ fields:
     validator: json_object
     group: scope
     meaning: >-
-      Groups derived from the list at save time: [{ rootDomain, prefixes[],
-      hosts[] }]. Persisted rather than re-derived so the grouping rule has
-      exactly ONE implementation, and so what the operator approved in the preview
-      is literally what the pipeline runs. Always recomputed server-side; never
-      trusted from a body. A prefix is a subdomain label, or one of two
-      sentinels: "." meaning the root domain itself, and "*" meaning enumerate
-      this domain (full subdomain discovery, as a single-domain project runs it).
-      Wildcard-ness is read from the prefixes; there is no separate flag.
+      The legacy record of the batch scope, [{ rootDomain, prefixes[], hosts[],
+      wildcard }], recomputed server-side from domainBatchHosts at every save and
+      never trusted from a body. domainBatchHosts is the source of truth; the
+      scope every service reads is scopeGroups, which GET /api/projects/[id]
+      derives from it on each read. Kept for readers that have not moved and
+      for a rollback. A prefix is a subdomain label, or one of two sentinels:
+      "." meaning the scan root itself, and "*" meaning enumerate it.
     form_section: null
     deny_reason: internal
     written_by: "create_project, from domainBatchHosts"
@@ -2833,7 +2884,7 @@ fields:
     traffic: active
     roe_capped: false
     mcp: settable
-    bounds: { min: 0, max: 10 }
+    bounds: { min: 1, max: 5 }
     group: agent
     meaning: >-
       How strongly the agent leans toward deploying a fireteam over single-agent
@@ -4494,6 +4545,39 @@ fields:
     group: identity
     meaning: >-
       The project's primary key. Row identity, not configuration.
+  ipAttributionEnabled:
+    tool: ip_attribution
+    runtime_key: "IP_ATTRIBUTION_ENABLED"
+    unit: none
+    phase: http_probe
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    meaning: >-
+      Whether IP attribution runs. After the HTTP probe it tags every IP of the
+      run shared_edge (a CDN edge serving many tenants), dedicated (the
+      certificate it presents without SNI covers a target domain) or unknown,
+      never "not ours". Vhost/SNI skips its wordlist on a shared edge, origin
+      discovery never reports one as an origin, Shodan and Netlas write no CVE
+      on one, and the Priority Board caps the reach of findings on one. Off, IPs
+      keep no tag and those consumers fall back to their own CDN checks.
+  ipAttributionTlsMaxProbes:
+    tool: ip_attribution
+    runtime_key: "IP_ATTRIBUTION_TLS_MAX_PROBES"
+    unit: count
+    phase: http_probe
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    bounds: { min: 0, max: 5000 }
+    zero_means: disabled
+    stealth: { set: 0 }
+    meaning: >-
+      The most TLS handshakes without SNI IP attribution makes in one run, one per
+      IP where port 443 was found open, to read the certificate the IP falls back
+      to. 0 means no handshake at all: the tag then uses only the CDN signals the
+      run already holds. The handshakes skip RoE-excluded hosts and are paced at
+      the engagement rate ceiling, and stealth mode sets this to 0.
   ipMode:
     tool: targeting
     runtime_key: "IP_MODE"
@@ -4516,9 +4600,10 @@ fields:
     mcp: settable
     group: llm
     meaning: >-
-      Whether JS recon runs. Configuration is two levels: this flag decides
-      whether the tool runs INSIDE its phase, and scanModules decides whether the
-      phase runs at all. Setting one without the other is a silent no-op.
+      Whether JS recon looks for AI SDKs in the JS it analyzes: LLM and vector
+      database SDK imports, hard-coded provider keys, browser-mode opt-ins and
+      AI front-end markers. Sends no extra traffic. Does nothing while
+      jsReconEnabled is off.
   jsReconConcurrency:
     tool: js_recon
     runtime_key: "JS_RECON_CONCURRENCY"
@@ -4649,9 +4734,11 @@ fields:
     roe_capped: false
     mcp: settable
     meaning: >-
-      Whether JS recon runs. Configuration is two levels: this flag decides
-      whether the tool runs INSIDE its phase, and scanModules decides whether the
-      phase runs at all. Setting one without the other is a silent no-op.
+      Whether JS recon runs. This flag alone switches it on: JS recon is not a
+      scanModules phase. It runs after resource enumeration and analyzes the JS
+      files the crawlers and HTTP probing found (and any uploaded files), so
+      with neither resource_enum nor http_probe in scanModules it has nothing
+      to read.
   jsReconEndpointAcceptStatus:
     tool: js_recon
     runtime_key: "JS_RECON_ENDPOINT_ACCEPT_STATUS"
@@ -4766,9 +4853,10 @@ fields:
     governor: { model: budget, family: js_file, floor: 50 }
     group: not-tuning
     meaning: >-
-      The most results JS recon accumulates in one pass. The memory governor
-      budgets it against available RAM, so the effective value can be below what
-      is written here.
+      The most JS files JS recon downloads and analyzes in one run, shared
+      round-robin between hosts; files over the cap are recorded as a coverage
+      gap. The memory governor budgets it against available RAM, so the effective
+      value can be below what is written here.
   jsReconMinConfidence:
     tool: js_recon
     runtime_key: "JS_RECON_MIN_CONFIDENCE"
@@ -4919,9 +5007,9 @@ fields:
     roe_capped: false
     mcp: settable
     meaning: >-
-      Whether jsluice runs. Configuration is two levels: this flag decides whether
-      the tool runs INSIDE its phase, and scanModules decides whether the phase
-      runs at all. Setting one without the other is a silent no-op.
+      Whether jsluice runs. It runs inside resource enumeration, on the JS files
+      the crawlers found, so it is a silent no-op unless resource_enum is in
+      scanModules.
   jsluiceExcludePatterns:
     tool: jsluice
     runtime_key: "JSLUICE_EXCLUDE_PATTERNS"
@@ -6726,6 +6814,22 @@ fields:
       Whether Path traversal runs. Configuration is two levels: this flag decides
       whether the tool runs INSIDE its phase, and scanModules decides whether the
       phase runs at all. Setting one without the other is a silent no-op.
+  pathTraversalGitReconstructEnabled:
+    tool: path_traversal
+    runtime_key: null
+    unit: none
+    phase: standalone
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    group: attack
+    meaning: >-
+      Lets the path_traversal skill reconstruct a repository from an exposed .git
+      that recon's route exposure scan found: it walks the loose objects in the Kali
+      sandbox (500 objects, 20 MiB, 240 s at most), scans them for secrets, reports
+      counts and types only, and deletes them. Also needs data exfiltration allowed
+      in the Rules of Engagement. Takes effect only while route exposure is on. Off
+      by default.
   pathTraversalOobCallbackEnabled:
     tool: path_traversal
     runtime_key: null
@@ -6793,6 +6897,20 @@ fields:
       How long Path traversal may spend before it is abandoned, in seconds. A run
       that hits it contributes whatever it found so far rather than failing the
       scan.
+  pathTraversalValidateSecretsEnabled:
+    tool: path_traversal
+    runtime_key: null
+    unit: none
+    phase: standalone
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    group: egress
+    meaning: >-
+      Lets the path_traversal skill check a secret found in an exposed file with one
+      identity-only call to its provider (AWS, GitHub, GitLab, Slack). The provider
+      sees the call, and a canary token alerts its owner. Takes effect only while
+      route exposure is on. Off by default.
   phishingSmtpConfig:
     tool: phishing
     runtime_key: null
@@ -6932,6 +7050,21 @@ fields:
       Whether rce runs. Configuration is two levels: this flag decides whether the
       tool runs INSIDE its phase, and scanModules decides whether the phase runs
       at all. Setting one without the other is a silent no-op.
+  rceHeapdumpAnalysisEnabled:
+    tool: rce
+    runtime_key: null
+    unit: none
+    phase: standalone
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    group: attack
+    meaning: >-
+      Lets the rce skill download an exposed Spring heap dump once (512 MiB at
+      most), count the credential shapes in it, and delete it. Also needs data
+      exfiltration allowed and sensitive data handling above "no access" in the
+      Rules of Engagement. Takes effect only while route exposure is on. Off by
+      default.
   rceOobCallbackEnabled:
     tool: rce
     runtime_key: null
@@ -7415,9 +7548,12 @@ fields:
     group: engagement_limits
     meaning: >-
       Hosts that must never be touched even though they fall inside the target
-      scope. Enforced in three places in recon/main.py: expanded IPs, discovered
-      subdomains and the target domain itself. A non-empty list is one of the three
-      things that make the engagement limits live at all.
+      scope. Each entry is an exact host or IP; a domain, which also excludes its
+      subdomains; *.domain, which excludes its subdomains only; or a CIDR. Case,
+      port, scheme, path and a trailing dot are ignored. Enforced in three places
+      in recon/main.py: expanded IPs, discovered subdomains and the target domain
+      itself. A non-empty list is one of the three things that make the
+      engagement limits live at all.
     form_section: "TargetSection"
   roeForbiddenCategories:
     tool: roe
@@ -7434,9 +7570,9 @@ fields:
     meaning: >-
       Technique categories the agent may not run on this engagement. Each token
       is expanded to the tools that perform it and refused before the tool
-      executes (CATEGORY_TOOL_MAP in
-      agentic/orchestrator_helpers/nodes/execute_plan_node.py), and the list is
-      also withheld from the classifier's options. What each token covers:
+      executes, on every executor path (CATEGORY_TOOL_MAP in
+      agentic/orchestrator_helpers/roe_gate.py), and the list is also withheld
+      from the classifier's options. What each token covers:
       brute_force is any credential guessing, including brute forcing, password
       spraying and credential stuffing; dos is anything aimed at availability,
       including denial of service, resource exhaustion and volumetric or
@@ -7463,8 +7599,8 @@ fields:
     group: engagement_limits
     meaning: >-
       Tools the agent may not run on this engagement, by name, whatever their own
-      enable flag says. Refused before the tool executes, in
-      agentic/orchestrator_helpers/nodes/execute_plan_node.py. The vocabulary is
+      enable flag says. Refused before the tool executes, on every executor path,
+      by agentic/orchestrator_helpers/roe_gate.py. The vocabulary is
       closed to the agent's real tool names because that gate is an exact string
       match: a near-miss like "hydra" for execute_hydra never matches, and the tool
       runs with the ban recorded and unenforced.
@@ -7702,6 +7838,367 @@ fields:
     meaning: >-
       The IANA timezone the scanning window's times are read in.
     form_section: "TargetSection"
+  routeExposureBackupFiles:
+    tool: route_exposure
+    runtime_key: "ROUTE_EXPOSURE_BACKUP_FILES"
+    unit: none
+    phase: vuln_scan
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    group: attack
+    meaning: >-
+      Whether the route exposure scan guesses backup copies of the server-side files
+      recon found (name.bak, name~, .old, .orig, .save, .dist and the editor's
+      .name.swp) plus root archives and dumps (backup.zip, backup.tar.gz, site.zip,
+      db.sql, dump.sql, database.sql). Each guess is read with HEAD, then a 1 KB
+      Range request, never downloaded in full; an archive, SQL dump or PHP source
+      that differs from a made-up path and from the original file becomes a finding.
+      At most 40 guesses per host. On by default.
+  routeExposureCompareLoggedIn:
+    tool: route_exposure
+    runtime_key: "ROUTE_EXPOSURE_COMPARE_LOGGED_IN"
+    unit: none
+    phase: vuln_scan
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    group: attack
+    meaning: >-
+      Whether the route exposure scan also requests each route logged in, with the
+      project's authentication profile, wherever that profile covers the host (its
+      scope hosts, never an RoE-excluded host). The logged-in answer is sent
+      whatever the anonymous one was: it finds routes that return too much to their
+      own user (sensitive_data), and compares bodies to tell a personal page from a
+      public one. Without a profile nothing is sent logged in. Logged-in requests go
+      through the capture proxy only for bearer, basic and cookie profiles. On by
+      default.
+  routeExposureEnabled:
+    tool: route_exposure
+    runtime_key: "ROUTE_EXPOSURE_ENABLED"
+    unit: none
+    phase: vuln_scan
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    stealth: { set: false }
+    group: attack
+    meaning: >-
+      Whether the route exposure scan runs. It requests the routes recon found
+      (crawl, ffuf, kiterunner, OpenAPI, JS bundles) plus routes it generates,
+      anonymously and, where the authentication profile covers the host, logged in,
+      and writes two kinds of Vulnerability under source route_exposure: leads for
+      the agent to confirm (needs_agent_confirmation true, severity info: a route
+      answering without credentials where authentication was expected, or a response
+      carrying sensitive fields or other people's personal data) and findings a
+      signature proves (exposed .git, .env, web.config, backups, debug consoles and
+      endpoints, debug pages, route catalogs, secrets in a response). It sends GET
+      and HEAD only and never requests a logout, delete, reset or other state-
+      changing path. Personal data is stored as its types and one record count,
+      never a value. It runs in GROUP 6 Phase A whenever active scanning runs
+      (http_probe found live URLs), whatever scanModules says: there is no second
+      level. It needs the routes resource_enum (and js_recon, when on) found.
+  routeExposureMaxRoutesPerHost:
+    tool: route_exposure
+    runtime_key: "ROUTE_EXPOSURE_MAX_ROUTES_PER_HOST"
+    unit: count
+    phase: vuln_scan
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    bounds: { min: 10, max: 5000 }
+    group: attack
+    meaning: >-
+      The most routes the route exposure scan requests on one host, per scope group
+      of a Domain batch. Routes with a prior score of 5 or more (an OpenAPI security
+      declaration, a discovery tool's 401/403, an internal path word) and every
+      version-control or env guess go first; the rest are cut and counted as
+      budget_cut.
+  routeExposureMaxRoutesTotal:
+    tool: route_exposure
+    runtime_key: "ROUTE_EXPOSURE_MAX_ROUTES_TOTAL"
+    unit: count
+    phase: vuln_scan
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    bounds: { min: 50, max: 50000 }
+    group: attack
+    meaning: >-
+      The most routes the route exposure scan requests in one invocation, across all
+      hosts, per scope group of a Domain batch. Hosts take turns, so one host never
+      spends the whole budget.
+  routeExposureMaxRps:
+    tool: route_exposure
+    runtime_key: "ROUTE_EXPOSURE_MAX_RPS"
+    unit: rps
+    phase: vuln_scan
+    traffic: active
+    roe_capped: true
+    mcp: settable
+    bounds: { min: 1, max: 50 }
+    group: attack
+    meaning: >-
+      Requests per second the route exposure scan sends across all hosts, shared by
+      every worker and counting control requests, logged-in comparisons and backup
+      reads. It runs at the same time as the other Phase A scanners (nuclei, cache
+      poisoning, GraphQL), so the load on a target is the sum of their rates. One
+      clock serves the whole run, so a Domain batch's groups never reset it.
+  routeExposurePiiDetection:
+    tool: route_exposure
+    runtime_key: "ROUTE_EXPOSURE_PII_DETECTION"
+    unit: none
+    phase: vuln_scan
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    meaning: >-
+      Whether the route exposure scan looks for personal data in the answers it
+      reads: e-mail addresses, phone numbers and dates of birth under their keys,
+      card numbers passing Luhn, IBANs with a valid checksum, US SSNs and Italian
+      fiscal codes. It stores the kinds found and the largest count of distinct
+      values, never a value; three or more e-mails or phones in one answer mark
+      other people's records. Sends no extra request. On by default.
+  routeExposureSeedPaths:
+    tool: route_exposure
+    runtime_key: "ROUTE_EXPOSURE_SEED_PATHS"
+    unit: none
+    phase: vuln_scan
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    group: attack
+    meaning: >-
+      Whether the route exposure scan requests well-known internal, admin and debug
+      paths (/internal, /api/admin/users, /actuator/env, /console, /phpinfo.php ...)
+      at each base URL and under each API prefix recon saw (/api, /api/v1). At most
+      60 per host. On by default.
+  routeExposureTimeout:
+    tool: route_exposure
+    runtime_key: "ROUTE_EXPOSURE_TIMEOUT"
+    unit: seconds
+    phase: vuln_scan
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    bounds: { min: 2, max: 60 }
+    group: attack
+    meaning: >-
+      Seconds the route exposure scan waits for one answer. A route that times out
+      costs that route only; a host is skipped once it stops answering altogether.
+  routeExposureVcsFiles:
+    tool: route_exposure
+    runtime_key: "ROUTE_EXPOSURE_VCS_FILES"
+    unit: none
+    phase: vuln_scan
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    group: attack
+    meaning: >-
+      Whether the route exposure scan requests version-control and environment files
+      at each base URL and under each top-level directory recon saw (a nested
+      application): /.git/HEAD, /.git/config, /.svn/entries, /.svn/wc.db,
+      /.hg/requires, /.env, /.env.local, /.env.production, /.env.bak and
+      /web.config. At most 30 per host. These always get a request, ahead of the
+      budget. On by default.
+  routeExposureVersionVariants:
+    tool: route_exposure
+    runtime_key: "ROUTE_EXPOSURE_VERSION_VARIANTS"
+    unit: none
+    phase: vuln_scan
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    group: attack
+    meaning: >-
+      Whether the route exposure scan requests the older API versions of each
+      versioned route recon found: /api/v2/x is tried as /api/v1/x and /api/x, at
+      most 3 per route. An older version that answers anonymously while the newer
+      one is locked is a high-confidence lead. On by default.
+  routeExposureWorkers:
+    tool: route_exposure
+    runtime_key: "ROUTE_EXPOSURE_WORKERS"
+    unit: threads
+    phase: vuln_scan
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    bounds: { min: 1, max: 16 }
+    governor: { model: ratio, floor: 1 }
+    group: attack
+    meaning: >-
+      How many routes the route exposure scan requests at once. The request rate
+      stays capped by routeExposureMaxRps whatever this is. The memory governor
+      scales it down when the host is short of RAM, so the effective value can be
+      below what is written here.
+  routeExposureSiblings:
+    tool: route_exposure
+    runtime_key: "ROUTE_EXPOSURE_SIBLINGS"
+    unit: none
+    phase: vuln_scan
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    group: attack
+    meaning: >-
+      Whether the route exposure scan generates sibling routes from each harvested
+      API route: the collection (dropping a trailing id), its /export, /all and
+      /list, an admin or internal segment inserted after the API prefix, and an
+      /internal or /private prefix. At most 6 per route and 100 per host. On by
+      default.
+  routeExposureFrameworkSeeds:
+    tool: route_exposure
+    runtime_key: "ROUTE_EXPOSURE_FRAMEWORK_SEEDS"
+    unit: none
+    phase: vuln_scan
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    group: attack
+    meaning: >-
+      Whether the route exposure scan requests framework-specific debug and
+      management paths based on the technologies recon fingerprinted on the host:
+      Spring actuator endpoints (/actuator/env, /actuator/mappings, and
+      /actuator/heapdump with HEAD only), Django /admin, Laravel /telescope,
+      /horizon and /_ignition/health-check, Rails /rails/info/routes, Go
+      /debug/pprof, .NET /elmah.axd, PHP /phpinfo.php, Apache /server-status. At
+      most 30 per host. On by default.
+  routeExposureFollowCatalogs:
+    tool: route_exposure
+    runtime_key: "ROUTE_EXPOSURE_FOLLOW_CATALOGS"
+    unit: none
+    phase: vuln_scan
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    group: attack
+    meaning: >-
+      Whether, when the scan finds an open route catalog (an /actuator/mappings
+      document, an anonymously served OpenAPI or Swagger spec, /rails/info/routes),
+      it parses the routes it lists and requests them once, in a single follow-up
+      round that never recurses. At most 500 routes per host. On by default.
+  routeExposureGitWalk:
+    tool: route_exposure
+    runtime_key: "ROUTE_EXPOSURE_GIT_WALK"
+    unit: none
+    phase: vuln_scan
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    group: attack
+    meaning: >-
+      Whether, after an exposed /.git/HEAD is confirmed, the scan fetches the ref it
+      names and one loose commit object and inflates it with a bounded decompressor,
+      to prove the repository is reconstructable. At most 4 requests, each body at
+      most 64 KiB; it stores only the proof and the commit tree's hash prefix, and
+      never downloads the tree or blobs. On by default.
+  routeExposureCrossHost:
+    tool: route_exposure
+    runtime_key: "ROUTE_EXPOSURE_CROSS_HOST"
+    unit: none
+    phase: vuln_scan
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    group: attack
+    meaning: >-
+      Whether a path that produced a candidate or finding on one in-scope host is
+      tried on the other in-scope hosts that share its technology set or page title.
+      Each target host must still pass the scope and SSRF checks. At most 50
+      requests. Off by default, because it widens the traffic across hosts.
+  routeExposureCorsRider:
+    tool: route_exposure
+    runtime_key: "ROUTE_EXPOSURE_CORS_RIDER"
+    unit: none
+    phase: vuln_scan
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    group: attack
+    meaning: >-
+      Whether, on a logged-in route whose answer is personalised and sensitive, the
+      scan resends the request with crafted Origin headers (an attacker origin,
+      null, a suffix and a prefix variant) to detect a reflected origin returned
+      with credentials. At most 4 extra requests per route; it reads only the CORS
+      response headers and never a body. On by default.
+  routeExposureCacheRider:
+    tool: route_exposure
+    runtime_key: "ROUTE_EXPOSURE_CACHE_RIDER"
+    unit: none
+    phase: vuln_scan
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    group: attack
+    meaning: >-
+      Whether, on a logged-in route whose answer is personalised and sensitive, the
+      scan checks the response's cache headers and the cache oracle for a layer that
+      would let a logged-in page be served from cache to an anonymous visitor. It
+      never plants or fetches from cache; that proof is the agent's. On by default.
+  routeExposureJevRank:
+    tool: route_exposure
+    runtime_key: "ROUTE_EXPOSURE_JEV_RANK"
+    unit: none
+    phase: vuln_scan
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    group: llm
+    meaning: >-
+      Ranks the route exposure scan's routes with TypeSafe AI Jev (model jev-1.13.0):
+      false keeps the deterministic budget order (floor first, then the prior score),
+      true asks Jev, per route, whether it is meant only for logged-in, internal or
+      administrative callers, and its answer fills the budget after the floor: the
+      routes Jev reads as private are requested first, the ones it did not answer
+      follow by prior score. The answer is saved on each finding as
+      route_jev_privacy. It never drops a floor route and never invents one, and
+      when Jev cannot answer the order is the deterministic one. Takes effect only
+      when aiInPipeline and routeExposureEnabled are both true, and aiInPipeline does
+      not reset it. Needs a Jev token on the project owner's account. At most 400 routes
+      per scan, sent as path, method, a closed category and four flags.
+  routeExposureJevWallCheck:
+    tool: route_exposure
+    runtime_key: "ROUTE_EXPOSURE_JEV_WALL_CHECK"
+    unit: none
+    phase: vuln_scan
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    group: llm
+    meaning: >-
+      Asks TypeSafe AI Jev (model jev-1.13.0) whether an HTML page the route exposure
+      scan kept as a lead is really a login form, an error page or a placeholder
+      that the deterministic page check could not place: false keeps the
+      deterministic verdict only, true saves Jev's page class on the lead
+      (anon_page_class) and puts a lead Jev places as a wall (a non-app class at
+      confidence 70 or more) last in the order the agent confirms; it never drops a
+      lead. The page body reaches Jev masked and capped. Takes effect only when
+      aiInPipeline and routeExposureEnabled are both true, and aiInPipeline does not
+      reset it. Needs a Jev token on the project owner's account. At most 100 pages
+      per scan, 4 per call, within a 60-second budget.
+  routeExposureJevAssess:
+    tool: route_exposure
+    runtime_key: "ROUTE_EXPOSURE_JEV_ASSESS"
+    unit: none
+    phase: vuln_scan
+    traffic: active
+    roe_capped: false
+    mcp: settable
+    group: llm
+    meaning: >-
+      Assesses each route exposure lead with TypeSafe AI Jev (model jev-1.13.0):
+      false keeps the deterministic route class only, true asks Jev which kind of
+      route it is and how sensitive what it returns is, from the evidence alone (the
+      statuses, content class, masked key names and closed hints, never the route
+      class or a value). Both answers are saved on the lead (route_jev_kind,
+      route_jev_sensitivity) and the agent confirms the leads most sensitive first,
+      a lead Jev reads as public content at confidence 70 or more last. It never
+      drops a lead and never rewrites its route class. Takes effect only when
+      aiInPipeline and routeExposureEnabled are both true, and aiInPipeline does not
+      reset it. Needs a Jev token on the project owner's account. At most 200 leads
+      per scan, one Jev request each, 4 per call, within a
+      60-second budget.
   scaIntelCorrelationEnabled:
     tool: supply_chain_recon
     runtime_key: "SCA_INTEL_CORRELATION_ENABLED"
@@ -7728,7 +8225,9 @@ fields:
     validator: scan_modules
     meaning: >-
       Pipeline phases to run. Values: "domain_discovery", "port_scan",
-      "http_probe", "resource_enum", "vuln_scan", "js_recon"
+      "http_probe", "resource_enum", "vuln_scan". "js_recon" is still accepted
+      so older projects and presets load, but it does nothing: JS recon runs on
+      jsReconEnabled alone.
   securityCheckAdminPortExposed:
     tool: security_check
     runtime_key: "SECURITY_CHECK_ADMIN_PORT_EXPOSED"
@@ -10672,6 +11171,16 @@ runtime_only:
     meaning: >-
       The project whose settings were loaded. Written by the loader, never
       configured.
+  SCOPE_GROUPS:
+    source: internal
+    tool: targeting
+    unit: none
+    roe_capped: false
+    meaning: >-
+      The project's scope as scan-root groups, read from the scopeGroups field
+      the webapp derives on every GET, then re-validated by recon (charset and
+      its own Public Suffix List). A batch with no usable group, or a target
+      that is a public suffix, refuses the run. Never configured.
   SECURITYTRAILS_API_KEY:
     source: user_account
     tool: osint_enrichment

@@ -37,7 +37,7 @@ SKILL_PATH = _AGENTIC_DIR / "community-skills" / f"{SKILL_ID}.md"
 COMMUNITY_DIR = _AGENTIC_DIR / "community-skills"
 
 # Hard caps from the import surface
-MAX_CONTENT_BYTES = 50 * 1024            # webapp/src/app/api/users/[id]/attack-skills/route.ts
+MAX_CONTENT_BYTES = 500 * 1024           # MAX_CONTENT_SIZE in webapp/src/lib/userSkills.ts
 MAX_DESCRIPTION_CHARS = 200              # agentic/api.py list_community_skills slice
 
 # Real agent tool names per the integration brief
@@ -64,10 +64,10 @@ class TestFilePresence(unittest.TestCase):
                         f"Expected community skill file at {SKILL_PATH}")
         self.assertTrue(SKILL_PATH.is_file())
 
-    def test_skill_file_under_50kb_cap(self):
+    def test_skill_file_under_import_cap(self):
         size = SKILL_PATH.stat().st_size
         self.assertLess(size, MAX_CONTENT_BYTES,
-                        f"File size {size} exceeds 50 KB import cap "
+                        f"File size {size} exceeds 500 KB import cap "
                         f"(POST /api/users/.../attack-skills validates this)")
 
     def test_skill_file_not_trivially_small(self):
@@ -164,10 +164,10 @@ class TestContentRules(unittest.TestCase):
                          f"Add them to KNOWN_AGENT_TOOLS if real, or fix the skill.")
 
     def test_no_unbacked_missing_kali_tools(self):
-        # The brief said missing tools are "None". The Kali image does NOT bundle
-        # grpcurl, websocat, wscat, or clairvoyance. If the skill mentions them,
-        # there must be an explicit fallback note nearby.
-        for tool in ("grpcurl", "websocat", "wscat", "clairvoyance"):
+        # The Kali image does NOT bundle grpcurl, websocat or wscat (clairvoyance
+        # it does). If the skill mentions them, there must be an explicit
+        # fallback note nearby.
+        for tool in ("grpcurl", "websocat", "wscat"):
             if tool in self.content:
                 # Look for a fallback note in the same file
                 self.assertRegex(

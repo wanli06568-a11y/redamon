@@ -37,12 +37,16 @@ def extract_targets_from_recon(recon_data: dict) -> Tuple[Set[str], Set[str], Di
         return ips, hostnames, ip_to_hostnames
 
     metadata = recon_data.get("metadata") or {}
-    include_root_domain = metadata.get("include_root_domain", True)
+    # A file written before scope_mode existed keeps the old default (the apex
+    # is in scope); a current one always stamps the flag.
+    include_root_domain = metadata.get("include_root_domain", "scope_mode" not in metadata)
 
     # Extract from root domain
     domain = recon_data.get("domain", "") or metadata.get("target", "")
     domain_dns = dns_data.get("domain", {})
-    if domain_dns:
+    if domain_dns and include_root_domain:
+        # The apex's IPs only with the apex: an address it resolves to is not a
+        # target when the operator left the root out.
         domain_ips = domain_dns.get("ips", {})
         ipv4_list = domain_ips.get("ipv4", [])
         ipv6_list = domain_ips.get("ipv6", [])
@@ -120,9 +124,34 @@ def build_target_urls_from_httpx(httpx_data: Optional[dict]) -> List[str]:
 # URL Building from Resource Enumeration Data
 # =============================================================================
 
+#: Endpoints known only from an API specification sent to nuclei per run. Both
+#: nuclei passes (main detection and DAST) read this function, so the cap bounds
+#: both; a specification can declare thousands of operations.
+MAX_DECLARED_NUCLEI_URLS = 500
+
+
+def _endpoint_url(base_url: str, path: str, endpoint_info: dict) -> str:
+    """The URL with sample query values for GET-style scanning, else the bare path."""
+    params = (endpoint_info.get("parameters") or {}).get("query") or []
+    parts = []
+    for param in params:
+        name = param.get("name")
+        if not name:
+            continue
+        sample_values = param.get("sample_values") or []
+        parts.append(f"{name}={sample_values[0] if sample_values else '1'}")
+    return f"{base_url}{path}?{'&'.join(parts)}" if parts else f"{base_url}{path}"
+
+
 def build_target_urls_from_resource_enum(resource_enum_data: Optional[dict]) -> Tuple[List[str], List[str]]:
     """
     Build list of target URLs from resource_enum data.
+
+    A path that still holds a template (``/users/{id}``) is never a target. An
+    endpoint known only from an API specification (``declared_only``) is a
+    target only when it declares GET or HEAD, and at most
+    MAX_DECLARED_NUCLEI_URLS of them are, in (base URL, path) order; how many
+    were left out is recorded on the run's OpenAPI inventory.
 
     Args:
         resource_enum_data: Resource enumeration data with endpoints
@@ -137,31 +166,33 @@ def build_target_urls_from_resource_enum(resource_enum_data: Optional[dict]) -> 
         return base_urls, endpoint_urls
 
     by_base_url = resource_enum_data.get("by_base_url", {})
+    declared = []
 
     for base_url, base_data in by_base_url.items():
         base_urls.append(base_url)
 
         endpoints = base_data.get("endpoints", {})
         for path, endpoint_info in endpoints.items():
-            # Build URLs with sample parameter values for GET endpoints
-            parameters = endpoint_info.get("parameters", {})
-            query_params = parameters.get("query", [])
+            if "{" in path:
+                continue
+            url = _endpoint_url(base_url, path, endpoint_info)
+            if endpoint_info.get("declared_only") is True:
+                methods = {str(m).upper() for m in endpoint_info.get("methods") or []}
+                if methods & {"GET", "HEAD"}:
+                    declared.append((base_url, path, url))
+                continue
+            endpoint_urls.append(url)
 
-            if query_params:
-                # Build URL with parameters
-                param_parts = []
-                for param in query_params:
-                    name = param.get("name")
-                    sample_values = param.get("sample_values", [])
-                    value = sample_values[0] if sample_values else "1"
-                    param_parts.append(f"{name}={value}")
-
-                if param_parts:
-                    full_url = f"{base_url}{path}?{'&'.join(param_parts)}"
-                    endpoint_urls.append(full_url)
-            else:
-                # Add path without params
-                endpoint_urls.append(f"{base_url}{path}")
+    declared.sort(key=lambda item: (item[0], item[1]))
+    endpoint_urls.extend(url for _, _, url in declared[:MAX_DECLARED_NUCLEI_URLS])
+    overflow = max(0, len(declared) - MAX_DECLARED_NUCLEI_URLS)
+    if overflow:
+        print(f"[-][OpenAPI] {overflow} declared endpoints not sent to nuclei (cap {MAX_DECLARED_NUCLEI_URLS})")
+        openapi = resource_enum_data.get("openapi")
+        groups = openapi.get("groups") if isinstance(openapi, dict) else None
+        if groups:
+            # This run's own group: a batch group's file holds only its own.
+            groups[-1]["declared_not_sent_to_nuclei"] = overflow
 
     return base_urls, endpoint_urls
 
@@ -394,10 +425,12 @@ def _san_resolve_cache():
 def _resolves_to_routable(hostname: str) -> bool:
     """Resolve-and-check for a SAN-derived name.
 
-    Returns False ONLY when the name resolves to at least one non-routable
-    address (the SSRF / scope-escape case we must drop). An unresolvable name
-    returns True: it is in scope and cannot be an internal pivot; it simply will
-    not be probed if nothing answers.
+    Returns False when the name resolves to at least one non-routable address
+    (the SSRF / scope-escape case we must drop), and while the resolver is
+    known down: then the name cannot be checked, and httpx and Nuclei would
+    resolve it themselves, so it is recorded as a skipped host and not
+    injected. An unresolvable name returns True: it is in scope and cannot be
+    an internal pivot; it simply will not be probed if nothing answers.
     """
     import socket
     from recon.main_recon_modules.ip_filter import is_non_routable_ip
@@ -413,11 +446,16 @@ def _resolves_to_routable(hostname: str) -> bool:
             cache.put(hostname, result)
         return result
 
-    # A resolver already proven down would make every getaddrinfo a timeout;
-    # an unresolved name is in scope anyway, so keep it without resolving (and
-    # don't cache it - the resolver may recover and a later pass can resolve it).
+    # A resolver already proven down would make every getaddrinfo a timeout.
+    # Fail closed, uncached: the resolver may recover and a later pass can
+    # resolve the name.
     if _resolver_down():
-        return True
+        try:
+            from recon.main_recon_modules.domain_recon import resolver_breaker
+            resolver_breaker.note_skipped(hostname)
+        except Exception:  # noqa: BLE001
+            pass
+        return False
 
     try:
         infos = socket.getaddrinfo(hostname, None)
@@ -433,6 +471,23 @@ def _resolves_to_routable(hostname: str) -> bool:
     return _remember(True)
 
 
+def injection_scope(recon_data: dict) -> Optional[dict]:
+    """What a group lets a discovered name join (§4.6 hostname injection), from
+    the recon dict's metadata, or None for a file written before scope_mode.
+
+    ``{"mode": "exact"}`` admits nothing; ``{"mode": "enumerate", "scan_root",
+    "include_root"}`` admits strict subdomains of the scan root, and the root
+    itself only when it is a target.
+    """
+    metadata = (recon_data or {}).get("metadata") or {}
+    mode = metadata.get("scope_mode")
+    if mode not in ("exact", "enumerate"):
+        return None
+    return {"mode": mode,
+            "scan_root": str(metadata.get("root_domain") or recon_data.get("domain") or "").lower(),
+            "include_root": bool(metadata.get("include_root_domain"))}
+
+
 def merge_discovered_hostnames(
     combined_result: dict,
     hostnames: list,
@@ -440,6 +495,7 @@ def merge_discovered_hostnames(
     root_domain=None,
     settings: Optional[dict] = None,
     max_injected: Optional[int] = None,
+    scope: Optional[dict] = None,
 ) -> dict:
     """Merge discovered hostnames into ``dns.subdomains`` (the DICT shape read by
     ``extract_targets_from_recon``) + ``discovered_external_domains``, mirroring
@@ -458,11 +514,19 @@ def merge_discovered_hostnames(
          into the newline-delimited target files).
       4. Resolve-and-check: drop any name resolving to a non-routable IP.
       5. Cap the injected count (``max_injected``).
+      6. Wildcard DNS (``wildcard_control``): drop a name that answers only
+         through its zone's wildcard. The zones checked are recorded in
+         ``combined_result["wildcard_zones"]``.
 
     Fails closed: without ``root_domain`` nothing is injected (names are still
     recorded as external), because there is no apex to test against — e.g. batch
     mode, where ``metadata['root_domain']`` is deliberately empty (a joined
     string once became a literal scan target).
+
+    ``scope`` (default: ``injection_scope(combined_result)``) narrows step 1 to
+    the group's rule: an EXACT group injects nothing, since it scans exactly
+    the hosts the operator listed; an ENUMERATE group injects strict
+    subdomains of its scan root, and the root only when it is a target.
     """
     settings = settings or {}
     result = combined_result
@@ -502,6 +566,21 @@ def merge_discovered_hostnames(
         else:
             _record_external(name)
 
+    # 1b. The group's own rule.
+    if scope is None:
+        scope = injection_scope(result)
+    if scope is not None:
+        before = len(in_scope)
+        if scope["mode"] == "exact":
+            in_scope = []
+        else:
+            sr = scope["scan_root"]
+            in_scope = [n for n in in_scope
+                        if n.endswith("." + sr) or (n == sr and scope["include_root"])]
+        if before != len(in_scope):
+            print(f"[*][{source}] {before - len(in_scope)} name(s) not injected: outside "
+                  f"this group's {scope['mode']} scope")
+
     # 2. RoE narrowing pass.
     from recon.helpers.roe_scope import _filter_roe_excluded
     in_scope = _filter_roe_excluded(in_scope, settings, label="SAN hostname")
@@ -526,6 +605,16 @@ def merge_discovered_hostnames(
 
     # 5. Resolve-and-check (SAN-derived names only, never the port-scan list).
     in_scope = [n for n in in_scope if _resolves_to_routable(n)]
+
+    # 6. Wildcard DNS: these names arrive after puredns, so they get RedAmon's
+    # own check. A name that answers only through its zone's wildcard is no
+    # evidence of a host.
+    if in_scope:
+        from recon.helpers import wildcard_control
+        control = wildcard_control.filter_late_names(in_scope, roots, settings, label=source)
+        in_scope = control.kept
+        if control.zones:
+            result.setdefault("wildcard_zones", {}).update(control.zones)
 
     # Merge in-scope names into dns.subdomains (the DICT shape). Only in-scope
     # names reach here, so the eventual HAS_SUBDOMAIN edge cannot promote a

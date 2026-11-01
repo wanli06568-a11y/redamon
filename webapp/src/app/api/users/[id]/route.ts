@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
+import { projectTargetLabel } from '@/lib/projectSummary'
 import prisma from '@/lib/prisma'
 import { getSession, isInternalRequest } from '@/lib/session'
+import { internalError } from '@/lib/routeErrors'
 
 interface RouteParams {
   params: Promise<{ id: string }>
@@ -39,6 +41,11 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
             id: true,
             name: true,
             targetDomain: true,
+            ipMode: true,
+            targetIps: true,
+            subdomainList: true,
+            domainBatchMode: true,
+            domainBatchHosts: true,
             createdAt: true,
             updatedAt: true
           }
@@ -53,13 +60,16 @@ export async function GET(request: NextRequest, { params }: RouteParams) {
       )
     }
 
-    return NextResponse.json(user)
+    // A batch has no targetDomain: each project row carries its scope label.
+    return NextResponse.json({
+      ...user,
+      projects: user.projects.map(({ ipMode, targetIps, subdomainList, domainBatchMode, domainBatchHosts, ...p }) => ({
+        ...p,
+        targetLabel: projectTargetLabel({ ...p, ipMode, targetIps, subdomainList, domainBatchMode, domainBatchHosts }),
+      })),
+    })
   } catch (error) {
-    console.error('Failed to fetch user:', error)
-    return NextResponse.json(
-      { error: 'Failed to fetch user' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to fetch user')
   }
 }
 
@@ -114,8 +124,6 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
 
     return NextResponse.json(user)
   } catch (error: unknown) {
-    console.error('Failed to update user:', error)
-
     if (error && typeof error === 'object' && 'code' in error && error.code === 'P2025') {
       return NextResponse.json(
         { error: 'User not found' },
@@ -123,10 +131,7 @@ export async function PUT(request: NextRequest, { params }: RouteParams) {
       )
     }
 
-    return NextResponse.json(
-      { error: 'Failed to update user' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to update user')
   }
 }
 
@@ -179,8 +184,6 @@ export async function DELETE(request: NextRequest, { params }: RouteParams) {
 
     return NextResponse.json({ success: true })
   } catch (error: unknown) {
-    console.error('Failed to delete user:', error)
-
     if (error && typeof error === 'object' && 'code' in error && error.code === 'P2025') {
       return NextResponse.json(
         { error: 'User not found' },
@@ -188,9 +191,6 @@ export async function DELETE(request: NextRequest, { params }: RouteParams) {
       )
     }
 
-    return NextResponse.json(
-      { error: 'Failed to delete user' },
-      { status: 500 }
-    )
+    return internalError(error, 'Failed to delete user')
   }
 }

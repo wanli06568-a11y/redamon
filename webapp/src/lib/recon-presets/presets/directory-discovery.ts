@@ -21,6 +21,7 @@ Pentesters and bug bounty hunters in the early recon phase who want a complete m
 - Hakrawler depth 4 for complementary DOM-aware crawling (1000 URLs)
 - GAU with all 4 providers for historical URL mining (5000 URLs)
 - jsluice for extracting endpoints and secrets from JavaScript files
+- OpenAPI import with Auto-discover: API specification documents found on live hosts become declared endpoints and parameters (never called; later scanners request them with GET or HEAD only)
 
 ### What it disables
 - Port scanning (Naabu, Masscan, Nmap) -- content discovery targets known HTTP endpoints
@@ -74,6 +75,7 @@ Pentesters and bug bounty hunters in the early recon phase who want a complete m
 
     // --- httpx: essential probes only ---
     httpxEnabled: true,
+    ipAttributionEnabled: true,
     httpxThreads: 50,
     httpxTimeout: 15,
     httpxRetries: 2,
@@ -170,6 +172,7 @@ Pentesters and bug bounty hunters in the early recon phase who want a complete m
 
     // --- Kiterunner: API route brute-forcing ---
     kiterunnerEnabled: true,
+    openapiAutoDiscover: true,
     kiterunnerWordlists: ['routes-large'],
     kiterunnerRateLimit: 150,
     kiterunnerConnections: 150,

@@ -6,12 +6,14 @@
   <b><i><big><big>Unmask the hidden before the world does</big></big></i></b>
 </p>
 <p align="center" style="font-size: 120%;">
-  An autonomous AI framework that chains reconnaissance, exploitation, and post-exploitation into a single pipeline, then goes further by triaging every finding, implementing code fixes, and opening pull requests on your repository. From first packet to merged patch, with human oversight at every critical step.
+  <b>RedAmon is an open-source, self-hosted AI penetration testing framework</b> that maps your attack surface into a graph, autonomously exploits it from a Kali sandbox with human approval gates, and opens pull requests that fix what it finds. From first packet to merged patch, with human oversight at every critical step.
 </p>
 
 <br/>
 
 <p align="center">
+  <a href="https://www.nviso.eu/" target="_blank" rel="sponsored noopener noreferrer"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/assets/nviso-logo-dark.svg"/><img src="docs/assets/nviso-logo.svg" alt="Sponsored by NVISO" height="55"/></picture></a>
+  &nbsp;&nbsp;&nbsp;&nbsp;
   <a href="https://trendshift.io/repositories/21794?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-21794" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/21794/daily?language=Python" alt="samugit83%2Fredamon | Trendshift" width="250" height="55"/></a>
 </p>
 
@@ -24,7 +26,7 @@
 
 <p align="center">
   <a href="https://github.com/samugit83/redamon/stargazers"><img height="24" src="https://img.shields.io/github/stars/samugit83/redamon?style=flat&color=2E8B57&label=Stars" alt="GitHub Stars"/></a>
-  <img height="24" src="https://img.shields.io/badge/v7.0.2-release-2E8B57?style=flat" alt="Version 7.0.2"/>
+  <img height="24" src="https://img.shields.io/badge/v7.5.0-release-2E8B57?style=flat" alt="Version 7.5.0"/>
   <img height="24" src="https://img.shields.io/badge/WARNING-SECURITY%20TOOL-B22222?style=flat" alt="Security Tool Warning"/>
   <img height="24" src="https://img.shields.io/badge/LICENSE-MIT-4169A1?style=flat" alt="MIT License"/>
   <img height="24" src="https://img.shields.io/badge/AI-AUTONOMOUS%20AGENT-6A5ACD?style=flat&logo=openai&logoColor=white" alt="AI Powered"/>
@@ -142,10 +144,12 @@ That's it. No Node.js, Python, or security tools needed on your host.
 | Resource | Without OpenVAS | With OpenVAS (full stack) |
 |----------|----------------|--------------------------|
 | **CPU** | 2 cores | 4 cores |
-| **RAM** | 4 GB | 8 GB (16 GB recommended) |
+| **RAM** | 7 GB | 10 GB (16 GB recommended) |
 | **Disk** | 80 GB free | 110 GB free |
 
-> **Without OpenVAS** runs 7 containers: webapp, postgres, neo4j, agent, kali-sandbox, recon-orchestrator, and docker-broker (a filtering Docker-socket proxy that the recon orchestrator's spawned scan containers go through, so they can only launch the known tool images).
+> **RAM is checked at start.** `./redamon.sh` refuses to start when the memory Docker can use does not cover the minimum of every service the profile runs (the memory allocator's per-service floors, see [README.MEMORY_GOVERNOR.md](docs/readmes/README.MEMORY_GOVERNOR.md)). With the default reserves that is about 6.5 GB for the core stack and about 9.6 GB with OpenVAS. `REDAMON_SKIP_RAM_GATE=1` skips the check.
+
+> **Without OpenVAS** runs 9 containers: webapp, postgres, neo4j, agent, kali-sandbox, recon-orchestrator, docker-broker (a filtering Docker-socket proxy that the recon orchestrator's spawned scan containers go through, so they can only launch the known tool images), and the plugin platform's plugin-runner and plugin-gateway.
 > **With OpenVAS** adds 4 more runtime containers (gvmd, ospd-openvas, gvm-postgres, gvm-redis) plus ~8 one-shot data-init containers for vulnerability feeds (~170K+ NVTs). First launch takes ~30 minutes for GVM feed synchronization.
 > Dynamic recon and scan containers are spawned on-demand during operations and require additional resources.
 
@@ -439,10 +443,10 @@ The platform is built around six pillars:
 |--------|-------------|
 | **Reconnaissance Pipeline** | A **parallelized fan-out / fan-in** scanning pipeline that maps your target's entire attack surface (starting from a single domain, **IP addresses / CIDR ranges**, or a **Domain batch** of many domains scanned in turn) from subdomain discovery (5 concurrent tools) through port scanning, Nmap service detection and NSE vulnerability scripts, HTTP probing, resource enumeration, and vulnerability detection. Independent modules run concurrently via `ThreadPoolExecutor`, graph DB updates happen in a background thread, and results are stored as a rich, queryable graph. Complemented by standalone GVM network scanning, GitHub secret hunting, and Secret Multiscanner deep secret scanning modules. |
 | **AI Agent Orchestrator** | A LangGraph-based autonomous agent that reasons about the graph, selects security tools via MCP, transitions through informational / exploitation / post-exploitation phases, and can be steered in real-time via chat. |
-| **Attack Surface Graph** | A Neo4j knowledge graph with 17 node types and 20+ relationship types that serves as the single source of truth for every finding, and the primary data source the AI agent queries before every decision. |
+| **Attack Surface Graph** | A Neo4j knowledge graph (every node type and relationship is declared once, in [graph_db/schema_sections.md](graph_db/schema_sections.md)) that serves as the single source of truth for every finding, and the primary data source the AI agent queries before every decision. |
 | **EvoGraph** | A persistent, evolutionary attack chain graph in Neo4j that tracks every step, finding, decision, and failure across the attack lifecycle, bridging the recon graph and enabling cross-session intelligence accumulation. |
 | **CypherFix** | Automated vulnerability remediation pipeline: one triage run scores every finding from the graph with a fixed risk model, groups the ones that share a fix, has an LLM check the evidence behind each, and writes one fix item per group. A CodeFix agent then clones the target repository, implements a fix using a ReAct loop with 11 code tools, and opens a GitHub pull request. |
-| **Project Settings Engine** | 500+ per-project parameters (exposed through the webapp UI) that control every tool's behavior, from Naabu thread counts to Nuclei severity filters to agent approval gates. |
+| **Project Settings Engine** | Hundreds of per-project parameters (exposed through the webapp UI, each one listed in the generated [Project Settings Registry](https://github.com/samugit83/redamon/wiki/Project-Settings-Registry)) that control every tool's behavior, from Naabu thread counts to Nuclei severity filters to agent approval gates. |
 
 ---
 
@@ -452,7 +456,7 @@ RedAmon is engineered to drop into a real security organization, not just a rese
 
 - **Secure by design, STRIDE threat-modeled.** The whole platform is assessed end to end under STRIDE and hardened in independently verified waves: code-level privilege separation, a filtering Docker broker in front of the host socket, fail-closed auth, SSRF egress guards, secret redaction, append-only audit trails, and a non-disableable guardrail that blocks government, military, and intergovernmental targets. See the [Security Posture](docs/readmes/README.SECURITY_POSTURE.md) and [Threat Model](docs/readmes/README.TM.SYSTEM_OVERVIEW.md).
 - **Fully isolated and containerized.** Every tool, scanner, and agent runs in its own container with no host-level execution. Scan jobs are spawned as ephemeral sibling containers with their own filesystem and network namespace, then torn down on completion, keeping the host clean and containing the blast radius of any exploit.
-- **Governed and multi-tenant.** Multi-user / multi-project tenancy with admin and standard roles, DB-level `user_id + project_id` scoping on every node, Rules-of-Engagement enforcement, human-in-the-loop approval gates, and 500+ per-project settings give teams the control an enterprise engagement requires.
+- **Governed and multi-tenant.** Multi-user / multi-project tenancy with admin and standard roles, DB-level `user_id + project_id` scoping on every node, Rules-of-Engagement enforcement, human-in-the-loop approval gates, and hundreds of per-project settings give teams the control an enterprise engagement requires.
 
 **Deploy to a server in one command.** Beyond local `localhost`, RedAmon ships a hardened [single-host deploy](tooling/deploy/single-host/) that stands up a shared, internet-reachable instance and wraps the stack in nginx + TLS (Let's Encrypt), a host firewall, SSH hardening, and fail2ban, exposing a single public HTTPS origin:
 
@@ -493,6 +497,10 @@ Found a vulnerability? See our [Security Policy](SECURITY.md) for private disclo
 
 ### Reconnaissance Pipeline
 
+<p align="center">
+  <a href="https://www.redamon.org/how-the-recon-pipeline-works"><img height="34" src="https://img.shields.io/badge/%E2%96%B6_Interactive_Walkthrough-Inside_the_Recon_Pipeline-A01025?style=for-the-badge&labelColor=000000" alt="Interactive walkthrough: Inside the Recon Pipeline"/></a>
+</p>
+
 A fully automated, end-to-end **external attack-surface mapper** running inside a Kali Linux container. Give it one input (a root domain, a subdomain list, IP/CIDR ranges, or a Domain batch: a list of hostnames grouped by domain and scanned one group after another into a single graph) and the pipeline returns a complete, structured picture of the target: every subdomain, every live host, every open port, every HTTP service with its technology stack, every crawled endpoint and discovered parameter, every CVE the target is likely vulnerable to, plus dedicated scanners for **GraphQL APIs**, **subdomain takeovers**, **hidden virtual hosts** behind reverse proxies, **web cache poisoning & deception**, and an **Adversarial AI Surface** layer that tags AI runtimes / vector DBs / LLM frontends / proxies / MCP servers / chat / completion / embedding / RAG endpoints and prompt-injectable parameters using header / favicon / title / path / parameter-name signatures, then **actively confirms** them with a dedicated **AI Surface Recon** module (benign chat-shape probes, MCP handshake + tool-poisoning scan, vector-DB reads — no LLM calls).
 
 Everything runs on a **fan-out / fan-in** architecture: each phase fires as many tools in parallel as the work allows, then converges before the next phase begins. **40+ industry tools** integrate into one coordinated workflow, wildcard DNS poisoning is filtered out automatically with puredns, and **stealth mode** keeps the entire pipeline running on passive sources only when active probing is off-limits. Findings stream into the **Neo4j knowledge graph** on a background thread so the scan never blocks on database writes, and the raw JSON is preserved for download. The detailed tool-by-tool breakdown is in the matrix below.
@@ -528,6 +536,7 @@ Everything runs on a **fan-out / fan-in** architecture: each phase fires as many
 | | **Browser Crawling** | ZAP Ajax Spider | Active | Sequential (post-FFuf), per-seed Docker containers in parallel |
 | | **Parameter Discovery** | Arjun | Active / Passive | Methods parallel (GET/POST/JSON/XML) |
 | | **API Discovery** | Kiterunner | Active | Sequential per wordlist |
+| | **API Specification Import** | OpenAPI / Swagger (declared endpoints, never called) | Active (documents only) | Sequential (after the other sources) |
 | | **Endpoint AI Classifier** | Path + parameter classifier — tags `Endpoint.ai_interface_type` (`llm-chat`, `llm-completion`, `llm-embedding`, `llm-tool-call`, `sse-stream`, `mcp`, `llm-graphql`), `is_ai_rag_ingest`, `Parameter.is_ai_prompt_injectable` against catalogued AI signatures | Passive | Sequential (post-crawl) |
 | **JS Recon** | **JS Secret Detection** | 100 regex patterns + custom uploads | Passive | Parallel per file |
 | | **Key Validation** | 21 service validators (AWS, GitHub, Stripe, etc.) | Active | Rate-limited (1/sec/svc) |
@@ -543,11 +552,12 @@ Everything runs on a **fan-out / fan-in** architecture: each phase fires as many
 | | **Multi-Turn Jailbreaks** | PyRIT — bounded conversational attacks (crescendo, skeleton-key, TAP, many-shot) | Active (offensive) | Multi-turn escalation, local attacker / judge model |
 | | **Quality + Safety Scan** | Giskard — app-tailored detectors (prompt injection, information disclosure, hallucination, harmfulness, stereotypes, sycophancy, output formatting) | Active (offensive) | Test set generated from the app purpose, local judge |
 | | **Red-Team Eval** | promptfoo — public attack datasets (Pliny, BeaverTails, HarmBench) + encoding strategies (base64, rot13, leetspeak, morse, pig latin) | Active (offensive) | Dataset eval, ASR per plugin, local judge |
-| **Vulnerability Scanning** | **Vulnerability Scanning** | Nuclei (9,000+ templates + DAST + custom template upload) | Active | Parallel with GraphQL Scan + Subdomain Takeover + VHost & SNI + Web Cache Poisoning + Origin Discovery (GROUP 6 Phase A) |
+| **Vulnerability Scanning** | **Vulnerability Scanning** | Nuclei (12,000+ templates + DAST + custom template upload) | Active | Parallel with GraphQL Scan + Subdomain Takeover + VHost & SNI + Web Cache Poisoning + Origin Discovery (GROUP 6 Phase A) |
 | **GraphQL Security** | **GraphQL Security Testing** | Endpoint discovery, introspection test, schema extraction, sensitive-field detection, graphql-cop (12 misconfig checks: alias/batch/directive DoS, GraphiQL, trace mode, GET/POST CSRF, field suggestions) | Active / Passive | Parallel with Nuclei + Subdomain Takeover + VHost & SNI + Web Cache Poisoning + Origin Discovery (GROUP 6 Phase A) |
 | **Subdomain Takeover** | **Subdomain Takeover Detection** | Subjack (Apache-2.0 DNS-first fingerprints) + Nuclei takeover templates (`http/takeovers/` + `dns/`) + BadDNS (AGPL-3.0 isolated sidecar: CNAME, NS, MX, TXT, SPF, DMARC, wildcard, NSEC, references, zonetransfer). Cross-tool dedup, 12+ auto-exploitable providers, confidence-scored `confirmed` / `likely` / `manual_review` verdicts | Active / Passive | Parallel with Nuclei + GraphQL Scan + VHost & SNI + Web Cache Poisoning + Origin Discovery (GROUP 6 Phase A) |
 | **VHost & SNI Enumeration** | **Hidden Virtual Host Discovery** | Curl-only dual-layer probing: L7 Host-header overrides + L4 TLS SNI swaps via `--resolve`, baseline-comparison anomaly detection, 4-tier severity ladder (`high` for L7/L4 routing inconsistency, `medium` for internal-keyword matches, `low`/`info` for status/size deltas), 2,471-entry default wordlist + custom + graph-derived candidates, discovery feedback loop into httpx | Active | Parallel with Nuclei + GraphQL Scan + Subdomain Takeover + Web Cache Poisoning + Origin Discovery (GROUP 6 Phase A) |
 | **Web Cache Poisoning** | **Web Cache Poisoning & Deception** | Two-engine detection: WCVS (Hackmanit, Docker-in-Docker) breadth sweep across 10+ technique classes (unkeyed-header poisoning, parameter cloaking, path/cache-key normalization, cache-key injection, web cache deception) then a RedAmon-native 5-phase confirmation (cache oracle with silent-cache frozen-Date fallback, isolated cache-buster, fingerprint-gated framework packs for Next.js/Nuxt/Remix, baseline→poison→clean persistence check, verified against a never-poisoned control slot and reproduced on fresh slots, reflected + non-reflective differential detection). Confidence-scored `Confirmed`/`Strong`/`Tentative` tiers, min-confidence gate; benign `.invalid` canaries + isolated cache buckets so the real cache is never poisoned. Disabled by default | Active | Parallel with Nuclei + GraphQL Scan + Subdomain Takeover + VHost & SNI + Origin Discovery (GROUP 6 Phase A) |
+| **Route Exposure Scan** | **Unauthenticated Routes & Exposed Files** | Requests the routes recon found (crawl, ffuf, kiterunner, OpenAPI, JS bundles) plus generated ones (internal/admin/debug seed paths, `.git`/`.svn`/`.hg`/`.env`/`web.config`, backup copies read with HEAD and a 1 KB Range, older API versions, sibling routes of each API, framework debug paths from the detected stack, the routes an open catalog lists, and optionally the paths that hit tried on sibling hosts) without credentials and, where the AuthProfile covers the host, logged in. Leads for the agent (`needs_agent_confirmation`): a route answering anonymously where auth was expected (OpenAPI security, locked siblings, a locked newer version, `Vary` on auth), an API hidden only by the browser's router (`client_gated`), a response with sensitive fields / other people's personal data (types and one count stored, never values), a credentialed CORS origin reflection, or logged-in content a shared cache would serve. Findings a signature proves: exposed VCS/env/config/backup files (a `.git` proven by a bounded walk to its commit object), Werkzeug/Ignition consoles, actuator env/heapdump, debug pages, route catalogs, secrets. The Access Control, Path Traversal and RCE agent skills confirm the leads with read-only proofs; three optional TypeSafe Jev hooks rank the routes and order the leads (saved on each finding), never dropping one. Catch-all control probe, login-wall prefilter, GET/HEAD only, never a state-changing path, one locked pacer under the RoE ceiling. Disabled by default | Active | Parallel with Nuclei + GraphQL Scan + Subdomain Takeover + VHost & SNI + Web Cache Poisoning + Origin Discovery (GROUP 6 Phase A) |
 | **Origin Discovery** | **Origin-IP Discovery (CDN/WAF unmasking)** | Finds the real origin server hidden behind a CDN/WAF by pivoting on the fingerprints the origin leaks: 44 non-CDN subdomain names, SPF/MX record IPs, crt.sh SANs, the favicon hash (mmh3), internet-wide scanners (Shodan/Censys/FOFA/ZoomEye/OTX/VirusTotal), and passive-DNS history (SecurityTrails/ViewDNS). It then confirms each candidate by fetching it directly and with a forged `Host:` header, scoring HTML 60% + TLS cert 25% + headers 15% (± status) against the fronted site. Fail-closed SSRF / CDN-range / current-resolution / RoE filters before any probe; per-scan keyed-search budget; per-target cache; never-raise; converges with the WAF-bypass finding via a tenant-scoped id. Disabled by default | Active / Passive | Parallel with Nuclei + GraphQL Scan + Subdomain Takeover + VHost & SNI + Web Cache Poisoning (GROUP 6 Phase A) |
 | **Security Checks** | **Security Checks** | WAF bypass, direct IP access, TLS expiry, missing headers, cache-control | Active | Parallel workers |
 | **CVE & MITRE** | **CVE Enrichment** | NVD API, Vulners API | Passive | Sequential |
@@ -565,7 +575,7 @@ Run **any single tool** from the pipeline independently without re-running the e
 
 Optional **LLM-augmented decision points** wired inside the recon pipeline where static look-ups historically drift -- **Nuclei** prunes its tag list to the detected tech stack, the **WAF classifier** catches header-stripped Cloudflare/AWS WAF/Imperva, and many others across FFuf, Nuclei false-positive filtering, and subdomain-takeover disambiguation. Each hook is a **cascade fallback** after the static path with a deterministic safe fallback, so an LLM outage cannot break a scan. One master toggle in the Target tab governs them all.
 
-The recon pipeline uses **TypeSafe Jev**, a typed decision model, for nine decisions: what kind of page each URL is, which host Hakrawler crawls first, which directories and extensions FFuf fuzzes, whether a tool failed or just found nothing, which Nuclei tags to run, whether a WAF is in front, whether a takeover is real, and which serialization format a flagged blob is. Jev needs a token on the project owner's account; see how it works in the [Jev Meets the Recon Pipeline](https://www.redamon.org/jev-meets-the-recon-pipeline) walkthrough on redamon.org.
+The recon pipeline uses **TypeSafe Jev**, a typed decision model, for nine decisions: what kind of page each URL is, which host Hakrawler crawls first, which directories and extensions FFuf fuzzes, whether a tool failed or just found nothing, which Nuclei tags to run, whether a WAF is in front, whether a takeover is real, and which serialization format a flagged blob is. Three more Jev hooks steer the Route Exposure Scan: which routes fill its request budget, whether a lead's page is a disguised login wall, and how sensitive each lead is, so the agent confirms the most sensitive first. They only rank and order: no lead is dropped, and without a Jev answer the scan is the deterministic one. Jev needs a token on the project owner's account; see how it works in the [Jev Meets the Recon Pipeline](https://www.redamon.org/jev-meets-the-recon-pipeline) walkthrough on redamon.org.
 
 > **[Wiki: TypeSafe Jev](https://github.com/samugit83/redamon/wiki/TypeSafe-Jev)**
 
@@ -587,7 +597,11 @@ It is **deterministic** (seeds, fixed bounds, pinned tool versions) and runs wit
 
 ### AI Agent Orchestrator
 
-A **LangGraph-based autonomous agent** implementing the ReAct pattern. It progresses through three phases: **Informational** (intelligence gathering, graph queries, Shodan, Google dorking), **Exploitation** (Metasploit, Hydra credential testing, social engineering simulation), and **Post-Exploitation** (enumeration, lateral movement). The agent executes 14 security tools via MCP servers inside a Kali sandbox, supports parallel tool execution via **Wave Runner**, and provides real-time chat interaction with guidance, stop/resume, and approval workflows. **Deep Think** mode enables structured strategic analysis before acting.
+<p align="center">
+  <a href="https://www.redamon.org/how-the-agent-works"><img height="34" src="https://img.shields.io/badge/%E2%96%B6_Interactive_Walkthrough-Inside_RedAmon_Agent-A01025?style=for-the-badge&labelColor=000000" alt="Interactive walkthrough: Inside RedAmon Agent"/></a>
+</p>
+
+A **LangGraph-based autonomous agent** implementing the ReAct pattern. It progresses through three phases: **Informational** (intelligence gathering, graph queries, Shodan, Google dorking), **Exploitation** (Metasploit, Hydra credential testing, social engineering simulation), and **Post-Exploitation** (enumeration, lateral movement). The agent executes 22 security tools via MCP servers inside a Kali sandbox, supports parallel tool execution via **Wave Runner**, and provides real-time chat interaction with guidance, stop/resume, and approval workflows. **Deep Think** mode enables structured strategic analysis before acting.
 
 > **[Wiki: AI Agent Guide](https://github.com/samugit83/redamon/wiki/AI-Agent-Guide)** | **[Technical: README.AGENTIC_SYSTEM.md](docs/readmes/README.AGENTIC_SYSTEM.md)**
 
@@ -610,7 +624,7 @@ A **LangGraph-based autonomous agent** implementing the ReAct pattern. It progre
 | | **execute_amass** | OWASP Amass subdomain enumeration and network mapping (passive + active, ASN intel) | Info, Exploit | network_recon :8000 |
 | **Scanning** | **execute_naabu** | Fast port scanning and verification | Info, Exploit | network_recon :8000 |
 | | **execute_nmap** | Deep service detection (-sV), OS fingerprint, NSE scripts | All | nmap :8004 |
-| | **execute_nuclei** | CVE verification and exploitation with 9,000+ templates + custom uploads | Info, Exploit | nuclei :8002 |
+| | **execute_nuclei** | CVE verification and exploitation with 12,000+ templates + custom uploads | Info, Exploit | nuclei :8002 |
 | | **execute_httpx** | HTTP probing and fingerprinting -- status codes, titles, server headers, tech detection | Info, Exploit | network_recon :8000 |
 | | **execute_wpscan** | WordPress vulnerability scanner -- detects vulnerable plugins, themes, users, misconfigurations | Info, Exploit | network_recon :8000 |
 | **Web & HTTP** | **execute_curl** | HTTP requests -- reachability, headers, status codes, banners | All | network_recon :8000 |
@@ -622,7 +636,7 @@ A **LangGraph-based autonomous agent** implementing the ReAct pattern. It progre
 | **Exploitation** | **metasploit_console** | Persistent msfconsole -- exploit execution, session management, post-exploitation | Exploit, Post | metasploit :8003 |
 | | **msf_restart** | Full Metasploit reset -- kills all sessions, clears module state | Exploit, Post | metasploit :8003 |
 | | **execute_hydra** | THC Hydra brute force -- 50+ protocols (SSH, FTP, RDP, SMB, HTTP, MySQL, etc.) | Exploit, Post | network_recon :8000 |
-| **Code Execution** | **kali_shell** | Full Kali Linux shell -- nikto, whatweb, testssl, commix, sstimap, tplmap, ysoserial, phpggc, ruby, viewgen, dnsrecon, dnsx, subzy, enum4linux-ng, netexec, kerbrute, bloodhound-python, bhgraph, certipy-ad, bloodyAD, jwt_tool, graphql-cop, graphqlmap, betterleaks, semgrep, hashcat, john, cewl, paramspider, Node.js + npm, Python libs (websockets, zeep, python3-saml, boto3, msal, azure-identity, google-auth, google-cloud-storage), pre-staged post-exploit toolkits at /opt/tools/{linux,windows}/ (linpeas, LinEnum, pspy64, deepce, winPEAS, PowerUp, PrivescCheck), and 70+ CLI tools | All | network_recon :8000 |
+| **Code Execution** | **kali_shell** | Full Kali Linux shell -- nikto, whatweb, testssl, commix, smuggler, h2csmuggler, sstimap, tplmap, ysoserial, phpggc, ruby, viewgen, dnsrecon, dnsx, subzy, enum4linux-ng, netexec, kerbrute, bloodhound-python, bhgraph, certipy-ad, bloodyAD, jwt_tool, graphql-cop, graphqlmap, clairvoyance, betterleaks, semgrep, hashcat, john, cewl, paramspider, Node.js + npm, Python libs (websockets, zeep, python3-saml, boto3, msal, azure-identity, google-auth, google-cloud-storage), pre-staged post-exploit toolkits at /opt/tools/{linux,windows}/ (linpeas, LinEnum, pspy64, deepce, winPEAS, PowerUp, PrivescCheck), and 70+ CLI tools | All | network_recon :8000 |
 | | **execute_code** | Write and run code files (Python, bash, Ruby, Perl, C, C++) -- no shell escaping | Exploit, Post | network_recon :8000 |
 | **Supply Chain** | **execute_osv_scanner** | Offline OSV verdict -- is a package known-malicious (`MAL-`) or known-vulnerable (`CVE`/`GHSA`)? Passive, zero network (reads the local OSV DB). Accepts a purl, lockfile, or SBOM | All | network_recon :8000 |
 | | **execute_guarddog** | Behavioural malware analysis of one package (install hooks, obfuscation, exfil, typosquat). Downloads the tarball, so it dispatches to the hardened analyzer sandbox -- never unpacked inline | Info, Exploit | network_recon :8000 |
@@ -663,9 +677,9 @@ A **LangGraph-based autonomous agent** implementing the ReAct pattern. It progre
 
 Beyond the 5 built-in MCP servers above, you can plug **any Model-Context-Protocol server** into the agent as a *tool plugin* (Shodan, GitHub, Censys, Hugging Face, mitmproxy, your own internal MCPs) without editing code, rebuilding containers, or running migrations. Open **Global Settings → MCP Tool Plugins**.
 
-Two paths: pick one of **39 prefilled Quick-Add presets** (OSINT, threat-intel, cloud, web-app scanners, reporting, reverse engineering; categories tagged on every card), or click **Add MCP** for a manual config. Three transports supported: `stdio`, `sse`, `streamable_http`. The orange **Discover and add new tools** button runs a live `list_tools()` against the draft, returns within 30 seconds, and auto-imports each discovered tool with its name, description, and a JSON-Schema-derived `args_format` (types, enums, defaults, min/max, per-property descriptions). Save → tools auto-appear in every project's Tool Matrix and in the agent's system prompt within ~1 second. No agent restart, no `prisma db push`.
+Two paths: pick one of the **prefilled Quick-Add presets** (OSINT, threat-intel, cloud, web-app scanners, reporting, reverse engineering; categories tagged on every card), or click **Add MCP** for a manual config. Three transports supported: `stdio`, `sse`, `streamable_http`. The orange **Discover and add new tools** button runs a live `list_tools()` against the draft, returns within 30 seconds, and auto-imports each discovered tool with its name, description, and a JSON-Schema-derived `args_format` (types, enums, defaults, min/max, per-property descriptions). Save → tools auto-appear in every project's Tool Matrix and in the agent's system prompt within ~1 second. No agent restart, no `prisma db push`.
 
-> **Full operator manual** (every form field, all 39 presets, the auth flow, the live discovery workflow, validation rules, troubleshooting, and the storage / security model): **[MCP Tool Plugins wiki page](https://github.com/samugit83/redamon/wiki/MCP-Tool-Plugins)**.
+> **Full operator manual** (every form field, every preset, the auth flow, the live discovery workflow, validation rules, troubleshooting, and the storage / security model): **[MCP Tool Plugins wiki page](https://github.com/samugit83/redamon/wiki/MCP-Tool-Plugins)**.
 
 ### MCP Server: Your Own Agent Connecting *Into* RedAmon
 
@@ -701,7 +715,7 @@ The agent's most powerful execution mode. When an objective decomposes into **in
 
 Every safety guarantee that applies to the root agent also applies to every member: hard guardrails, soft guardrails, phase gating, Rules of Engagement, and dangerous-tool confirmations (handled **per-member, in parallel**; N members can each be awaiting your approval on their own panel simultaneously without serializing). Recursion is forbidden (a member cannot itself deploy a fireteam) and every wave has a hard cap on members, an iteration budget per member, and a wall-clock timeout. The result is wall-clock parallelism without coordination chaos, predictable termination, and an audit trail where every action is attributable to the specialist that produced it.
 
-> **[Wiki: Fireteam (Parallel Specialists)](https://github.com/samugit83/redamon/wiki/Fireteam-Parallel-Specialists)** | **[Technical: README.AGENTIC_SYSTEM.md](docs/readmes/README.AGENTIC_SYSTEM.md#fireteam--parallel-specialist-sub-agents)**
+> **[Wiki: Fireteam (Parallel Specialists)](https://github.com/samugit83/redamon/wiki/Fireteam-Parallel-Specialists)** | **[Technical: README.AGENTIC_SYSTEM.md](docs/readmes/README.AGENTIC_SYSTEM.md#fireteam---parallel-specialist-sub-agents)**
 
 ### AI Model Providers
 
@@ -713,7 +727,7 @@ OpenAI-compatible provider settings include a **reasoning effort** control. Enab
 
 ### Attack Surface Graph
 
-A **Neo4j knowledge graph** with 19 node types and 20+ relationship types, the single source of truth for the target's attack surface. The agent queries it before every decision via natural language → Cypher translation.
+A **Neo4j knowledge graph**, the single source of truth for the target's attack surface. Its node types and relationships are declared once, in [graph_db/schema_sections.md](graph_db/schema_sections.md), and the schema the agent is served is generated from that file. The agent queries it before every decision via natural language → Cypher translation.
 
 > **[Wiki: Attack Surface Graph](https://github.com/samugit83/redamon/wiki/Attack-Surface-Graph)** | **[Technical: GRAPH.SCHEMA.md](docs/readmes/GRAPH.SCHEMA.md)**
 
@@ -721,7 +735,7 @@ A **Neo4j knowledge graph** with 19 node types and 20+ relationship types, the s
 
 A persistent, evolutionary graph tracking everything the AI agent does: tool executions, discoveries, failures, and strategic decisions. Structured chain context replaces flat execution traces, improving agent efficiency by 25%+. Cross-session memory means the agent never starts from zero.
 
-> **[Wiki: EvoGraph](https://github.com/samugit83/redamon/wiki/EvoGraph-Attack-Chain-Evolution)** | **[Technical: README.AGENTIC_SYSTEM.md](docs/readmes/README.AGENTIC_SYSTEM.md#evograph--evolutive-attack-chain-graph)**
+> **[Wiki: EvoGraph](https://github.com/samugit83/redamon/wiki/EvoGraph-Attack-Chain-Evolution)** | **[Technical: README.AGENTIC_SYSTEM.md](docs/readmes/README.AGENTIC_SYSTEM.md#evograph-evolutive-attack-chain-graph)**
 
 ### Multi-Session Parallel Attack Chains
 
@@ -749,7 +763,7 @@ Unified view of active sessions: meterpreter, reverse/bind shells, and listeners
 
 Full interactive **PTY shell access** to the Kali sandbox container directly from the graph page via **xterm.js**. Access all pre-installed pentesting tools (Metasploit, Nmap, Nuclei, Hydra, sqlmap) without leaving the browser. Features dark terminal theme, connection status indicator, auto-reconnect with exponential backoff, fullscreen mode, and browser-side keepalive.
 
-> **[Wiki: The Graph Dashboard](https://github.com/samugit83/redamon/wiki/The-Graph-Dashboard#redamon-terminal)**
+> **[Wiki: Red Zone (RedAmon Terminal)](https://github.com/samugit83/redamon/wiki/Red-Zone#redamon-terminal)**
 
 ### CypherFix: Automated Vulnerability Remediation
 
@@ -759,7 +773,7 @@ Two-agent pipeline. A **Triage Agent** scores every finding in the graph with a 
 
 ### Agent Skills
 
-An **LLM-powered Intent Router** classifies user requests into agent skills: CVE (MSF), SQL Injection, XSS, SSRF, RCE, Path Traversal / LFI / RFI, Credential Testing, Social Engineering, Availability Testing, or custom user-defined skills uploaded as Markdown files. Ready-to-use **[community skills](agentic/community-skills/)** ship for API testing, XSS, SQLi, XXE, BFLA, SSTI, IDOR / BOLA, insecure deserialization, mass assignment, subdomain takeover, and insecure file uploads -- download the `.md` file and upload it via **Global Settings > Agent Skills** to activate it for your user. You can also [contribute your own](https://github.com/samugit83/redamon/wiki/Agent-Skills#share-your-skills-with-the-community) by opening a PR.
+An **LLM-powered Intent Router** classifies user requests into agent skills: CVE (MSF), SQL Injection, XSS, SSRF, RCE, Path Traversal / LFI / RFI, Credential Testing, Social Engineering, Availability Testing, or custom user-defined skills uploaded as Markdown files. Ready-to-use **[community skills](agentic/community-skills/)** ship for API testing, XSS, SQLi, XXE, BFLA, SSTI, IDOR / BOLA, insecure deserialization, mass assignment, subdomain takeover, and insecure file uploads -- download the `.md` file and upload it via **Global Settings > Agent Skills** (or a project's Agent Skills section), one file or a batch, to activate it for your user. You can also [contribute your own](https://github.com/samugit83/redamon/wiki/Agent-Skills#share-your-skills-with-the-community) by opening a PR.
 
 > **[Wiki: Agent Skills](https://github.com/samugit83/redamon/wiki/Agent-Skills)** | **[Community Skills](agentic/community-skills/)**
 
@@ -797,7 +811,7 @@ Detects known-malicious (`MAL-`) and known-vulnerable (`CVE`/`GHSA`) packages **
 
 ### Project Settings
 
-**500+ configurable parameters** across 16 tabs controlling every tool's behavior, from scan modules to agent approval gates. Managed through the webapp UI.
+**Hundreds of configurable parameters** across 16 tabs controlling every tool's behavior, from scan modules to agent approval gates. Managed through the webapp UI; the generated **[Project Settings Registry](https://github.com/samugit83/redamon/wiki/Project-Settings-Registry)** lists every one with its meaning and the values it accepts.
 
 > **[Wiki: Project Settings Reference](https://github.com/samugit83/redamon/wiki/Project-Settings-Reference)**
 
@@ -831,7 +845,7 @@ LLM-based guardrail preventing targeting of unauthorized domains: blocks governm
 
 Per-tool human-in-the-loop gate for dangerous operations. When enabled, the agent pauses before executing high-impact tools (Nmap, Nuclei, Metasploit, Hydra, Kali shell, code execution) and presents an inline **Allow / Deny** prompt in the chat timeline. Supports both single-tool and parallel-wave (plan) confirmation modes. Users can approve, reject, or modify tool arguments before execution proceeds. Disabled via the `Require Tool Confirmation` toggle in Project Settings.
 
-> **[Wiki: Pentest Agent (Tool Confirmation)](https://github.com/samugit83/redamon/wiki/Pentest-Agent#tool-confirmation-gate)**
+> **[Technical: README.AGENTIC_SYSTEM.md (Tool Confirmation Gate)](docs/readmes/README.AGENTIC_SYSTEM.md#tool-confirmation-gate)**
 
 ### Pentest Reports
 
@@ -977,6 +991,7 @@ flowchart TB
 | Resource | Link |
 |----------|------|
 | **Full Wiki** (user guide) | **[github.com/samugit83/redamon/wiki](https://github.com/samugit83/redamon/wiki)** |
+| **Interactive walkthroughs** (redamon.org) | **[Inside RedAmon Agent](https://www.redamon.org/how-the-agent-works)** · **[Inside the Recon Pipeline](https://www.redamon.org/how-the-recon-pipeline-works)** |
 | **Bug Bounty Coverage Audit** (397 classes, PDF) | **[Wiki: The Full Taxonomy Audit](https://raw.githubusercontent.com/wiki/samugit83/redamon/docs/RedAmon_Bug_Bounty_Coverage.pdf)** |
 | Server Deployment (single-host) | **[Wiki: Deploying to a Server](https://github.com/samugit83/redamon/wiki/Deploying-to-a-Server)** · [tooling/deploy/single-host/README.md](tooling/deploy/single-host/README.md) |
 | **Security Posture** (defense-in-depth catalog) | **[docs/readmes/README.SECURITY_POSTURE.md](docs/readmes/README.SECURITY_POSTURE.md)** |

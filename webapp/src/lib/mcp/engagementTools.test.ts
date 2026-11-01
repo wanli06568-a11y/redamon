@@ -30,6 +30,7 @@ const h = vi.hoisted(() => ({
   transaction: vi.fn(),
   busy: vi.fn(),
   audit: vi.fn(),
+  fetch: vi.fn(),
 }))
 
 vi.mock('@/lib/prisma', () => {
@@ -87,6 +88,7 @@ describe('preflight_scope_check: the effective engine of each AI hook', () => {
     expect(r.aiHooks.map(x => x.hook)).toEqual([
       'ffuf_extensions', 'nuclei_tags', 'waf_classification', 'takeover_disambiguation',
       'ffuf_base_paths', 'page_type', 'tool_health', 'crawl_seed_order', 'serialized_assess',
+      'route_privacy_rank', 'route_exposure_wall', 'route_exposure_assess',
     ])
     expect(byHook(r).ffuf_extensions).toEqual(
       { hook: 'ffuf_extensions', kind: 'engine', engine: 'llm', effective: 'llm' })
@@ -97,7 +99,7 @@ describe('preflight_scope_check: the effective engine of each AI hook', () => {
     h.findProject.mockResolvedValue(projectRow({ aiInPipeline: true }))
     const r = await preflightScopeCheck(ctx(), 'p1')
     for (const hook of ['ffuf_base_paths', 'page_type', 'tool_health', 'crawl_seed_order',
-      'serialized_assess']) {
+      'serialized_assess', 'route_privacy_rank', 'route_exposure_wall', 'route_exposure_assess']) {
       expect(byHook(r)[hook]).toEqual({ hook, kind: 'enable', engine: 'off', effective: 'off' })
     }
   })
@@ -240,6 +242,9 @@ beforeEach(() => {
   h.updateManyProject.mockResolvedValue({ count: 1 })
   h.transaction.mockImplementation((fn, client) => fn(client))
   h.audit.mockResolvedValue(undefined)
+  // The soft guardrail calls the agent; every test runs against a stub of it.
+  h.fetch.mockResolvedValue({ ok: true, json: async () => ({ allowed: true }) })
+  vi.stubGlobal('fetch', h.fetch)
 })
 
 // --- create_project -----------------------------------------------------------------
@@ -311,11 +316,28 @@ describe('B-3: create_project runs the hard guardrail the form runs', () => {
     })).rejects.toThrow(/permanently blocked/)
   })
 
-  test('one blocked root refuses the whole batch', async () => {
+  test('one blocked host refuses the whole batch, and the refusal names that host', async () => {
     await expect(createProject(ctx(), {
       name: 'test', engagementKind: 'internal',
       domainBatchHosts: ['a.example.com', 'portal.example.gov'],
-    })).rejects.toThrow(/permanently blocked: example\.gov/)
+    })).rejects.toThrow(/permanently blocked: portal\.example\.gov:/)
+    expect(h.createProject).not.toHaveBeenCalled()
+  })
+
+  test.each(['www.agency.gov.uk', 'www.isa.org.jm', 'x.met.police.uk'])(
+    'a batch host %s under a government name is refused although its root is not blocked',
+    async (host) => {
+      await expect(createProject(ctx(), {
+        name: 'test', engagementKind: 'internal', domainBatchHosts: ['a.example.com', host],
+      })).rejects.toThrow(new RegExp(`permanently blocked: ${host.replace(/\./g, '\\.')}:`))
+      expect(h.createProject).not.toHaveBeenCalled()
+    },
+  )
+
+  test('a single-domain prefix that makes a blocked host is refused', async () => {
+    await expect(createProject(ctx(), {
+      name: 'test', engagementKind: 'internal', targetDomain: 'org.jm', subdomainList: ['isa.'],
+    })).rejects.toThrow(/permanently blocked: isa\.org\.jm:/)
     expect(h.createProject).not.toHaveBeenCalled()
   })
 })
@@ -677,6 +699,43 @@ describe('preflight_scope_check reports RESOLVED values', () => {
     expect(r.silentNoOps.some(x => x.field === 'ffufEnabled')).toBe(true)
   })
 
+  // Plan 06.7: js_recon is not a scanModules phase. JS recon runs on
+  // jsReconEnabled alone and reads what resource_enum and http_probe found;
+  // jsluice runs inside resource_enum.
+  test('JS recon without a js_recon scan module is not a no-op when it has crawler input', async () => {
+    h.findProject.mockResolvedValue(projectRow({
+      scanModules: ['domain_discovery', 'http_probe', 'resource_enum'], jsReconEnabled: true,
+      jsReconAiSdkDetectionEnabled: true, jsluiceEnabled: true,
+    }))
+    const r = await preflightScopeCheck(ctx(), 'p1')
+    for (const field of ['jsReconEnabled', 'jsReconAiSdkDetectionEnabled', 'jsluiceEnabled']) {
+      expect(r.silentNoOps.some(x => x.field === field), field).toBe(false)
+    }
+  })
+
+  test('JS recon with neither resource_enum nor http_probe is named as having no input', async () => {
+    h.findProject.mockResolvedValue(projectRow({ scanModules: ['domain_discovery'], jsReconEnabled: true }))
+    const r = await preflightScopeCheck(ctx(), 'p1')
+    const hit = r.silentNoOps.find(x => x.field === 'jsReconEnabled')
+    expect(hit?.why).toMatch(/resource_enum.*http_probe/)
+    expect(hit?.why).not.toMatch(/'js_recon' is not in scanModules/)
+  })
+
+  test('a JS recon option is a no-op while JS recon itself is off, whatever scanModules says', async () => {
+    h.findProject.mockResolvedValue(projectRow({
+      scanModules: ['domain_discovery', 'http_probe', 'resource_enum', 'js_recon'],
+      jsReconEnabled: false, jsReconAiSdkDetectionEnabled: true,
+    }))
+    const r = await preflightScopeCheck(ctx(), 'p1')
+    expect(r.silentNoOps.find(x => x.field === 'jsReconAiSdkDetectionEnabled')?.why).toMatch(/jsReconEnabled/)
+  })
+
+  test('jsluice is a no-op exactly when resource_enum does not run', async () => {
+    h.findProject.mockResolvedValue(projectRow({ scanModules: ['domain_discovery', 'http_probe'], jsluiceEnabled: true }))
+    const r = await preflightScopeCheck(ctx(), 'p1')
+    expect(r.silentNoOps.find(x => x.field === 'jsluiceEnabled')?.why).toMatch(/resource_enum/)
+  })
+
   test('a tool enabled in a phase that IS running is not a no-op', async () => {
     h.findProject.mockResolvedValue(projectRow({
       scanModules: ['domain_discovery', 'port_scan'], naabuEnabled: true,
@@ -838,3 +897,103 @@ describe('T24 every new tool joins the guards the others keep', () => {
     }
   })
 })
+
+describe('create_project judges a single-domain target as the form does', () => {
+  const create = (over: Record<string, unknown>) =>
+    createProject(ctx(), { name: 'test', engagementKind: 'internal', ...over } as never)
+
+  test('a public suffix is refused with its reason, and nothing is written', async () => {
+    await expect(create({ targetDomain: 'co.uk' })).rejects.toThrow(/co\.uk \(a public suffix/)
+    expect(h.createProject).not.toHaveBeenCalled()
+  })
+
+  test('an address in the domain field is refused: use targetIps', async () => {
+    await expect(create({ targetDomain: '192.0.2.10' })).rejects.toThrow(/use IP mode/)
+  })
+
+  test('the target is stored normalised: lower case, wildcard marker stripped', async () => {
+    await create({ targetDomain: '*.API.Example.COM' })
+    expect(h.createProject.mock.calls[0][0].data.targetDomain).toBe('api.example.com')
+  })
+
+  test('prefixes may have several labels and are stored in the form the project form writes', async () => {
+    await create({ targetDomain: 'example.com', subdomainList: ['www', 'eu.api.', '.'] })
+    expect(h.createProject.mock.calls[0][0].data.subdomainList).toEqual(['www.', 'eu.api.', '.'])
+  })
+
+  test('a prefix that is not one is refused', async () => {
+    await expect(create({ targetDomain: 'example.com', subdomainList: ['*'] })).rejects.toThrow(/not a valid subdomain prefix/)
+  })
+
+  test('subdomainList outside single-domain mode is refused, not silently stored', async () => {
+    await expect(create({ domainBatchHosts: ['www.example.com'], subdomainList: ['www'] }))
+      .rejects.toThrow(/single-domain project/)
+    expect(h.createProject).not.toHaveBeenCalled()
+  })
+})
+
+describe('Q-1: create_project runs the soft guardrail the HTTP create runs', () => {
+  test('a refusal blocks the create and nothing is written', async () => {
+    h.fetch.mockResolvedValue({ ok: true, json: async () => ({ allowed: false, reason: 'not an owned asset' }) })
+    await expect(createProject(ctx(), { name: 'x', engagementKind: 'internal', targetDomain: 'example.com' }))
+      .rejects.toMatchObject({ code: 'target_blocked' })
+    expect(h.createProject).not.toHaveBeenCalled()
+    expect(JSON.parse(h.fetch.mock.calls[0][1].body).target_domain).toBe('example.com')
+  })
+
+  test('a batch sends its orgs and scan roots as a list', async () => {
+    await createProject(ctx(), { name: 'x', engagementKind: 'internal', domainBatchHosts: ['www.acme.co.uk', '*.example.org'] })
+    expect(JSON.parse(h.fetch.mock.calls[0][1].body).target_domains).toEqual(['acme.co.uk', 'example.org'])
+  })
+
+  test('settings.targetGuardrailEnabled false switches it off, as on the HTTP route', async () => {
+    await createProject(ctx(), {
+      name: 'x', engagementKind: 'internal', targetDomain: 'example.com',
+      settings: { targetGuardrailEnabled: false },
+    })
+    expect(h.fetch).not.toHaveBeenCalled()
+    expect(h.createProject).toHaveBeenCalled()
+  })
+
+  test('an unreachable agent fails open', async () => {
+    h.fetch.mockRejectedValue(new Error('ECONNREFUSED'))
+    await createProject(ctx(), { name: 'x', engagementKind: 'internal', targetDomain: 'example.com' })
+    expect(h.createProject).toHaveBeenCalled()
+  })
+})
+
+describe('MCP-06: preflight_scope_check reports the derived scope', () => {
+  test('the group shape keeps its old keys and adds the current ones', async () => {
+    h.findProject.mockResolvedValue(projectRow({
+      targetDomain: '', domainBatchMode: true,
+      domainBatchHosts: ['*.example.com', 'example.com', 'www.acme.co.uk'],
+    }))
+    const r = await preflightScopeCheck(ctx(), 'p1')
+    expect(r.scope.domainBatchGroupShape).toEqual([
+      { rootDomain: 'example.com', wildcard: true, includesRoot: true, hostCount: 0,
+        scanRoot: 'example.com', orgDomain: 'example.com', mode: 'enumerate', includeRoot: true },
+      { rootDomain: 'acme.co.uk', wildcard: false, includesRoot: false, hostCount: 1,
+        scanRoot: 'acme.co.uk', orgDomain: 'acme.co.uk', mode: 'exact', includeRoot: false },
+    ])
+    expect(r.scope.scopeGroups).toHaveLength(2)
+    expect(r.scope.guardrailNames).toContain('www.acme.co.uk')
+    expect(r.scope.invalidEntries).toEqual([])
+  })
+
+  test('a stored entry the current rules refuse is listed, and the scan is not startable', async () => {
+    h.findProject.mockResolvedValue(projectRow({
+      targetDomain: '', domainBatchMode: true, domainBatchHosts: ['*.github.io', 'www.example.com'],
+    }))
+    const r = await preflightScopeCheck(ctx(), 'p1')
+    expect(r.scope.invalidEntries).toEqual([{ entry: '*.github.io', reason: 'wildcard_on_suffix' }])
+    expect(r.startable).toBe(false)
+  })
+
+  test('a single-domain project is one group', async () => {
+    h.findProject.mockResolvedValue(projectRow({ targetDomain: 'example.com', subdomainList: ['www.'] }))
+    const r = await preflightScopeCheck(ctx(), 'p1')
+    expect(r.scope.scopeGroups.map(g => [g.scanRoot, g.mode, g.exactHosts])).toEqual([['example.com', 'exact', ['www.example.com']]])
+    expect(r.scope.domainBatchGroupShape).toEqual([])
+  })
+})
+

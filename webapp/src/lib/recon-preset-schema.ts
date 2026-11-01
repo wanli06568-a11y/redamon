@@ -136,6 +136,10 @@ export const reconPresetSchema = z.object({
   httpProbeAiTitleDetectionEnabled: bool,
   httpProbeAiWappalyzerEnabled: bool,
 
+  // -- IP attribution (shared edge / dedicated / unknown per IP) --
+  ipAttributionEnabled: bool,
+  ipAttributionTlsMaxProbes: int,
+
   // -- Wappalyzer --
   wappalyzerEnabled: bool,
   wappalyzerMinConfidence: int,
@@ -187,6 +191,14 @@ export const reconPresetSchema = z.object({
   katanaCustomHeaders: strArr,
   katanaParallelism: int,
   katanaConcurrency: int,
+
+  // Project-specific source URLs and Authenticated Session credentials are intentionally
+  // excluded from generated presets; presets may only tune non-secret controls.
+  openapiEnabled: bool,
+  openapiAutoDiscover: bool,
+  openapiDiscoveryPaths: z.array(z.string()).max(200).optional(),
+  openapiTimeout: z.number().int().min(1).max(60).optional(),
+  openapiMaxDocuments: z.number().int().min(1).max(200).optional(),
 
   // -- Web Crawling: ZAP Ajax Spider --
   zapAjaxSpiderEnabled: bool,
@@ -481,6 +493,28 @@ export const reconPresetSchema = z.object({
   webCachePoisonBehavioralOracle: bool,
   webCachePoisonBehavioralDelay: float,
   webCachePoisonDifferential: bool,
+  routeExposureEnabled: bool,
+  routeExposureMaxRps: float,
+  routeExposureWorkers: int,
+  routeExposureTimeout: int,
+  routeExposureMaxRoutesPerHost: int,
+  routeExposureMaxRoutesTotal: int,
+  routeExposureSeedPaths: bool,
+  routeExposureVcsFiles: bool,
+  routeExposureBackupFiles: bool,
+  routeExposureVersionVariants: bool,
+  routeExposureCompareLoggedIn: bool,
+  routeExposurePiiDetection: bool,
+  routeExposureSiblings: bool,
+  routeExposureFrameworkSeeds: bool,
+  routeExposureFollowCatalogs: bool,
+  routeExposureGitWalk: bool,
+  routeExposureCrossHost: bool,
+  routeExposureCorsRider: bool,
+  routeExposureCacheRider: bool,
+  routeExposureJevRank: bool,
+  routeExposureJevWallCheck: bool,
+  routeExposureJevAssess: bool,
 
   // -- CVE Lookup --
   cveLookupEnabled: bool,
@@ -589,7 +623,7 @@ export type ReconPresetParams = z.infer<typeof reconPresetSchema>
 
 export const RECON_PARAMETER_CATALOG = `
 ## Scan Modules & Global
-- scanModules: string[] - Pipeline phases to run. Values: "domain_discovery", "port_scan", "http_probe", "resource_enum", "vuln_scan", "js_recon"
+- scanModules: string[] - Pipeline phases to run. Values: "domain_discovery", "port_scan", "http_probe", "resource_enum", "vuln_scan". JS recon is not one of them: set jsReconEnabled, and keep resource_enum or http_probe on, since it analyzes the JS files those phases found
 - stealthMode: boolean - Reduce scan aggressiveness and network noise
 - aiInPipeline: boolean - Master toggle that enables AI-powered enhancements across all recon modules that support them. Cascades on/off to per-tool AI flags (ffufAiExtensions, nucleiAiTags, wafAiClassifier, nucleiAiResponseFilter, takeoverAiClassifier).
 - aiPipelineModel: string - Model identifier for the AI hooks in recon (e.g. "claude-opus-4-6", "claude-haiku-4-5-20251001"). Independent of agentOpenaiModel.
@@ -701,6 +735,10 @@ export const RECON_PARAMETER_CATALOG = `
 - httpProbeAiTitleDetectionEnabled: boolean - Regex page title against AI frontend products; fills BaseURL.ai_frontend_product_guess when favicon hash is unknown
 - httpProbeAiWappalyzerEnabled: boolean - Local Wappalyzer fingerprint additions for AI frameworks (LangChain JS marker, vLLM cookie, TGI route, …); rides existing Wappalyzer pass
 
+## IP Attribution
+- ipAttributionEnabled: boolean - After the HTTP probe, tag every IP shared_edge (a CDN edge serving many tenants), dedicated (its default certificate covers a target domain) or unknown. Vhost/SNI, origin discovery, the Shodan/Netlas CVE writers and the Priority Board read the tag. Keep true; it costs one TLS handshake per IP with 443 open
+- ipAttributionTlsMaxProbes: integer - 0-5000. Most TLS handshakes without SNI per scan, one per IP with 443 open, paced at the engagement rate ceiling. 0 means no handshake (the tag then uses only CDN signals already collected); stealth presets should use 0
+
 ## Technology Fingerprinting - Wappalyzer
 - wappalyzerEnabled: boolean
 - wappalyzerMinConfidence: integer - 0-100
@@ -752,6 +790,14 @@ export const RECON_PARAMETER_CATALOG = `
 - katanaCustomHeaders: string[] - Custom HTTP headers for crawler
 - katanaParallelism: integer - Targets crawled simultaneously
 - katanaConcurrency: integer - Concurrent fetchers per target
+
+## OpenAPI Ingestion
+- openapiEnabled: boolean - Import supported in-scope operations from OpenAPI documents
+- openapiAutoDiscover: boolean - Discover documents from crawl results and bounded common paths
+- openapiDiscoveryPaths: string[] - Paths probed for specification documents during auto-discovery
+- openapiTimeout: integer - Per-document fetch timeout in seconds (1-60)
+- openapiMaxDocuments: integer - Maximum specification documents to import (1-200)
+OpenAPI source URLs and the project Authenticated Session profile are project-specific and may contain credentials, so they must never appear in generated presets.
 
 ## Web Crawling - ZAP Ajax Spider
 - zapAjaxSpiderEnabled: boolean - Enable browser-driven Ajax Spider crawling for modern SPAs and authenticated apps
@@ -812,7 +858,7 @@ export const RECON_PARAMETER_CATALOG = `
 - serializedScanJevRank: boolean - Ask TypeSafe AI Jev (jev-1.13.0), per distinct flagged blob, which serialization format it is and how likely it is to be an attacker-reachable sink, to rank the serialized-object candidates for the agent. Only when aiInPipeline=true and serializedScanEnabled=true; needs a Jev token on the owner's account. Annotates and ranks only: never drops a candidate. Default false.
 
 ## JavaScript Analysis - JS Recon (deep)
-- jsReconEnabled: boolean - Run deep JS analysis
+- jsReconEnabled: boolean - Run deep JS analysis. This flag alone switches it on (no scanModules entry); it reads the JS URLs from resource_enum and http_probe
 - jsReconMaxFiles: integer
 - jsReconTimeout: integer - Seconds
 - jsReconConcurrency: integer
@@ -1039,6 +1085,30 @@ export const RECON_PARAMETER_CATALOG = `
 - webCachePoisonBehavioralOracle: boolean - Detect *silent* caches (no cache-status headers, common with default Varnish/nginx or hardened CDNs) via a frozen-Date probe: fetch twice across a short delay; a frozen Date header + identical body implies a cache. Catches caches header detection alone would miss. Default true.
 - webCachePoisonBehavioralDelay: number - Seconds to wait between the two frozen-Date probes. Larger = more reliable on slow origins, but adds latency per silent URL. Default 1.1.
 - webCachePoisonDifferential: boolean - Non-reflective detection. Beyond looking for a benign canary echoed back, also flag a poison that changes the response *behaviour* (a persisted status code / Location redirect / body) with no echoed marker, guarded against false positives by requiring the affected response dimension to be stable across two clean baselines. Catches CPDoS-style status flips, scheme/redirect poisoning, and cache-key confusion. Adds one extra baseline request per vector. Default true.
+
+## Route Exposure (active, GET/HEAD only)
+- routeExposureEnabled: boolean - Request the routes recon found plus generated ones (internal/admin/debug seed paths, .git/.env/web.config, backup copies, older API versions) without credentials, and logged in where the authentication profile covers the host. Writes info-severity leads the agent's access_control skill confirms (a route answering anonymously where auth was expected, or returning sensitive fields / other people's personal data) and signature findings with real severity (exposed .git, .env, backups, debug consoles, actuator env, debug pages). Never requests logout/delete/reset paths. Runs in GROUP 6 whenever active scanning runs. Good fit for API, web-app and bug-bounty presets. Default false.
+- routeExposureMaxRps: number - Requests per second across all hosts (1-50), capped to the RoE ceiling. Adds to the other Phase A scanners' load. Default 5.
+- routeExposureWorkers: integer - Routes requested at once (1-16). Default 4.
+- routeExposureTimeout: integer - Seconds to wait for one answer (2-60). Default 10.
+- routeExposureMaxRoutesPerHost: integer - Route budget per host (10-5000); OpenAPI-secured, seen-denied and .git/.env routes go first. Default 300.
+- routeExposureMaxRoutesTotal: integer - Route budget per run across hosts (50-50000). Default 3000.
+- routeExposureSeedPaths: boolean - Request well-known internal/admin/debug paths, at most 60 per host. Default true.
+- routeExposureVcsFiles: boolean - Request .git/.svn/.hg/.env/web.config files at each host and top-level folder, at most 30 per host. Default true.
+- routeExposureBackupFiles: boolean - Guess backup copies of server-side files and root archives/dumps, read with HEAD and a 1 KB Range only. Default true.
+- routeExposureVersionVariants: boolean - Try older API versions of versioned routes (/api/v2/x -> /api/v1/x, /api/x). Default true.
+- routeExposureCompareLoggedIn: boolean - Also request each route logged in where the authentication profile covers the host. Default true.
+- routeExposurePiiDetection: boolean - Detect personal data in answers; stores types and one count, never values. Default true.
+- routeExposureSiblings: boolean - Generate sibling routes from each API route (collection, /export, /all, /list, admin/internal segments), at most 6 per route and 100 per host. Default true.
+- routeExposureFrameworkSeeds: boolean - Request framework debug/management paths from the host's detected technologies (Spring actuator incl. heapdump HEAD-only, Django/Laravel/Rails/Go/.NET/PHP/Apache), at most 30 per host. Default true.
+- routeExposureFollowCatalogs: boolean - When an open route catalog is found (actuator mappings, anonymous OpenAPI/Swagger, rails routes), parse and request its routes once, at most 500 per host. Default true.
+- routeExposureGitWalk: boolean - After an exposed .git/HEAD, fetch the ref and one commit object and inflate it bounded to prove reconstructability; stores only the proof, never the tree or blobs. Default true.
+- routeExposureCrossHost: boolean - Try a path that hit on one host against other in-scope hosts with the same technology or title, at most 50. Default false.
+- routeExposureCorsRider: boolean - On a personalised, sensitive logged-in route, resend with crafted Origin headers to detect a credentialed reflected origin; headers only, never a body. Default true.
+- routeExposureJevRank: boolean - Ask TypeSafe AI Jev (jev-1.13.0) whether each route is meant only for logged-in, internal or admin callers; its answer fills the request budget after the always-requested floor (private-looking routes first) and is saved on each lead. Only when aiInPipeline=true and routeExposureEnabled=true; needs a Jev token on the owner's account. Never cuts a floor route. Default false.
+- routeExposureJevWallCheck: boolean - Ask Jev whether an HTML lead the deterministic page check kept is really a login wall, error page or placeholder; the page class is saved on the lead and a wall at confidence >= 70 is confirmed last. Never drops a lead. Same gating and token rule. Default false.
+- routeExposureJevAssess: boolean - Ask Jev which kind of route each lead is and how sensitive its answer is, from the evidence alone (never the route class or a value); both are saved on the lead and the agent confirms the most sensitive first, public content last. Never drops a lead or rewrites its route class. Same gating and token rule. Default false.
+- routeExposureCacheRider: boolean - On a personalised, sensitive logged-in route, check whether the answer is cacheable to an anonymous visitor; never plants or fetches from cache. Default true.
 
 ## CVE Lookup
 - cveLookupEnabled: boolean

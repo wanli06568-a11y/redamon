@@ -103,7 +103,7 @@ Settings are resolved in the following order of precedence:
    PROJECT_ID=cml6xov4q0002h58pln96n20d
    WEBAPP_API_URL=http://localhost:3000
    ```
-   The recon module fetches all 169+ configurable parameters from:
+   The recon module fetches every project setting (each one is described in `recon_settings/registry.yaml`) from:
    ```
    GET /api/projects/{projectId}
    ```
@@ -128,7 +128,7 @@ settings = get_settings()
 TARGET_DOMAIN = settings['TARGET_DOMAIN']
 SUBDOMAIN_LIST = settings['SUBDOMAIN_LIST']
 SCAN_MODULES = settings['SCAN_MODULES']
-# ... all 169+ parameters
+# ... and every other setting
 ```
 
 ### Orchestrator Communication Flow
@@ -144,7 +144,7 @@ sequenceDiagram
     Webapp->>Orchestrator: POST /recon/{projectId}/start
     Orchestrator->>Recon: docker run with PROJECT_ID, WEBAPP_API_URL
     Recon->>API: GET /api/projects/{projectId}
-    API-->>Recon: Project settings (169+ params)
+    API-->>Recon: Project settings
     Recon->>Recon: Execute scan pipeline
     Recon->>Neo4j: Update graph with results
     Orchestrator->>Webapp: SSE log stream
@@ -154,7 +154,7 @@ sequenceDiagram
 
 ---
 
-## 🏗️ Docker-in-Docker Architecture
+## 🏗 Docker-in-Docker Architecture
 
 The recon module uses a **Docker-in-Docker (DinD)** pattern where the main recon container orchestrates sibling containers for each scanning tool.
 
@@ -274,6 +274,7 @@ sequenceDiagram
     Recon->>Recon: jsluice — extract URLs & secrets from JS files
     Recon->>Recon: FFuf — directory/endpoint fuzzing with wordlists
     Recon->>Recon: Merge & classify endpoints
+    Recon->>Recon: OpenAPI — fetch specifications, merge declared endpoints (never called)
     Recon->>GraphBG: Background: resource enum graph update
 
     Note over Recon,KR: GROUP 5b — JS Recon (if enabled)
@@ -337,7 +338,7 @@ flowchart LR
     end
 
     subgraph G5["GROUP 5 — parallel + sequential"]
-        RE[Resource Enum<br/>Katana ∥ Hakrawler ∥ GAU ∥ ParamSpider ∥ Kiterunner<br/>then jsluice → FFuf → Arjun]
+        RE[Resource Enum<br/>Katana ∥ Hakrawler ∥ GAU ∥ ParamSpider ∥ Kiterunner<br/>then jsluice → FFuf → Arjun → OpenAPI]
     end
 
     subgraph G6["GROUP 6 Phase A — parallel (4-way fan-out)"]
@@ -638,11 +639,45 @@ The recon pipeline uses a **fan-out / fan-in** pattern with Python's `concurrent
 | **GROUP 3** | Shodan Enrichment + Port Scan (Naabu) | 2 parallel tasks | Needs IPs from GROUP 1 + GROUP 2b |
 | **GROUP 3b** | OSINT Enrichment (Censys + FOFA + OTX + Netlas + VirusTotal + ZoomEye + CriminalIP) | 7 parallel tasks | Needs IPs/domains from GROUP 1; runs concurrently with GROUP 3 |
 | **GROUP 4** | HTTP Probe (httpx) | Sequential (internally parallel) | Needs ports from GROUP 3 |
-| **GROUP 5** | Resource Enum (Katana + GAU + Kiterunner) | 3 tools internally parallel | Needs live URLs from GROUP 4 |
+| *IP attribution* | Tags every IP `shared_edge` / `dedicated` / `unknown` (`main_recon_modules/ip_attribution.py`), then writes the Shodan CVEs and the Netlas data GROUP 3/3b held back | Sequential; the TLS handshakes without SNI in a small pool, paced at the RoE ceiling | After GROUP 4 and the certificate SAN feedback; before GROUP 5 and 6. Runs if `IP_ATTRIBUTION_ENABLED` |
+| **GROUP 5** | Resource Enum (Katana + GAU + Kiterunner, then OpenAPI) | 3 tools internally parallel | Needs live URLs from GROUP 4 |
 | **GROUP 5b** | JS Recon Scanner (100 regex patterns, key validation, source maps, dependency confusion, endpoint extraction, DOM sinks) | 5 analyzers parallel per file | Needs JS files from GROUP 5; runs if `JS_RECON_ENABLED` |
 | **GROUP 5.5** | Supply-Chain Recon (black-box package harvest + offline OSV verdict, retire.js over served JS, optional GuardDog; then incident enrichment, malicious-host correlation and typosquat detection) | Sequential; dispatches the DIRTY analyzer | Needs JS files from GROUP 5b; runs if `SUPPLY_CHAIN_RECON_ENABLED` |
-| **GROUP 6 Phase A** | Vuln Scan (Nuclei) ∥ GraphQL Security Testing ∥ Subdomain Takeover ∥ VHost & SNI Enumeration | 4 parallel tasks (ThreadPoolExecutor, `_isolated` wrappers) | Needs endpoints from GROUP 5/5b |
+| **GROUP 6 Phase A** | Vuln Scan (Nuclei) ∥ GraphQL Security Testing ∥ Subdomain Takeover ∥ VHost & SNI Enumeration ∥ Web Cache Poisoning ∥ Origin Discovery ∥ Route Exposure | Up to 7 parallel tasks (ThreadPoolExecutor, `_isolated` wrappers), each only when enabled | Needs endpoints from GROUP 5/5b |
 | **GROUP 6 Phase B** | MITRE Enrichment (CWE + CAPEC) | Sequential | Needs CVEs from Phase A (Nuclei) |
+
+### IP attribution
+
+`run_ip_attribution` labels every IP of the run once, so the modules that ask
+"is this IP the target's?" stop guessing on their own. The rule
+(`ownership_tag`, pure):
+
+- `shared_edge`: `cdn_ranges.classify_ip` fires on a published edge prefix,
+  an edge-only CDN name naabu, tlsx or httpx reported, or an edge's response
+  header; or on an edge-only ASN (`CDN_ASNS`) while the default certificate
+  does not cover a target domain;
+- `dedicated`: the certificate the IP presents to a TLS client that sends no
+  SNI covers a target domain (the org of every project root; IP mode has none);
+- `unknown`: otherwise. Never "not ours": a cloud label is no signal.
+
+Its one active check is that handshake (`recon/helpers/peer_cert.py`, shared
+with origin discovery), only where :443 was found open. It skips RoE-excluded,
+loopback and link-local addresses and hosts `host_health` marks down, is paced
+at `min(10 rps, ROE_GLOBAL_MAX_RPS)`, and is capped per run by
+`IP_ATTRIBUTION_TLS_MAX_PROBES` (stealth sets 0). A failed handshake is never
+evidence: the reasons say "default certificate not checked (<why>)". The step
+never raises; an IP it could not attribute is `unknown` with the reason.
+
+Output: `combined_result["ip_attribution"]["by_ip"]`, written by
+`update_graph_from_ip_attribution` to the existing IP (`ownership`,
+`ownership_reasons`, `default_cert_names`, `current_dns_names`, plus the CDN
+tag on a shared edge). Consumers read it through `shared_edge_ips()`:
+vhost/SNI (`_shared_edge_ips`, plan 07's CDN check as the fallback for an
+untagged IP), origin discovery (`_cdn_flagged_ips`), the Shodan CVE write
+(`_write_shodan_cves`) and the Netlas write (`_write_netlas`, both held back
+until the step runs), and the Priority Board (`ip_ownership` fact). A partial
+run loads the graph's tag with `attach_graph_ownership`. The step writes no
+finding, so it has nothing for the prune to keep.
 
 ### Background Graph DB Updates
 
@@ -691,17 +726,151 @@ three places, all in `recon/main.py`:
 
 What follows from that:
 
-- **Some kinds are never swept by a scan.** Passive CVEs (Shodan, Netlas,
-  CriminalIP) and the supply-chain findings (OSV advisories, malicious packages)
-  come from sources outside `RECON_FINDING_SOURCES`, so only "apply to current
-  graph" reaches them. GVM findings cannot be filtered yet.
-- **A stopped scan runs neither step 2 nor step 3.** Stop sends SIGTERM and the
-  process exits without its `finally`, so what it wrote stays unfiltered until
-  the next scan or an apply.
+- **Some kinds are never swept by a scan.** The supply-chain findings (OSV
+  advisories, malicious packages) come from sources outside
+  `RECON_FINDING_SOURCES`, so only "apply to current graph" reaches them. GVM
+  findings cannot be filtered yet.
+- **Passive CVEs are recon sources.** `shodan_api`, `internetdb`, `netlas` and
+  `criminalip` (plus `shodan` and `shodan_host_lookup`, the Shodan writer's
+  create-only fallbacks) are in `RECON_FINDING_SOURCES`, grouped per enricher
+  in `PASSIVE_CVE_SOURCES`, which also feeds `_PHASE_FINDING_SOURCES`: an
+  enricher that raises, in its module or at the fan-in, keeps its findings.
+- **Switched off vs degraded.** A source switched off by configuration (the
+  module disabled, no API key) notes nothing, so its old findings are pruned
+  like any other's; muted and judged ones are kept as stale, as the nmap rule in
+  `_note_nmap_without_port_data` does. A source that was meant to run and could
+  not check everything is degraded instead, through
+  `note_cve_coverage` in `recon/helpers/passive_cve_coverage.py`: each lookup records
+  which IPs got an answer ("no data" included), the IPs it could not ask about
+  are kept by host (`target_ip`, source-only), and a lookup that reached
+  nothing (a refused key, a crash, no IP at all) keeps its whole source.
+  A Netlas answer cut short by its row cap keeps that IP; one that reached the
+  provider never degrades the whole source, or its stale findings would never
+  be pruned. The provider names one coverage gap: `note_degraded(aliases=...)`
+  cuts its other source values with it.
+- **Older passive CVEs get their host first.** `backfill_passive_cve_hosts`
+  sets `target_ip` from the id (`shodan-<cve>-<ip>`, `criminalip-<cve>-<ip>`)
+  on rows written before the writers stored it, so the by-host keep can match
+  them. If it fails, passive sources are left out of that run's prune.
+- **Passive CVEs are checked against the port scan.** `_reachcheck_shodan_cves`
+  runs after the CDN drop in both pipelines and sets `port_confirmed` from
+  `recon/helpers/port_coverage.py`: open, looked at and not open, or unknown.
+  What a scan looked at comes from its recorded `ports_config`: a custom list
+  or `top-full` is known; naabu's and masscan's top-100/1000 lists are not
+  shipped here, so they can confirm an open port but never call one closed;
+  naabu passive mode confirms nothing; masscan with an exclusion list never
+  says closed. Partial recon reads `active_open_ports` from the graph and only
+  confirms.
+- **Netlas findings are per IP and port.** `netlas-<cve>-<ip>-<port>`, under
+  the IP. Rows from earlier releases were keyed on the bare CVE id;
+  `tooling/scripts/netlas_finding_rekey.py` (dry run by default; `--apply`
+  with the services stopped, before the first scan on the new release) moves
+  their mutes, layers, proof edges and Postgres references.
+- **A JS Recon Secret's id is a hash of its pattern, match and file**
+  (`_make_finding_id` in `recon/helpers/js_recon/patterns.py`). The keyword
+  gap of about 70 patterns is now `[^\n]{0,120}?` (the nearest value, at most
+  120 characters away) instead of `.*`, so a match that ran to the last
+  candidate on a minified line is shorter and gets a new id.
+  `tooling/scripts/js_secret_rekey.py` finds the pattern that produced each
+  stored id, re-runs its current regex over the stored match, and moves the
+  mute, layers, CONFIRMS edges and Postgres references to the id the scanner
+  now writes (dry run by default; `--apply` with the services stopped, before
+  the first scan on the new release). A match the new pattern rejects (the old
+  Azure AD false positives) is left for the prune. A hit re-read under another
+  name (`_refine`: an Algolia key labelled as the search key, a Supabase JWT by
+  its `role`) keeps the id of the pattern that matched it, so it needs no
+  re-key.
+- **Secret validation states.** `validators.py` returns an explicit `state`
+  (`valid`, `rejected`, `unknown`, `format_invalid`); js_recon stores
+  `validated`, `rejected`, `unknown`, `format_invalid`, `format_validated`,
+  `incomplete`, `unvalidated` (no validator) or `skipped`. Only a `401` or a
+  provider's own "invalid key" answer is `rejected`; a timeout, `429`, `5xx`,
+  breaker skip or `403` is `unknown`. The node-filter catalog keeps the legacy
+  `invalid` as an alias (`aliases: {invalid: [rejected, format_invalid]}` on the
+  field, expanded in `graph_db/node_filters/evaluate.py`), so saved rules keep
+  matching.
+- **Public client keys.** `PUBLIC_CLIENT_KEY_NAMES` in `patterns.py` is written
+  at severity info with `public_client_key`. The same names, lowercased, live in
+  `score_model.PUBLIC_CLIENT_KEY_TYPES`, `triage_mixin._PUBLIC_CLIENT_KEY_TYPES`,
+  `graph_db/node_filters/normalize.py` and `webapp/src/lib/secrets/publicClientKeys.ts`;
+  tests pin all five equal. Readers decide on the flag OR the name, for nodes
+  written before the flag.
+- **The legacy path (domain discovery off) keeps what it does not run.**
+  `_run_pipeline` clears the graph, then `run_domain_group`'s legacy branch
+  reloads the previous run's file and re-runs only HTTP probing, resource
+  enumeration, AI Surface, JS Recon and vuln_scan on it. Every other recon
+  source (Shodan, InternetDB, Netlas, Criminal IP, nmap NSE, GraphQL,
+  takeover, VHost/SNI, cache poisoning, WCVS, origin discovery, serialized
+  scan) is noted degraded first (`_note_legacy_unrun_sources`), so the prune
+  keeps its findings. The branch rebuilds the Domain and Subdomain nodes from
+  the file (`_write_legacy_domain_nodes`, synchronous, after the RoE filter,
+  which covers `subdomains`, `subdomain_status_map` and `dns.subdomains`),
+  resets the graph writer so its background writes land, and drains it before
+  the coverage record. The file can carry the previous run's
+  `technology_cves` when the CVE lookup does not run this time, and IP
+  attribution is not re-run on this path.
+- **A stopped scan runs step 3, never step 2.** Python is PID 1 in the recon
+  container, so it installs its own SIGTERM handler before anything else
+  (`recon/helpers/shutdown.py`, from the top of `main.py` and
+  `partial_recon.py`). The handler raises nothing (a `SystemExit` would wait on
+  every `with ThreadPoolExecutor`, and partial recon catches it per root); it
+  sets a flag and wakes a stopper thread, which signals the run's own processes,
+  waits for the queued graph writes (`_drain_graph_writes`) until a deadline
+  inside `RECON_STOP_GRACE_S`, runs the sweep once (`sweep_once`, which the
+  normal `finally` shares) and exits 143. Once the flag is up,
+  `subprocess.Popen` refuses (no new tool), `_graph_update_bg` queues nothing,
+  `save_recon_file` parks the thread instead of starting the next phase, a
+  batch or a per-root partial loop starts no further group or root, and
+  `_prune_recon_findings` refuses: the killed tools returned empty results,
+  which would read as "gone".
+- **One graph writer at a time, drained before it is read.** `_graph_reset`
+  drains a writer still live from a group that raised, and `main()`'s `finally`
+  drains before it sweeps, so the sweep sees every write of the run.
 - **Scans and applies exclude each other.** A full scan cannot start while an
   "apply to current graph" runs (`describeScanWriters`), and an apply to the
   current graph cannot start while a scan runs. Arming the rules for new scans
   is allowed at any time.
+
+### Per-host coverage stamps (what each host got)
+
+The coverage record above is per run and per org, and lists what was CUT. It
+cannot say whether "no Secret on `app.example.com`" means analyzed and clean, JS
+Recon off, no JS from the crawler, or the file cap. So the modules that work
+per web host also report, for every host they *considered*, one row
+`{status, inputs, outputs, reason}`, and their graph writers stamp it on the
+matching `BaseURL` as `<module>_at` / `_status` / `_inputs` / `_outputs` /
+`_reason` (declared in `graph_db/schema_sections.md`).
+
+| Piece | Where |
+|---|---|
+| Row vocabulary, `base_url_key` (`https://x` and `https://x:443` are one host) | `recon/helpers/coverage_stamps.py` |
+| JS Recon rows | `_js_coverage` in `recon/main_recon_modules/js_recon.py`, in `scan_metadata.coverage` |
+| Nuclei rows | `_nuclei_coverage` in `recon/main_recon_modules/vuln_scan.py`, in `vuln_scan.scan_metadata.coverage` |
+| The stamp (MATCH only, tenant-scoped, module name from an allowlist) | `stamp_base_url_coverage` in `graph_db/coverage_stamps.py`, called by `update_graph_from_js_recon` and `update_graph_from_vuln_scan` |
+| The per-module counts readers use | `COVERAGE_SUMMARY_CYPHER` / `coverage_summary` in the same file: the agent's `/graph/exec` summary op (MCP `graph_summary`) and the in-app `graph_summary` |
+| Webapp copy of the vocabulary | `webapp/src/lib/coverageStamps.ts` (node drawer, report, MCP); `tests/test_coverage_stamps_parity.py` holds the three lists equal |
+
+- **Considered.** JS Recon: every host http_probe got a live (< 500) answer
+  from, every host it was handed pages on (`resource_enum` URLs, which is how
+  partial runs pass their targets), and every host serving a JS candidate; a
+  host the RoE exclude is never considered. Nuclei: every host a pass targeted;
+  when Nuclei was meant to run but could not start, every live host.
+- **Status.** `complete`; `no_input` (no candidate, or every candidate turned
+  out not to be JavaScript); `partial` with the reasons (`file cap`, `host
+  unreachable`, `analyzer failed or timed out`; `runtime cap`, `nuclei exited
+  <code>`); `failed` (all lost, a fatal error, or Nuclei unavailable). A Nuclei
+  pass stopped at `NUCLEI_MAX_RUNTIME` leaves all its hosts partial: the run
+  never says which targets it reached.
+- **Absence.** A module switched off stamps nothing. Readers say "not scanned"
+  for a live BaseURL without a module's stamp only when some BaseURL of the
+  project carries it, and "coverage not recorded" otherwise (a graph written
+  before the stamps, or a module that never ran). A full run rebuilds every
+  BaseURL, so stamps describe the latest full run plus partial JS Recon and
+  Nuclei runs since; partial JS Recon writes even when it found nothing.
+- **Recon Delta.** Every stamp is in `VOLATILE_PROPERTIES`.
+- **Follow-ups.** Only JS Recon and Nuclei stamp. `resource_enum`, the security
+  checks and the GraphQL, cache and vhost scanners are the obvious next modules,
+  and Subdomain / IP nodes the place for host-level modules.
 
 ---
 
@@ -714,33 +883,64 @@ afterwards, and all three run the **same** pipeline.
 | --- | --- | --- |
 | **Single Domain** | one root domain plus optional subdomain prefixes | the default; full OSINT and subdomain discovery are available |
 | **IP / CIDR** | a list of addresses or ranges | skips domain ownership, subdomain enumeration and domain WHOIS; runs reverse DNS and IP WHOIS instead |
-| **Domain batch** | a list of hostnames spanning several domains | groups them by domain and scans each group in turn, in one run; a `*.example.com` entry enumerates that domain instead of scanning it literally |
+| **Domain batch** | a list of hostnames spanning several domains | groups them by registrable domain and scans each group in turn, in one run; a `*.example.com` entry enumerates that domain instead of scanning it literally |
 
 ### Domain batch
 
 Paste or upload a flat hostname list. RedAmon groups it and scans the groups one
 after another.
 
-**The grouping rule is the last two labels.** `suba.sub3.domain3.com` belongs to
-`domain3.com`, with the prefix `suba.sub3`. This is deliberately not a public
-suffix list: it is exactly what an operator does by hand when filling the
-single-domain form (target = the domain, everything else = subdomain prefixes),
-so a batch and a hand-built project scan identically. The consequence worth
-knowing is that `foo.example.co.uk` groups under `co.uk`. The project form shows
-the computed groups before you save, so the grouping is never a surprise.
+**The grouping rule is the registrable domain**, read from the Public Suffix
+List with its private section (`tldts` in the webapp, `publicsuffixlist` in
+recon; both pinned and bumped together, README.DEV.md 5.8).
+`suba.sub3.domain3.com` belongs to `domain3.com`, `foo.example.co.uk` to
+`example.co.uk`, `alice.github.io` to itself. The webapp derives the project's
+**scope groups** from the stored hostname list on every read
+(`webapp/src/lib/domainBatch.ts` + `scopeGroups.ts`, returned as `scopeGroups`
+by `GET /api/projects/[id]`); they are never stored. Each group is
+`{scanRoot, orgDomain, mode: exact|enumerate, includeRoot, exactHosts}`: an EXACT
+group scans exactly its listed hosts (and its scan root only when listed), an
+ENUMERATE group runs subdomain discovery under its scan root. A single-domain
+project is one such group, whose scan root is the typed target at any depth.
+
+**Scan root vs registrable domain.** A wildcard may sit below its registrable
+domain: `*.api.example.com` is an ENUMERATE group with scan root
+`api.example.com` and org `example.com`. A wildcard under another wildcard
+collapses into the broader one (`*.v1.api.example.com` beside
+`*.api.example.com`; the preview notes "covered by"), and a plain line under a
+wildcard is seeded into its group. Plain lines of one org that no wildcard
+covers form that org's EXACT group, so one org can have several groups
+(`*.api.example.com` and `www.example.com` are two groups of `example.com`).
 
 **A `*` entry enumerates that domain.** `*.example.com` (or `*example.com`) is
 the one way to run subdomain discovery inside a batch: that group takes the same
 FULL DISCOVERY path a single-domain project takes, and every other group in the
-same run still scans exactly the hostnames it was given. The decision is per
-group, carried as a `*` sentinel in the group's prefix list beside the existing
-`.` ("the root domain itself"); the settings toggle can only say whether
-enumeration is permitted at all.
+same run still scans exactly the hostnames it was given. A plain line under a
+wildcard is seeded into its group. The settings toggle can only say whether
+enumeration is permitted at all; the per-group decision is the group's `mode`.
 
-Because a wildcard turns a naive registrable domain into a scan boundary, it is
-the one place the last-two-labels rule is NOT good enough: `*.co.uk` would mean
-"enumerate a public suffix", so a wildcard is refused on any multi-label suffix
-and on any name below the registrable domain. Literal entries keep the quirk.
+**What is refused**, with a reason per line: a public suffix (`co.uk`), a wildcard
+on one (`*.co.uk`, `*.github.io`), an IP literal (use IP mode), a malformed
+wildcard (`a*.example.com`) and a name that is not a hostname.
+
+**Recon re-validates, and fails closed.** `fetch_project_settings` reads
+`scopeGroups` into `SCOPE_GROUPS` (`recon/project_settings.py`,
+`_parse_scope_groups`): each name is re-checked against the hostname charset,
+and each scan root against recon's own Public Suffix List
+(`recon/helpers/public_suffix.py`); a suffix root or a malformed group is
+dropped. A batch with no usable group, a single-domain target that is a public
+suffix or not a hostname, or a suffix list that fails to import raises
+`ScopeRefused` before any tool starts. When the two suffix lists disagree on a
+name's org (one is newer), the webapp's org is kept and a warning is logged.
+`DOMAIN_BATCH_GROUPS` (the legacy `{rootDomain, prefixes}` shape) is derived from
+`SCOPE_GROUPS` for the readers that have not moved; only a webapp that sends no
+`scopeGroups` makes recon fall back to the stored record. Each run logs:
+
+```
+[*][PSL] publicsuffixlist <pinned version>
+[*][Scope] acme.co.uk org=acme.co.uk mode=enumerate root=true exact=0
+[*][Scope] example.com org=example.com mode=exact root=false exact=2
+```
 
 A wildcard group discovers hosts the list never names, so `MAX_BATCH_HOSTS` and
 `MAX_BATCH_GROUPS` stop bounding the run's length. The preview badges the group,
@@ -765,26 +965,112 @@ results before the next one starts, so all groups accumulate into a single graph
 and the run produces **one** new version covering every domain. Re-running works
 the same way it does in the other two modes.
 
-**Only the hostnames you list are scanned.** Subdomain discovery is forced off for
-a batch, including for a group that is just a bare root domain.
+**Only the hostnames you list are scanned**, except in a wildcard group.
+Subdomain discovery is forced off when no group enumerates, including for a
+group that is just a bare root domain. An EXACT group stays exact all the way
+through: names a certificate, JS bundle or uncover reveals under its scan root
+are never injected as targets (`merge_discovered_hostnames` takes the group's
+scope from the recon metadata), uncover adds no IPs for it, and VHost/SNI
+fabricates no `{word}.<root>` candidates.
+
+**Root is honoured everywhere.** Without Include Root (a `*.example.com` line
+with Root unticked) the scan root itself is no target: it is removed from the
+merged host list, `dns.domain` is blanked (it is still resolved, only as the
+resolver canary), and port scan, masscan, HTTP probe, TLS/header checks, VHost
+and takeover never add it or its addresses.
+
+**Ownership** (when Verify Domain Ownership is on) accepts the token at
+`<prefix>.<scan root>` **or** `<prefix>.<registrable domain>`; RoE is checked
+first, each name is asked once per run, and a resolver failure fails the group
+closed with the resolver's message instead of reading as "no record". The
+preview lists both accepted record names per group.
+
+**The DNS resolver latch is per group, not per process**
+(`_ResolverBreaker` in `domain_recon.py`). One transient failure that a
+re-probe of the canary (the most recent root that answered) confirms opens it,
+and the open latch skips this module's lookups, the ownership TXT lookup,
+reverse DNS and the certificate-name check. `recheck()` runs at the start of
+every `run_domain_group` and of every partial root (`run_per_root`): one
+canary probe closes a recovered latch (`[+][DNS] Resolver answering again:
+lookups resumed`) or keeps it open and records the DNS gap again for this group
+(`[!][DNS] Resolver still down: skipping this group's lookups`). Inside a
+group an open latch is probed again after 120 s, doubling up to 1800 s, by one
+thread. Each hostname whose lookup is skipped is recorded with
+`note_degraded("domain_recon", hosts=[...], host_source="dns")`, so its
+findings are kept for every source; and a certificate name that cannot be
+resolved is recorded, never injected unchecked (`_resolves_to_routable` fails
+closed). Do not call `reset()` per group: it also drops the canary, and with a
+dead resolver every lookup would then wait out dnspython's 5 s timeout.
+
+**Org-level work runs once per registrable domain per run** (`recon/helpers/org_work.py`):
+WHOIS, Shodan domain DNS, OTX/VirusTotal/Criminal IP domain reports and FOFA
+`domain=` are asked for the org by the org's first group that passed RoE and
+ownership, and its other groups get a copy (`[*][...] <org>: answered earlier
+this run, reused`). SPF/DMARC/DNSSEC run on the org once, inside vuln_scan, for
+the first group of that org that reaches it; when no group of an org reached
+them, `security_check` is marked degraded so the prune keeps the old findings.
+Origin discovery keys its candidate sources on the org only when the org is in
+scope (some group's scan root is the org, or ownership was proven at the org),
+else on the scan root (`[*][Origin] candidate key: <root> (org not in scope)`).
+crt.name asks the org once and keeps names under the scan root; uncover's
+`ssl:"<registrant>"` query runs only for a group whose scan root is its org.
 
 **A failing group does not stop the batch.** One unresolvable domain should not
 cost you the other nineteen: failures are reported at the end, and the run only
 fails outright if every group failed.
 
-**Output.** Each group writes `recon_<project_id>__<domain>.json`, and the
+**Output.** Each group writes `recon_<project_id>__<scan root>.json`, and the
 canonical `recon_<project_id>.json` is rebuilt as the union of them after every
 group. Everything downstream (GVM, the project export, the report) reads the
 canonical file and sees the whole batch, and a batch stopped part way still
-leaves a file that parses.
+leaves a file that parses. Every recon file (single-domain and IP mode too)
+states its scope: `metadata.org_domain`, `metadata.scope_mode` (`exact` |
+`enumerate`), `metadata.include_root_domain` (always stamped; a file without
+`scope_mode` is an older one and keeps the old default, root included), plus
+top-level `scope_groups` (every group of the project, snake-case keys) and
+`all_project_roots`. The merged canonical file drops the per-group scalars
+(`scope_mode`, `org_domain`, `include_root_domain`, `filtered_mode`,
+`wildcard_mode`, `subdomain_filter`) and carries `metadata.org_domains` and
+`metadata.scope_groups` instead. A run that skips discovery reads each group's
+previous file as its input, so only the files of removed roots are cleared.
+
+**Graph.** One `Domain` per registrable domain: every in-scope host is a
+`Subdomain` of its org, a deeper scan root that is a target is
+`Subdomain {is_scan_root: true}`, and a host under no scan root is an
+`ExternalDomain` even when it shares the org. Each group stamps the coverage
+record on its org Domain, merged across the run's groups of that org
+(`recon_coverage_roots`). A graph built before this model (a `Domain` named
+after an old scan root) refuses partial recon, GVM and AI-attack starts until a
+full recon rebuilds it.
 
 **Limits.** 500 hostnames and 50 domain groups per project. A batch holds the
 project's single scan slot for as long as it runs, so a very long list is a very
 long scan.
 
-Implementation: `_batch_groups()` / `run_domain_batch()` / `run_domain_group()` in
-`recon/main.py`, grouping in `webapp/src/lib/domainBatch.ts`, output handling in
-`recon/helpers/output_paths.py`.
+Implementation: `_batch_groups()` / `run_domain_batch()` / `run_domain_group(group)` in
+`recon/main.py` (a batch group runs on `target_info_from_group`,
+`recon/helpers/batch_groups.py`; ownership in `_group_ownership`), grouping in
+`webapp/src/lib/domainBatch.ts`, output handling in `recon/helpers/output_paths.py`,
+graph scope in `graph_db/mixins/recon/scope.py` (`scan_root_for_host`,
+`org_for_scan_root`).
+
+### Authenticated scans: where the session goes
+
+An Authenticated Session profile's headers attach only to hosts in the auth
+scope (`recon/helpers/auth_profile.py`, `default_scope_hosts`), built from the
+scope groups: an ENUMERATE group gives `*.<scan root>` (its strict subdomains),
+an EXACT group gives exactly its listed hosts, and either gives its scan root
+only when `includeRoot` is set. A listed single-domain project therefore never
+authorises `*.<target>`. RoE exclusions are removed, and a tool that sends one
+header set for a whole target file gets no session at all if any host in it is
+out of scope.
+
+An explicit `scopeHosts` on the profile only **narrows** that scope
+(`resolve_scope_hosts` intersects the two, then applies RoE): `*.example.com` on
+a project listing only `www.example.com` resolves to `www.example.com`, and a host
+the project does not cover resolves to nothing. The agent's replay and curl and
+the webapp's recording default use the same rule (`agentic/scope_groups.py`,
+`webapp/src/lib/scopeGroups.ts` `authScopePatterns`).
 
 ---
 
@@ -861,8 +1147,9 @@ flowchart LR
 
     MergeDedupe --> PD[Puredns<br/>Wildcard Filter]
     PD --> DNS
+    DNS --> WC[Wildcard control<br/>random-label probe per zone]
 
-    DNS --> Subs
+    WC --> Subs
     DNS --> IPs
     DNS --> Records
 ```
@@ -873,7 +1160,56 @@ flowchart LR
 | **Subdomain discovery** | Finds subdomains via 5 parallel sources (crt.sh, HackerTarget, Subfinder, Amass, Knockpy) |
 | **Wildcard filtering** | Puredns validates subdomains against public DNS resolvers, removes wildcards and DNS-poisoned entries |
 | **DNS enumeration** | A, AAAA, MX, NS, TXT, CNAME records (20 parallel workers) |
+| **Wildcard control** | RedAmon's own check after DNS: drops names that answer only through their zone's wildcard DNS, and stamps the zone |
 | **IP resolution** | Maps all discovered hostnames to IPs |
+
+**Puredns can be skipped.** `run_puredns_resolve` returns `(names, status)`:
+`"filtered"`, or `"skipped:<reason>"` with the list unchanged. Discovery stores the
+status as `metadata.wildcard_filter`. `disabled` (the setting, or Stealth Mode) and
+`no_input` are not cuts; `breaker_open`, `no_resolvers`, `no_output`, `timeout`,
+`docker_missing` and `error` record a coverage gap (source `puredns`, no prune
+effect, shown in the report's Coverage Limitations).
+
+**The wildcard control** (`recon/helpers/wildcard_control.py`) runs whatever
+puredns did, so it stands in when puredns was skipped:
+
+- **Zones.** The scan root, plus each deeper parent with at least 5 direct
+  candidates; a candidate is checked against its nearest probed zone. Each zone is
+  probed with up to 3 random labels (`rdm-<uuid12>.<zone>`) through dnspython and the
+  shared `resolver_breaker`; answers mean a wildcard zone, and their union is its
+  `wildcard_ips`. Cached per run (`circuit_breaker.run_cache`).
+- **The rule.** A candidate is dropped when its own A/AAAA set is non-empty and a
+  subset of `wildcard_ips`, unless a non-guessing source listed it AND it has a
+  CNAME that is not the wildcard's own. Guessing sources: knockpy with brute force,
+  amass with `-brute` (`_guessing_sources`). A name with no address is unresolved,
+  not a wildcard match, and is kept. The scan root is never checked.
+- **Two entry points.** `filter_discovered` reads discovery's own `resolve_all_dns`
+  answers (no extra lookups); `filter_late_names` serves the names added after
+  puredns and looks up A/AAAA/CNAME only for names under a wildcard zone:
+  `merge_discovered_hostnames` (certificate SANs, tlsx, JS recon, Uncover) and
+  `run_tlsx_enrichment`, which lists the dropped SANs as `tlsx.wildcard_dropped` so
+  the tlsx writer links no `COVERS_HOST` Subdomain to them (full and partial tlsx).
+- **Limits.** At most 3 labels per zone and 50 zones per run; probes one at a time,
+  paced to `ROE_GLOBAL_MAX_RPS` when RoE is on (the capper's own rule); an
+  RoE-excluded zone is never queried. With `DNS_ENABLED` off the control does not
+  run. Stealth Mode keeps DNS on and turns puredns off, so the control is what
+  filters there.
+- **Never evidence on failure.** A failed probe leaves the zone unknown: nothing
+  under it is dropped, and a `wildcard_control` coverage gap is recorded, as for
+  the zone cap and for DNS off when puredns did not filter either.
+- **The graph.** Probed zones travel as `wildcard_zones` (`{zone: {is_wildcard,
+  ips}}`, definite answers only). `update_graph_wildcard_zones` (Domain mixin)
+  stamps `is_wildcard_zone` / `wildcard_ips` with MATCH and SET only: the org
+  Domain for an org zone, the Subdomain of that name for a deeper one. The domain
+  and partial discovery writers call it, and `main._stamp_wildcard_zones` once
+  more at the end of each domain group for zones the late names added.
+
+**DNS skipped.** With `resolve=False`, discovery writes every candidate's status as
+`"unverified"`, the value uncover and the passive-DNS writers use for names nobody
+resolved. `Subdomain.status` is shared with http_probe, which later writes
+`"no_http"` or the HTTP code; the readers count "resolved" by a `RESOLVES_TO` edge
+(report, Insights) or by `status = 'resolved'` (http_probe's `no_http` demotion),
+so an unverified name never counts as resolved.
 
 📖 **Key Parameters:**
 ```python
@@ -1005,6 +1341,7 @@ flowchart TB
 
         subgraph Bruteforce["API Discovery"]
             KR[🔑 Kiterunner<br/>Swagger Specs<br/>Hidden APIs]
+            OA[📄 OpenAPI<br/>Specification import<br/>Declared APIs]
         end
     end
 
@@ -1053,6 +1390,7 @@ flowchart TB
 | **Hakrawler** | Active crawling | Links, forms, DOM-discovered URLs |
 | **GAU** | Passive archives | Historical/deleted pages |
 | **Kiterunner** | API bruteforce | Hidden API routes |
+| **OpenAPI** | Specification import (never calls a declared operation) | Endpoints and parameters declared in OpenAPI/Swagger documents |
 | **jsluice** | JS analysis (active download) | URLs, endpoints, and secrets from JS files |
 
 📖 **Detailed documentation:** [docs/readmes/README.RESOURCE_ENUM.md](README.RESOURCE_ENUM.md)
@@ -1391,6 +1729,32 @@ graph_db/mixins/recon/vhost_sni_mixin.py     # Neo4jClient.update_graph_from_vho
 
 ---
 
+### Module 5e: `route_exposure`
+
+Requests the routes recon found, and routes it generates, without credentials, and again
+logged in where the project's authentication profile covers the host. Runs in GROUP 6
+Phase A beside Nuclei and the other active scanners, after resource_enum and JS Recon have
+landed. Toggle: `ROUTE_EXPOSURE_ENABLED` (default `false`). Code: `recon/route_exposure/`.
+
+| Stage | What it does |
+| --- | --- |
+| Harvest | One route per (base URL, path, GET) from resource_enum (with its OpenAPI security, tags and declared-only flag and a discovery tool's 401/403), JS Recon's endpoints and http_probe's pages. An API that the bundle defining a client-side router route calls under that route's first segment is tagged `client_gated` (a partial run rebuilds that pairing from the graph's JS file → Endpoint edges). Templated, static, auth-flow and state-changing paths (`logout`, `delete`, `reset`, ... as whole tokens) are never kept; a POST-only route is skipped. |
+| Generate | Seed paths (internal, admin and debug, 60 per host), `.git`/`.svn`/`.hg`/`.env`/`web.config` at each base and top-level folder (30), backup variants of server-side files plus root archives and dumps (40, read with HEAD then `Range: bytes=0-1023`), older API versions (3 per route), siblings of API routes (`/export`, `/all`, `/list`, the collection, an inserted `admin`/`internal`; 6 per route, 100 per host), framework paths from the host's technologies (Spring actuator, Laravel Ignition, Django and Rails debug routes; 30; a heap dump HEAD only). Each has its own setting. |
+| Rank | A deterministic prior score whose reasons are the `auth_expected_by` hints; the floor (score 5 or more, every VCS/env guess) goes first; per-host and total budgets, hosts round-robin. |
+| Probe | One process-wide locked pacer (`ROUTE_EXPOSURE_MAX_RPS`, under the RoE ceiling), per-worker sessions that keep no cookie, `verify=False` with the TLS warning silenced, bodies capped at 256 KiB, no redirect followed, the host breaker, the stop flag, capture routing (logged-in requests only for bearer, basic and cookie profiles). One guard for every request and control: the run's own hosts follow the pipeline's address rule, a host seen only in a bundle must pass the probe scope and the attacker-URL rule. |
+| Follow-up | One round, never recursive: the routes an open catalog lists (actuator mappings, OpenAPI, the Rails route table; templated routes skipped; 500) and, with `ROUTE_EXPOSURE_CROSS_HOST` (off by default), the paths that hit tried on sibling hosts sharing the page title or technology set (50). |
+| Assess | Signatures first (a debug page answers 500; a `/.git/HEAD` signature is followed by a bounded walk to its ref and commit object, inflated to at most 64 KiB, recorded as `git_walk_proof`), then the logged-in GET whatever the anonymous answer was, then the drops (denied, empty, catch-all by a control request sent exactly like the hit, login wall by the page-type prefilter) and the content signals (PII kinds and one count, sensitive key names, secret detector names). A second pass adds `siblings_locked` (same content kind as the locked neighbours), `version_locked` and `vary_auth`. On a personalised logged-in 2xx with a leak signal, two riders: four hostile origins for a credentialed CORS reflection (`cors_misconfig`, `cors_variants`) and the shared-cache headers (`auth_cacheable`). |
+| Jev (act) | With `AI_IN_PIPELINE` and each flag: `route_privacy_rank` after the prior score and before the selection, so its answer (`Route.jev_rank`) fills each host's budget after the floor; `route_exposure_wall` and `route_exposure_assess` after the assessment, writing `anon_page_class*` and `route_jev_*` onto the leads, then `_order_leads` puts the most sensitive first and a confident wall or public-content reading last (`recon/helpers/ai_planner/route_*.py`, `recon/route_exposure/scanner.py`). They never drop a lead or a floor route; the graph writer persists the fields, and each answer is also recorded beside the deterministic one under `jev_shadow.<hook>`. |
+
+Output: `combined_result["route_exposure"]` (summary, findings, endpoint_status,
+new_endpoints) and, through `update_graph_from_route_exposure`, `Endpoint.anon_status`,
+new Endpoints for generated routes that answered with content (never an artifact) and one
+`:Vulnerability {source:'route_exposure'}` per finding: leads with
+`needs_agent_confirmation` at severity info, findings with their signature's severity. A
+failure is noted degraded so the prune keeps last run's findings. Logs are counts only.
+
+---
+
 ### Module 6: `github`
 
 ```mermaid
@@ -1550,24 +1914,24 @@ flowchart TB
 
 ### Feature Comparison
 
-| Feature | WHOIS | DNS | Shodan | URLScan | Censys | FOFA | OTX | Netlas | VirusTotal | ZoomEye | CriminalIP | Masscan | Naabu | httpx | Katana | Hakrawler | GAU | Kiterunner | jsluice | Nuclei | GVM |
-|---------|-------|-----|--------|---------|--------|------|-----|--------|------------|---------|------------|---------|-------|-------|--------|-----------|-----|------------|---------|--------|-----|
-| **Domain Info** | ✅ | ⚠️ | ❌ | ❌ | ❌ | ⚠️ | ⚠️ | ⚠️ | ❌ | ⚠️ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| **IP Resolution** | ❌ | ✅ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ❌ | ⚠️ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| **Subdomain Discovery** | ❌ | ❌ | ⚠️ | ✅ | ❌ | ⚠️ | ❌ | ⚠️ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| **Port / Service Data** | ❌ | ❌ | ⚠️ | ❌ | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ⚠️ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
-| **Live URL Check** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| **Tech Detection** | ❌ | ❌ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ❌ | ⚠️ | ⚠️ | ⚠️ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ⚠️ | ⚠️ |
-| **Endpoint Discovery** | ❌ | ❌ | ❌ | ⚠️ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ⚠️ | ❌ | ❌ |
-| **Historical URLs** | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ⚠️ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ |
-| **Threat Reputation** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| **Passive DNS** | ❌ | ❌ | ⚠️ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| **Malware / CVE Intel** | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ |
-| **TLS / Certificate** | ❌ | ❌ | ⚠️ | ⚠️ | ✅ | ✅ | ❌ | ✅ | ❌ | ✅ | ⚠️ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| **Geolocation / ASN** | ❌ | ❌ | ✅ | ⚠️ | ✅ | ✅ | ⚠️ | ✅ | ⚠️ | ✅ | ✅ | ❌ | ❌ | ⚠️ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| **API Discovery** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ |
-| **XSS/SQLi Testing** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ⚠️ |
-| **Secret Detection** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ |
+| Feature | WHOIS | DNS | Shodan | URLScan | Censys | FOFA | OTX | Netlas | VirusTotal | ZoomEye | CriminalIP | Masscan | Naabu | httpx | Katana | Hakrawler | GAU | Kiterunner | OpenAPI | jsluice | Nuclei | GVM |
+|---------|-------|-----|--------|---------|--------|------|-----|--------|------------|---------|------------|---------|-------|-------|--------|-----------|-----|------------|---------|---------|--------|-----|
+| **Domain Info** | ✅ | ⚠️ | ❌ | ❌ | ❌ | ⚠️ | ⚠️ | ⚠️ | ❌ | ⚠️ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| **IP Resolution** | ❌ | ✅ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ❌ | ⚠️ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| **Subdomain Discovery** | ❌ | ❌ | ⚠️ | ✅ | ❌ | ⚠️ | ❌ | ⚠️ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| **Port / Service Data** | ❌ | ❌ | ⚠️ | ❌ | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ⚠️ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ |
+| **Live URL Check** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| **Tech Detection** | ❌ | ❌ | ⚠️ | ⚠️ | ⚠️ | ⚠️ | ❌ | ⚠️ | ⚠️ | ⚠️ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ⚠️ | ⚠️ |
+| **Endpoint Discovery** | ❌ | ❌ | ❌ | ⚠️ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ⚠️ | ❌ | ❌ |
+| **Historical URLs** | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ⚠️ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| **Threat Reputation** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| **Passive DNS** | ❌ | ❌ | ⚠️ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| **Malware / CVE Intel** | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ✅ | ❌ | ✅ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ |
+| **TLS / Certificate** | ❌ | ❌ | ⚠️ | ⚠️ | ✅ | ✅ | ❌ | ✅ | ❌ | ✅ | ⚠️ | ❌ | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| **Geolocation / ASN** | ❌ | ❌ | ✅ | ⚠️ | ✅ | ✅ | ⚠️ | ✅ | ⚠️ | ✅ | ✅ | ❌ | ❌ | ⚠️ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| **API Discovery** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | ❌ | ❌ |
+| **XSS/SQLi Testing** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ⚠️ |
+| **Secret Detection** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ |
 
 **Legend:** ✅ Primary | ⚠️ Limited | ❌ Not supported
 
@@ -1600,7 +1964,7 @@ flowchart TB
 
 ---
 
-## ⚙️ Key Configuration Parameters
+## ⚙ Key Configuration Parameters
 
 ### Essential Settings
 
@@ -1664,36 +2028,47 @@ docker-compose run --rm recon python /app/recon/main.py
 
 ```
 recon/
-├── Dockerfile              # Container build
-├── docker-compose.yml      # Orchestration
-├── project_settings.py     # 🔗 Settings fetcher (API or built-in defaults)
-├── main.py                 # 🚀 Entry point
-├── domain_recon.py         # Subdomain discovery
-├── whois_recon.py          # WHOIS lookup
-├── urlscan_enrich.py       # URLScan.io OSINT enrichment
-├── censys_enrich.py        # Censys threat intelligence enrichment
-├── fofa_enrich.py          # FOFA internet asset search enrichment
-├── otx_enrich.py           # OTX (AlienVault) threat intelligence enrichment
-├── netlas_enrich.py        # Netlas internet intelligence enrichment
-├── virustotal_enrich.py    # VirusTotal reputation enrichment
-├── zoomeye_enrich.py       # ZoomEye host search enrichment
-├── criminalip_enrich.py    # Criminal IP threat intelligence enrichment
-├── port_scan.py            # Port scanning
-├── http_probe.py           # HTTP probing
-├── resource_enum.py        # Endpoint discovery
-├── main_recon_modules/
-│   └── ai_surface_recon.py # AI/LLM/MCP/vector-DB surface fingerprinting (Phase 4.5)
-├── vuln_scan.py            # Vulnerability scanning
-├── add_mitre.py            # MITRE enrichment
-├── github_secret_hunt.py   # GitHub secrets
-├── scanners/trufflehog_scan/        # TruffleHog secret scanner (separate service)
-├── output/                 # 📄 Scan results (JSON)
-├── data/                   # 📦 Cached databases
-│   ├── mitre_db/           # CVE2CAPEC database
-│   └── wappalyzer/         # Technology rules
-├── helpers/                # Tool helpers
-└── docs/readmes/                # 📖 Module docs
+├── Dockerfile                # Container build (the redamon-recon image)
+├── docker-compose.yml        # Standalone compose (the root docker-compose.yml runs the stack)
+├── entrypoint.sh             # Container entrypoint
+├── project_settings.py       # 🔗 Settings fetcher (API or built-in defaults)
+├── settings_registry.py      # Reads the recon settings registry (recon_settings/registry.json)
+├── main.py                   # 🚀 Full-pipeline entry point
+├── partial_recon.py          # Partial recon: one tool on demand, inputs from the graph
+├── main_recon_modules/       # One module per pipeline tool
+│   ├── domain_recon.py       #   Subdomain discovery
+│   ├── whois_recon.py        #   WHOIS lookup
+│   ├── urlscan_enrich.py     #   URLScan.io OSINT enrichment
+│   ├── shodan_enrich.py      #   Shodan / InternetDB enrichment
+│   ├── censys_enrich.py      #   Censys, and fofa_, otx_, netlas_, virustotal_, zoomeye_,
+│   │                         #   criminalip_, uncover_enrich.py beside it
+│   ├── port_scan.py          #   Port scanning (Naabu); masscan_scan.py, nmap_scan.py beside it
+│   ├── http_probe.py         #   HTTP probing (+ Wappalyzer); tls_scan.py beside it
+│   ├── resource_enum.py      #   Endpoint discovery
+│   ├── js_recon.py           #   JavaScript analysis
+│   ├── ai_surface_recon.py   #   AI/LLM/MCP/vector-DB surface fingerprinting (Phase 4.5)
+│   ├── vuln_scan.py          #   Vulnerability scanning (Nuclei)
+│   ├── add_mitre.py          #   MITRE enrichment
+│   ├── subdomain_takeover.py, vhost_sni_enum.py, origin_discovery.py,
+│   │   supply_chain_recon.py, sca_intel_correlate.py, ip_filter.py
+│   └── data/                 #   📦 Cached databases
+│       ├── mitre_db/         #     CVE2CAPEC database (CVE year files downloaded at scan time)
+│       └── wappalyzer_cache/ #     Technology rules, refreshed by http_probe.py
+├── partial_recon_modules/    # Per-tool modules for partial recon
+├── helpers/                  # Tool helpers (ai_planner/, js_recon/, openapi/, resource_enum/, supply_chain/)
+├── graphql_scan/             # GraphQL probe
+├── cache_scan/               # Web cache poisoning probe
+├── serialized_scan/          # Serialized-object probe
+├── route_exposure/           # Route exposure scan (anonymous vs logged-in routes, exposed files)
+├── data/                     # Static data (IANA services, popular npm names)
+├── wordlists/                # vhost wordlist
+├── tests/                    # pytest suite (runs in the redamon-recon image)
+└── output/                   # 📄 Scan results (JSON)
 ```
+
+The GitHub secret hunt and TruffleHog run in their own images, from
+`scanners/github_secret_hunt/` and `scanners/trufflehog_scan/`; the module docs
+are in `docs/readmes/` (this folder).
 
 ---
 
